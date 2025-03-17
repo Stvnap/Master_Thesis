@@ -585,7 +585,11 @@ def multiplier (seqarray_full,sliding):
 
         if category_index % 1000 == 0:
             print('iteration:',category_index)
+
+            
     print(sliding_df)
+    return sliding_df
+    
 
 
 
@@ -596,30 +600,8 @@ seqarray_final=multiplier(seqarray_full,sliding)
 
 print('Final array:',seqarray_final)
 
-seqarray_final.to_csv('datatest1.csv', index=False) 
+seqarray_final.to_csv('datatest2.csv', index=False) 
 
-
-
-# ######################################################################################################################################################
-# ################################################### Padding the datasets ###########################################################################
-# ######################################################################################################################################################
-
-
-# def padding(sliding_seqarray, dimension):
-#     padded_seqarray = []
-#     for seq in sliding_seqarray:
-#         padded_seq = []
-#         for entry in seq:
-#             if len(entry) < dimension:
-#                 entry = entry.ljust(dimension, 'X')
-#             padded_seq.append(entry)
-#         padded_seqarray.append(padded_seq)
-#     # print(padded_seqarray)
-#     return padded_seqarray
-
-
-# # padded_example=padding(example_sliding,exampledimension)
-# padded=padding(sliding,dimension_positive)
 
 
 # ######################################################################################################################################################
