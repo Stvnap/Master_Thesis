@@ -3,6 +3,9 @@
 # File after Dataset_preprocessing.py
 # This file is used to create a DNN model using the preprocessed dataset
 
+# Tasks:
+# Check datasplitting, reason for high overfitting/ accuracy in train & val set
+
 ###################################################################################################################################
 # imports
 
@@ -10,6 +13,7 @@ import datetime
 import os
 import time
 
+import numpy as np
 import pandas as pd
 import tensorflow as tf
 from keras import regularizers
@@ -17,6 +21,7 @@ from keras.callbacks import ReduceLROnPlateau, TensorBoard
 from keras.layers import Dense, Dropout, Flatten
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
 from tensorflow.python import keras
 
 ###################################################################################################################################
@@ -61,7 +66,9 @@ class Starter:
             "Z": 21,  # Glutamine (Q) or Glutamic acid (E)
             "B": 21,  # Asparagine (N) or Aspartic acid (D)
             "U": 21,  # Selenocysteine
+            "O": 21,  # Pyrrolysin
         }
+        self.df = self.df.dropna(subset=["Sequences"])
 
         def encode_sequence(seq):
             return [amino_acid_to_int[amino_acid] for amino_acid in seq]
@@ -124,34 +131,41 @@ class Starter:
 
     def _splitter(self):
         start_time = time.time()
+
         tensor_df = tf.data.Dataset.from_tensor_slices(
             (self.df_one_hot, self.padded_label["Labels"])
         )
-        tensor_df = tensor_df.shuffle(
-            buffer_size=218468, reshuffle_each_iteration=False
+
+        features, labels = [], []
+        for feature, label in tensor_df:
+            features.append(feature.numpy())
+            labels.append(label.numpy())
+
+        features = np.array(features)
+        labels = np.array(labels)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            features, labels, test_size=0.3, stratify=labels, random_state=42
         )
 
-        ### splitting ###
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
+        )
 
-        # split sizes
-        dataset_size = len(self.padded)
-        train_size = int(0.70 * dataset_size)  # 70%
-        val_size = int(0.15 * dataset_size)  # 15%
-        test_size = dataset_size - train_size - val_size  # 15%
+        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+        val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+        test_dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
 
-        # split the sets
-        train_dataset = tensor_df.take(train_size)
-        val_dataset = tensor_df.skip(train_size).take(val_size)
-        test_dataset = tensor_df.skip(train_size + val_size)
+        train_dataset = train_dataset.shuffle(buffer_size=218468).batch(32)
+        val_dataset = val_dataset.batch(32)
+        test_dataset = test_dataset.batch(32)
 
-        # Batch & prefetch
-        train_dataset = train_dataset.batch(32).prefetch(tf.data.AUTOTUNE)
-        val_dataset = val_dataset.batch(32).prefetch(tf.data.AUTOTUNE)
-        test_dataset = test_dataset.batch(32).prefetch(tf.data.AUTOTUNE)
+        print(f"Train dataset size: {len(X_train)}")
+        print(f"Validation dataset size: {len(X_val)}")
+        print(f"Test dataset size: {len(X_test)}")
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
+        print(f"Stratified split completed in {time.time() - start_time:.2f} seconds")
+
         return train_dataset, val_dataset, test_dataset
 
     def _modeler(self):
@@ -214,15 +228,9 @@ class Starter:
 ###################################################################################################################################
 
 if __name__ == "__main__":
-    run = Starter("./datatest1.csv")
-    # run.trainer()
-
-    print(run.padded_label)
-
-    # lists = run.padded_label['Labels'].tolist()
-    # for entry in lists:
-    #     if entry == 0:
-    #         print('found')
-    #     else:
-    #         # print('NOT found')
-    #         continue
+    with tf.device("/CPU:0"):
+        run = Starter(
+            "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
+        )
+        # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
+        run.trainer()

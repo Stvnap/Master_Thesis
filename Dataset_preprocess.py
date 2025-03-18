@@ -361,10 +361,6 @@ seqarray_clean_rnd_without_double_domains = seqarray_clean_rnd_sprot[
 ]
 
 
-print(seqarray_clean_rnd_sprot.shape)
-print(seqarray_clean_rnd_without_double_domains.shape)
-
-
 seqarray_full = pd.concat(
     [seqarray_clean_rnd_without_double_domains, seq_labels_all_domains]
 )
@@ -378,18 +374,13 @@ seqarray_full = pd.concat(
 print("full df:", seqarray_full)
 
 
+
+
+
+
 # ratio control
 
-ratio_positive = len(seqarray_clean) / len(seqarray_full)
-print("ratio positive:", ratio_positive)
 
-ratio_negative_domains = (
-    len(seqarray_clean_PF00079)
-    + len(seqarray_clean_PF00080)
-    + len(seqarray_clean_PF00118)
-    + len(seqarray_clean_PF00162)
-) / len(seqarray_full)
-print("ratio negative domains:", ratio_negative_domains, "\n")
 
 
 ######################################################################################################################################################
