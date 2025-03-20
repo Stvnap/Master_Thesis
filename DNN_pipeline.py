@@ -27,42 +27,50 @@ from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
 
 ###################################################################################################################################
+STRATEGY = tf.distribute.MirroredStrategy()
 
 
 class HyperModel(kt.HyperModel):
-    def __init__(self, target_dimension):
+    def __init__(self, target_dimension, strategy=STRATEGY):
         self.target_dimension = target_dimension
+        self.strategy = strategy
 
     def build(self, hp):
-        model = Sequential()
-        model.add(Flatten(input_shape=(self.target_dimension, 21)))
+        with self.strategy.scope():
+            model = Sequential()
+            model.add(Flatten(input_shape=(self.target_dimension, 21)))
 
-        model.add(
-            Dense(
-                units=hp.Int("units", min_value=32, max_value=512, step=32),
-                activation=hp.Choice("activation", ["relu", "tanh"]),
+            model.add(
+                Dense(
+                    units=hp.Int("units", min_value=32, max_value=512, step=32),
+                    activation=hp.Choice("activation", ["relu", "tanh"]),
+                )
             )
-        )
 
-        if hp.Boolean("dropout"):
-            model.add(Dropout(rate=hp.Float("dropout_rate", 0.1, 0.5, step=0.1)))
+            if hp.Boolean("dropout"):
+                model.add(Dropout(rate=hp.Float("dropout_rate", 0.1, 0.5, step=0.1)))
 
-        model.add(
-            Dense(1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001))
-        )
+            model.add(
+                Dense(
+                    1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
+                )
+            )
 
-        learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-            loss="binary_crossentropy",
-            metrics=["accuracy", "precision", "recall", "AUC"],
-        )
+            learning_rate = hp.Float(
+                "lr", min_value=1e-4, max_value=1e-2, sampling="log"
+            )
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                loss="binary_crossentropy",
+                metrics=["accuracy", "precision", "recall", "AUC"],
+            )
 
-        return model
+            return model
 
 
 class Starter:
-    def __init__(self, df_path):
+    def __init__(self, df_path, strategy=STRATEGY):
+        self.strategy = strategy
         self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
         self.df_int = self._sequence_to_int()
         self.target_dimension = len(self.df["Sequences"].max())
@@ -144,15 +152,17 @@ class Starter:
 
     def _one_hot(self):
         start_time = time.time()
-        df_one_hot = [
-            tf.one_hot(int_sequence, 21) for int_sequence in self.padded["Sequences"]
-        ]
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
-        # print(len(df_one_hot))
-        # print(len(self.padded))
-        return df_one_hot
+        with tf.device("/CPU:0"):
+            df_one_hot = [
+                tf.one_hot(int_sequence, 21)
+                for int_sequence in self.padded["Sequences"]
+            ]
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
+            # print(len(df_one_hot))
+            # print(len(self.padded))
+            return df_one_hot
 
     def _labler(self):
         start_time = time.time()
@@ -229,7 +239,7 @@ class Starter:
 
         return train_dataset, val_dataset, test_dataset
 
-    # def _modeler(self, hp):
+        # def _modeler(self, hp):
         start_time = time.time()
 
         strategy = tf.distribute.MirroredStrategy()
@@ -279,29 +289,30 @@ class Starter:
 
     def trainer(self):
         start_time = time.time()
-        reduce_lr = ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
-        )
-        log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
+        with self.strategy.scope():
+            reduce_lr = ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
+            )
+            log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
 
-        tensorboard_cb = TensorBoard(log_dir=log_dir)
+            tensorboard_cb = TensorBoard(log_dir=log_dir)
 
-        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+            timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
 
-        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-            f"run_{timestamp}.keras", save_best_only=True
-        )
+            checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+                f"run_{timestamp}.keras", save_best_only=True
+            )
 
-        early_stopping_cb = keras.callbacks.EarlyStopping(
-            patience=10, restore_best_weights=True, monitor="val_loss"
-        )
-        history = self.model.fit(
-            self.train_dataset,
-            epochs=500,
-            validation_data=self.val_dataset,
-            callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
-            class_weight=self.class_weight_dict,
-        )
+            early_stopping_cb = keras.callbacks.EarlyStopping(
+                patience=10, restore_best_weights=True, monitor="val_loss"
+            )
+            history = self.model.fit(
+                self.train_dataset,
+                epochs=500,
+                validation_data=self.val_dataset,
+                callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
+                class_weight=self.class_weight_dict,
+            )
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
@@ -326,10 +337,12 @@ class Starter:
 ###################################################################################################################################
 
 if __name__ == "__main__":
-    with tf.device("/CPU:0"):       # still runs oom on gpu mode, need to take a look
+    print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
+    with STRATEGY.scope():
         run = Starter(
             "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
         )
+
         # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
 
         run.tuner()
