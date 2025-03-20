@@ -236,7 +236,7 @@ class databaseCreater:
 
     def _saver(self):
         print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("datatest3.csv", index=False)
+        self.seqarray_final.to_csv("dataSwissProt_NoOvelap.csv", index=False)
 
 
 ##################################################################################################################################################
@@ -294,5 +294,5 @@ if __name__ == "__main__":
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
         dimension_positive,
-        10,
+        0,
     )

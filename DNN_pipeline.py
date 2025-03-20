@@ -13,6 +13,7 @@ import datetime
 import os
 import time
 
+import keras_tuner as kt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -22,9 +23,42 @@ from keras.layers import Dense, Dropout, Flatten
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
 
 ###################################################################################################################################
+
+
+class HyperModel(kt.HyperModel):
+    def __init__(self, target_dimension):
+        self.target_dimension = target_dimension
+
+    def build(self, hp):
+        model = Sequential()
+        model.add(Flatten(input_shape=(self.target_dimension, 21)))
+
+        model.add(
+            Dense(
+                units=hp.Int("units", min_value=32, max_value=512, step=32),
+                activation=hp.Choice("activation", ["relu", "tanh"]),
+            )
+        )
+
+        if hp.Boolean("dropout"):
+            model.add(Dropout(rate=hp.Float("dropout_rate", 0.1, 0.5, step=0.1)))
+
+        model.add(
+            Dense(1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001))
+        )
+
+        learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss="binary_crossentropy",
+            metrics=["accuracy", "precision", "recall", "AUC"],
+        )
+
+        return model
 
 
 class Starter:
@@ -35,8 +69,10 @@ class Starter:
         self.padded = self._padder()
         self.df_one_hot = self._one_hot()
         self.padded_label = self._labler()
-        self.train_dataset, self.val_dataset, self.test_dataset = self._splitter()
-        self.model = self._modeler()
+        # self.train_dataset, self.val_dataset, self.test_dataset = self._splitter()
+        self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
+
+        # self.model = self._modeler(kt.HyperParameters())
 
     def _sequence_to_int(self):
         start_time = time.time()
@@ -132,6 +168,13 @@ class Starter:
     def _splitter(self):
         start_time = time.time()
 
+        self.class_weights = compute_class_weight(
+            "balanced",
+            classes=np.unique(self.padded_label["Labels"]),
+            y=self.padded_label["Labels"],
+        )
+        self.class_weight_dict = dict(enumerate(self.class_weights))
+
         tensor_df = tf.data.Dataset.from_tensor_slices(
             (self.df_one_hot, self.padded_label["Labels"])
         )
@@ -160,6 +203,10 @@ class Starter:
         val_dataset = val_dataset.batch(32)
         test_dataset = test_dataset.batch(32)
 
+        train_dataset.save("trainset")
+        val_dataset.save("valset")
+        test_dataset.save("testset")
+
         print(f"Train dataset size: {len(X_train)}")
         print(f"Validation dataset size: {len(X_val)}")
         print(f"Test dataset size: {len(X_test)}")
@@ -168,28 +215,62 @@ class Starter:
 
         return train_dataset, val_dataset, test_dataset
 
-    def _modeler(self):
+    def _loader(self):
+        self.class_weights = compute_class_weight(
+            "balanced",
+            classes=np.unique(self.padded_label["Labels"]),
+            y=self.padded_label["Labels"],
+        )
+        self.class_weight_dict = dict(enumerate(self.class_weights))
+
+        train_dataset = tf.data.Dataset.load("trainset")
+        val_dataset = tf.data.Dataset.load("valset")
+        test_dataset = tf.data.Dataset.load("testset")
+
+        return train_dataset, val_dataset, test_dataset
+
+    # def _modeler(self, hp):
         start_time = time.time()
-        model = Sequential(
-            [
-                Flatten(input_shape=(self.target_dimension, 21)),
-                Dense(21, activation="relu", kernel_regularizer=regularizers.l2(0.001)),
-                Dropout(0.3),
-                Dense(21, activation="relu", kernel_regularizer=regularizers.l2(0.001)),
-                Dropout(0.3),
+
+        strategy = tf.distribute.MirroredStrategy()
+
+        with strategy.scope():
+            model = Sequential()
+
+            # Flatten layer
+            model.add(Flatten(input_shape=(self.target_dimension, 21)))
+
+            # Dense layer with hyperparameters
+            model.add(
                 Dense(
-                    1,
-                    activation="sigmoid",
-                    kernel_regularizer=regularizers.l2(0.001),
-                ),
-            ]
-        )
+                    units=hp.Int("units", min_value=5, max_value=505, step=25),
+                    activation=hp.Choice("activation", ["relu", "tanh"]),
+                )
+            )
 
-        print(model.summary())
+            # Conditionally add the Dropout layer
+            if hp.Boolean("dropout"):
+                model.add(Dropout(rate=0.25))
 
-        model.compile(
-            optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"]
-        )
+            # Output layer
+            model.add(
+                Dense(
+                    1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
+                )
+            )
+
+            print(model.summary())
+
+            learning_rate = hp.Float(
+                "lr", min_value=1e-4, max_value=1e-2, sampling="log"
+            )
+
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                loss="binary_crossentropy",
+                metrics=["accuracy", "precision", "recall", "AUC", "f1_score"],
+            )
+
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done modelling\nElapsed Time: {elapsed_time:.4f} seconds")
@@ -219,18 +300,36 @@ class Starter:
             epochs=500,
             validation_data=self.val_dataset,
             callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
+            class_weight=self.class_weight_dict,
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
+    def tuner(self):
+        hypermodel = HyperModel(target_dimension=self.target_dimension)
+
+        tuner = kt.RandomSearch(
+            hypermodel=hypermodel,
+            objective="val_AUC",
+            max_trials=3,
+            executions_per_trial=2,
+            overwrite=True,
+            directory="./logshp",
+            project_name="test1",
+        )
+
+        tuner.search_space_summary()
+        tuner.search(self.train_dataset, epochs=2, validation_data=self.val_dataset)
+
 
 ###################################################################################################################################
 
 if __name__ == "__main__":
-    with tf.device("/CPU:0"):
+    with tf.device("/CPU:0"):       # still runs oom on gpu mode, need to take a look
         run = Starter(
             "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
         )
         # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
-        run.trainer()
+
+        run.tuner()

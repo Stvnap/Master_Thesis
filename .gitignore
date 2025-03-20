@@ -16,3 +16,7 @@
 
 # directories #
 logs/
+logshp/
+trainset/
+valset/
+testset/
