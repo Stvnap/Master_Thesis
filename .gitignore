@@ -20,3 +20,4 @@ logshp/
 trainset/
 valset/
 testset/
+models/

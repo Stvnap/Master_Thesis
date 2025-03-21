@@ -26,8 +26,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
 
+# from tensorflow.keras.callbacks import TensorBoard
+
 ###################################################################################################################################
-STRATEGY = tf.distribute.MirroredStrategy()
+# STRATEGY = tf.distribute.MirroredStrategy()
+STRATEGY = tf.device("/GPU:1")
+
 
 
 class HyperModel(kt.HyperModel):
@@ -36,19 +40,47 @@ class HyperModel(kt.HyperModel):
         self.strategy = strategy
 
     def build(self, hp):
-        with self.strategy.scope():
+        # with self.strategy.scope():
+        with self.strategy:
+
             model = Sequential()
             model.add(Flatten(input_shape=(self.target_dimension, 21)))
 
             model.add(
                 Dense(
-                    units=hp.Int("units", min_value=32, max_value=512, step=32),
+                    units=hp.Int("units", min_value=20*155, max_value=22*155, step=32),
                     activation=hp.Choice("activation", ["relu", "tanh"]),
                 )
             )
 
             if hp.Boolean("dropout"):
                 model.add(Dropout(rate=hp.Float("dropout_rate", 0.1, 0.5, step=0.1)))
+
+            if hp.Boolean("dense"):
+                model.add(
+                    Dense(
+                        units=hp.Int("units", min_value=32, max_value=512, step=32),
+                        activation=hp.Choice("activation", ["relu", "tanh"]),
+                    )
+                )
+
+                if hp.Boolean("dropout2"):
+                    model.add(
+                        Dropout(rate=hp.Float("dropout_rate2", 0.1, 0.5, step=0.1))
+                    )
+
+            if hp.Boolean("dense2"):
+                model.add(
+                    Dense(
+                        units=hp.Int("units", min_value=32, max_value=512, step=32),
+                        activation=hp.Choice("activation", ["relu", "tanh"]),
+                    )
+                )
+
+                if hp.Boolean("dropout3"):
+                    model.add(
+                        Dropout(rate=hp.Float("dropout_rate2", 0.1, 0.5, step=0.1))
+                    )
 
             model.add(
                 Dense(
@@ -59,6 +91,8 @@ class HyperModel(kt.HyperModel):
             learning_rate = hp.Float(
                 "lr", min_value=1e-4, max_value=1e-2, sampling="log"
             )
+
+
             model.compile(
                 optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
                 loss="binary_crossentropy",
@@ -66,6 +100,14 @@ class HyperModel(kt.HyperModel):
             )
 
             return model
+
+    def fit(self, hp, model, *args, **kwargs):
+        with self.strategy:
+            return model.fit(
+                *args,
+                batch_size=hp.Int("batch_size", 32, 256, step=32, default=64),
+                **kwargs,
+            )
 
 
 class Starter:
@@ -239,110 +281,133 @@ class Starter:
 
         return train_dataset, val_dataset, test_dataset
 
-        # def _modeler(self, hp):
-        start_time = time.time()
+    # def _modeler(self, hp):
+    #     start_time = time.time()
 
-        strategy = tf.distribute.MirroredStrategy()
+    #     strategy = tf.distribute.MirroredStrategy()
 
-        with strategy.scope():
-            model = Sequential()
+    #     with strategy.scope():
+    #         model = Sequential()
 
-            # Flatten layer
-            model.add(Flatten(input_shape=(self.target_dimension, 21)))
+    #         # Flatten layer
+    #         model.add(Flatten(input_shape=(self.target_dimension, 21)))
 
-            # Dense layer with hyperparameters
-            model.add(
-                Dense(
-                    units=hp.Int("units", min_value=5, max_value=505, step=25),
-                    activation=hp.Choice("activation", ["relu", "tanh"]),
-                )
-            )
+    #         # Dense layer with hyperparameters
+    #         model.add(
+    #             Dense(
+    #                 units=hp.Int("units", min_value=5, max_value=505, step=25),
+    #                 activation=hp.Choice("activation", ["relu", "tanh"]),
+    #             )
+    #         )
 
-            # Conditionally add the Dropout layer
-            if hp.Boolean("dropout"):
-                model.add(Dropout(rate=0.25))
+    #         # Conditionally add the Dropout layer
+    #         if hp.Boolean("dropout"):
+    #             model.add(Dropout(rate=0.25))
 
-            # Output layer
-            model.add(
-                Dense(
-                    1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
-                )
-            )
+    #         # Output layer
+    #         model.add(
+    #             Dense(
+    #                 1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
+    #             )
+    #         )
 
-            print(model.summary())
+    #         print(model.summary())
 
-            learning_rate = hp.Float(
-                "lr", min_value=1e-4, max_value=1e-2, sampling="log"
-            )
+    #         learning_rate = hp.Float(
+    #             "lr", min_value=1e-4, max_value=1e-2, sampling="log"
+    #         )
 
-            model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-                loss="binary_crossentropy",
-                metrics=["accuracy", "precision", "recall", "AUC", "f1_score"],
-            )
+    #         model.compile(
+    #             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+    #             loss="binary_crossentropy",
+    #             metrics=["accuracy", "precision", "recall", "AUC", "f1_score"],
+    #         )
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done modelling\nElapsed Time: {elapsed_time:.4f} seconds")
+    #     end_time = time.time()
+    #     elapsed_time = end_time - start_time
+    #     print(f"Done modelling\nElapsed Time: {elapsed_time:.4f} seconds")
 
-        return model
+    #     return model
 
     def trainer(self):
         start_time = time.time()
-        with self.strategy.scope():
-            reduce_lr = ReduceLROnPlateau(
-                monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
-            )
-            log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
+        # with self.strategy.scope():
+        reduce_lr = ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
+        )
+        log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
 
-            tensorboard_cb = TensorBoard(log_dir=log_dir)
+        tensorboard_cb = TensorBoard(log_dir=log_dir)
 
-            timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
 
-            checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-                f"run_{timestamp}.keras", save_best_only=True
-            )
+        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            f"models/run_{timestamp}.keras", save_best_only=True
+        )
 
-            early_stopping_cb = keras.callbacks.EarlyStopping(
-                patience=10, restore_best_weights=True, monitor="val_loss"
-            )
-            history = self.model.fit(
-                self.train_dataset,
-                epochs=500,
-                validation_data=self.val_dataset,
-                callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
-                class_weight=self.class_weight_dict,
-            )
+        early_stopping_cb = keras.callbacks.EarlyStopping(
+            patience=10, restore_best_weights=True, monitor="val_loss"
+        )
+        history = self.model.fit(
+            self.train_dataset,
+            epochs=500,
+            validation_data=self.val_dataset,
+            callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
+            class_weight=self.class_weight_dict,
+        )
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
     def tuner(self):
         hypermodel = HyperModel(target_dimension=self.target_dimension)
-
+        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
         tuner = kt.RandomSearch(
-            hypermodel=hypermodel,
+            hypermodel=hypermodel.build,
             objective="val_AUC",
-            max_trials=3,
+            max_trials=30,
             executions_per_trial=2,
             overwrite=True,
             directory="./logshp",
-            project_name="test1",
+            project_name=(f"run_{timestamp}"),
+        )
+
+        log_dir = f"./logshp/tb_{datetime.datetime.now().strftime('%Y_%m_%d-%H_%M')}"
+        os.makedirs(log_dir, exist_ok=True)
+
+        tensorboard = TensorBoard(log_dir=log_dir)
+        print(
+            "\n",
+            "\n",
+            "\n",
         )
 
         tuner.search_space_summary()
-        tuner.search(self.train_dataset, epochs=2, validation_data=self.val_dataset)
+        
+        print(
+            "\n",
+            "\n",
+            "\n",
+        )
+        with self.strategy:
+
+            tuner.search(
+                self.train_dataset,
+                epochs=2,
+                validation_data=self.val_dataset,
+                callbacks=[tensorboard],
+            )
 
 
 ###################################################################################################################################
 
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
-    with STRATEGY.scope():
-        run = Starter(
-            "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
-        )
 
-        # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
+    run = Starter(
+        "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
+    )
 
-        run.tuner()
+    # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
+
+    run.tuner()
