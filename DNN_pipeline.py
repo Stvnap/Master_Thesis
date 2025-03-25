@@ -1,11 +1,18 @@
 ###################################################################################################################################
+''''
+File after Dataset_preprocessing.py
+This file is used to create a DNN model using the preprocessed dataset
 
-# File after Dataset_preprocessing.py
-# This file is used to create a DNN model using the preprocessed dataset
+INFOS:
+HARD CODED CPU:1 USE FOR TESTING PURPOSES
+Switch to STRATEGY = tf.distribute.MirroredStrategy() and change the with self.strategy: to with self.strategy.scope(): for GPU usage
 
-# Tasks:
-# Check datasplitting, reason for high overfitting/ accuracy in train & val set
+QUESTIONS:
+Still uses double batching (batch two times during data creation and during tuning)
+due to the mismatch in input dimension (dimension expected: [none,target_dimension,21]; without the batching during data creation its [21,target_dimension])
+is there a fix for this?
 
+'''
 ###################################################################################################################################
 # imports
 
@@ -17,24 +24,23 @@ import keras_tuner as kt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from keras import regularizers
 from keras.callbacks import ReduceLROnPlateau, TensorBoard
-from keras.layers import Dense, Dropout, Flatten
+from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
+from tensorflow.keras import backend as K
 
 # from tensorflow.keras.callbacks import TensorBoard
 
 ###################################################################################################################################
 # STRATEGY = tf.distribute.MirroredStrategy()
-STRATEGY = tf.device("/GPU:1")
+STRATEGY = tf.device("/CPU:1")
 
 
-
-class HyperModel(kt.HyperModel):
+class MyHyperModel(kt.HyperModel):
     def __init__(self, target_dimension, strategy=STRATEGY):
         self.target_dimension = target_dimension
         self.strategy = strategy
@@ -42,59 +48,64 @@ class HyperModel(kt.HyperModel):
     def build(self, hp):
         # with self.strategy.scope():
         with self.strategy:
-
-            model = Sequential()
-            model.add(Flatten(input_shape=(self.target_dimension, 21)))
-
-            model.add(
-                Dense(
-                    units=hp.Int("units", min_value=20*155, max_value=22*155, step=32),
-                    activation=hp.Choice("activation", ["relu", "tanh"]),
-                )
-            )
-
-            if hp.Boolean("dropout"):
-                model.add(Dropout(rate=hp.Float("dropout_rate", 0.1, 0.5, step=0.1)))
-
-            if hp.Boolean("dense"):
-                model.add(
-                    Dense(
-                        units=hp.Int("units", min_value=32, max_value=512, step=32),
-                        activation=hp.Choice("activation", ["relu", "tanh"]),
-                    )
-                )
-
-                if hp.Boolean("dropout2"):
-                    model.add(
-                        Dropout(rate=hp.Float("dropout_rate2", 0.1, 0.5, step=0.1))
-                    )
-
-            if hp.Boolean("dense2"):
-                model.add(
-                    Dense(
-                        units=hp.Int("units", min_value=32, max_value=512, step=32),
-                        activation=hp.Choice("activation", ["relu", "tanh"]),
-                    )
-                )
-
-                if hp.Boolean("dropout3"):
-                    model.add(
-                        Dropout(rate=hp.Float("dropout_rate2", 0.1, 0.5, step=0.1))
-                    )
-
-            model.add(
-                Dense(
-                    1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
-                )
-            )
+            n_neurons = hp.Int("n_neurons", min_value=3100, max_value=3400)
+            n_hidden = hp.Int("n_hidden", min_value=2, max_value=24, default=8)
 
             learning_rate = hp.Float(
                 "lr", min_value=1e-4, max_value=1e-2, sampling="log"
             )
+            optimizer = hp.Choice("optimizer", values=["adam", "sgd"])
+            activation = hp.Choice(
+                "activation", values=["leaky_relu", "sigmoid", "elu"]
+            )
+            dropout_rate = hp.Float("drop_rate", min_value=0.1, max_value=0.5, step=0.1)
 
+            if optimizer == "adam":
+                optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-07
+                )
+            else:
+                optimizer = tf.keras.optimizers.SGD(
+                    learning_rate=learning_rate,
+                    nesterov=True,  # , decay=1e-4 for power scheduling
+                )
+
+            if activation == "leaky_relu":
+                activation = tf.keras.layers.LeakyReLU(negative_slope=0.2)
+                kernel_init = "he_normal"
+            elif activation == "sigmoid":
+                activation = "sigmoid"
+                kernel_init = "glorot_normal"
+            elif activation == "elu":
+                activation = "elu"
+                kernel_init = "he_normal"
+            else:
+                pass
+
+            model = Sequential()
+            model.add(Input(shape=(self.target_dimension, 21)))
+            model.add(Flatten())
+
+            for current_layer in range(n_hidden):
+                if current_layer <= 5:
+                    model.add(tf.keras.layers.Dropout(rate=dropout_rate))
+
+                model.add(
+                    Dense(
+                        n_neurons,
+                        activation=activation,
+                        kernel_initializer=kernel_init,
+                        kernel_constraint=tf.keras.constraints.max_norm(1.0),
+                        kernel_regularizer=tf.keras.regularizers.l2(hp.Float('l2_reg', min_value=1e-6, max_value=1e-2, step=1e-6)),
+                    )
+                )
+
+            model.add(Dense(1, activation="sigmoid"))
+
+            hp.Int("batch_size", 32, 512, step=32)
 
             model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                optimizer=optimizer,
                 loss="binary_crossentropy",
                 metrics=["accuracy", "precision", "recall", "AUC"],
             )
@@ -102,12 +113,17 @@ class HyperModel(kt.HyperModel):
             return model
 
     def fit(self, hp, model, *args, **kwargs):
-        with self.strategy:
-            return model.fit(
-                *args,
-                batch_size=hp.Int("batch_size", 32, 256, step=32, default=64),
-                **kwargs,
-            )
+        kwargs["batch_size"] = hp.get("batch_size")
+        model =model.fit(*args, **kwargs)
+        K.clear_session()                               # added to prevent memory spill
+        return model
+
+
+
+class MyTuner(kt.tuners.BayesianOptimization):
+    def run_trial(self, trial, *args, **kwargs):
+        kwargs["batch_size"] = trial.hyperparameters.get("batch_size")
+        return super(MyTuner, self).run_trial(trial, *args, **kwargs)
 
 
 class Starter:
@@ -195,6 +211,8 @@ class Starter:
     def _one_hot(self):
         start_time = time.time()
         with tf.device("/CPU:0"):
+            # with self.strategy.scope():
+
             df_one_hot = [
                 tf.one_hot(int_sequence, 21)
                 for int_sequence in self.padded["Sequences"]
@@ -220,52 +238,63 @@ class Starter:
     def _splitter(self):
         start_time = time.time()
 
-        self.class_weights = compute_class_weight(
-            "balanced",
-            classes=np.unique(self.padded_label["Labels"]),
-            y=self.padded_label["Labels"],
-        )
-        self.class_weight_dict = dict(enumerate(self.class_weights))
+        with tf.device("/CPU:0"):
+            self.class_weights = compute_class_weight(
+                "balanced",
+                classes=np.unique(self.padded_label["Labels"]),
+                y=self.padded_label["Labels"],
+            )
+            self.class_weight_dict = dict(enumerate(self.class_weights))
 
-        tensor_df = tf.data.Dataset.from_tensor_slices(
-            (self.df_one_hot, self.padded_label["Labels"])
-        )
+            tensor_df = tf.data.Dataset.from_tensor_slices(
+                (self.df_one_hot, self.padded_label["Labels"])
+            )
 
-        features, labels = [], []
-        for feature, label in tensor_df:
-            features.append(feature.numpy())
-            labels.append(label.numpy())
+            features, labels = [], []
+            for feature, label in tensor_df:
+                features.append(feature)
+                labels.append(label)
 
-        features = np.array(features)
-        labels = np.array(labels)
+            features = np.array(features)
+            labels = np.array(labels)
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, labels, test_size=0.3, stratify=labels, random_state=42
-        )
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, labels, test_size=0.3, stratify=labels, random_state=42
+            )
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
-        )
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
+            )
 
-        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-        val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
-        test_dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
+            train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+            val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+            test_dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
 
-        train_dataset = train_dataset.shuffle(buffer_size=218468).batch(32)
-        val_dataset = val_dataset.batch(32)
-        test_dataset = test_dataset.batch(32)
+            train_dataset.shuffle(buffer_size=1000, seed=4213122)
+            val_dataset = val_dataset.shuffle(buffer_size=1000, seed=4213122)
+            test_dataset = test_dataset.shuffle(buffer_size=1000, seed=4213122)
 
-        train_dataset.save("trainset")
-        val_dataset.save("valset")
-        test_dataset.save("testset")
+            train_dataset = train_dataset.batch(512)
+            val_dataset = val_dataset.batch(512)
+            test_dataset = test_dataset.batch(512)
 
-        print(f"Train dataset size: {len(X_train)}")
-        print(f"Validation dataset size: {len(X_val)}")
-        print(f"Test dataset size: {len(X_test)}")
+            train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+            val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+            test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-        print(f"Stratified split completed in {time.time() - start_time:.2f} seconds")
+            train_dataset.save("trainset")
+            val_dataset.save("valset")
+            test_dataset.save("testset")
 
-        return train_dataset, val_dataset, test_dataset
+            print(f"Train dataset size: {len(X_train)}")
+            print(f"Validation dataset size: {len(X_val)}")
+            print(f"Test dataset size: {len(X_test)}")
+
+            print(
+                f"Stratified split completed in {time.time() - start_time:.2f} seconds"
+            )
+
+            return train_dataset, val_dataset, test_dataset
 
     def _loader(self):
         self.class_weights = compute_class_weight(
@@ -280,54 +309,6 @@ class Starter:
         test_dataset = tf.data.Dataset.load("testset")
 
         return train_dataset, val_dataset, test_dataset
-
-    # def _modeler(self, hp):
-    #     start_time = time.time()
-
-    #     strategy = tf.distribute.MirroredStrategy()
-
-    #     with strategy.scope():
-    #         model = Sequential()
-
-    #         # Flatten layer
-    #         model.add(Flatten(input_shape=(self.target_dimension, 21)))
-
-    #         # Dense layer with hyperparameters
-    #         model.add(
-    #             Dense(
-    #                 units=hp.Int("units", min_value=5, max_value=505, step=25),
-    #                 activation=hp.Choice("activation", ["relu", "tanh"]),
-    #             )
-    #         )
-
-    #         # Conditionally add the Dropout layer
-    #         if hp.Boolean("dropout"):
-    #             model.add(Dropout(rate=0.25))
-
-    #         # Output layer
-    #         model.add(
-    #             Dense(
-    #                 1, activation="sigmoid", kernel_regularizer=regularizers.l2(0.001)
-    #             )
-    #         )
-
-    #         print(model.summary())
-
-    #         learning_rate = hp.Float(
-    #             "lr", min_value=1e-4, max_value=1e-2, sampling="log"
-    #         )
-
-    #         model.compile(
-    #             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-    #             loss="binary_crossentropy",
-    #             metrics=["accuracy", "precision", "recall", "AUC", "f1_score"],
-    #         )
-
-    #     end_time = time.time()
-    #     elapsed_time = end_time - start_time
-    #     print(f"Done modelling\nElapsed Time: {elapsed_time:.4f} seconds")
-
-    #     return model
 
     def trainer(self):
         start_time = time.time()
@@ -360,14 +341,14 @@ class Starter:
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
     def tuner(self):
-        hypermodel = HyperModel(target_dimension=self.target_dimension)
+        start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
-        tuner = kt.RandomSearch(
-            hypermodel=hypermodel.build,
-            objective="val_AUC",
+        tuner = MyTuner(
+            hypermodel=MyHyperModel(target_dimension=self.target_dimension),
+            objective="val_accuracy",
             max_trials=30,
             executions_per_trial=2,
-            overwrite=True,
+            overwrite=False,
             directory="./logshp",
             project_name=(f"run_{timestamp}"),
         )
@@ -383,20 +364,24 @@ class Starter:
         )
 
         tuner.search_space_summary()
-        
+
         print(
             "\n",
             "\n",
             "\n",
         )
         with self.strategy:
-
             tuner.search(
                 self.train_dataset,
                 epochs=2,
                 validation_data=self.val_dataset,
                 callbacks=[tensorboard],
+                class_weight=self.class_weight_dict,
             )
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Done tuning\nElapsed Time: {elapsed_time:.4f} seconds")
 
 
 ###################################################################################################################################

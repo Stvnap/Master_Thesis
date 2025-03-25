@@ -21,3 +21,4 @@ trainset/
 valset/
 testset/
 models/
+.venv/
