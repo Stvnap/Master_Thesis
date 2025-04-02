@@ -3,13 +3,15 @@ Current tasks:
 Hyperparameter tuning is set to be run on the palma cluster with parameters:
 (trying now to run it there)
 
+batch_size              512
 n_neurons               3100; 3400 
 n_hidden layers         2; 24
 lr                      1e-4; 1e-2 log
 optimizer               ["adam", "sgd"]
 activation              ["leaky_relu", "sigmoid", "elu"]
 drop_rate               0.1; 0.5 step=0.1
-batch_size              32; 256 step=32
+
+
 
 
 Further Information:

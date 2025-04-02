@@ -22,3 +22,8 @@ valset/
 testset/
 models/
 .venv/
+bestmodels/
+__pycache__/
+
+
+fastacutter.py

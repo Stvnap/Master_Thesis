@@ -1,18 +1,18 @@
 ###################################################################################################################################
-''''
-File after Dataset_preprocessing.py
+"""'
+File after Dataset_preprocessing.pya
 This file is used to create a DNN model using the preprocessed dataset
 
 INFOS:
-HARD CODED CPU:1 USE FOR TESTING PURPOSES
+HARDt CODED CPU:1 USE FOR TESTING PURPOSES
 Switch to STRATEGY = tf.distribute.MirroredStrategy() and change the with self.strategy: to with self.strategy.scope(): for GPU usage
 
 QUESTIONS:
 Still uses double batching (batch two times during data creation and during tuning)
-due to the mismatch in input dimension (dimension expected: [none,target_dimension,21]; without the batching during data creation its [21,target_dimension])
-is there a fix for this?
+due to the mismatch inc input dimension (dimension expected: [none,target_dimension,21]; without the batching during data creation its [21,target_dimension])
+ish there a fix for this?
 
-'''
+"""
 ###################################################################################################################################
 # imports
 
@@ -24,6 +24,7 @@ import keras_tuner as kt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from keras import backend as K
 from keras.callbacks import ReduceLROnPlateau, TensorBoard
 from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
@@ -31,25 +32,44 @@ from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
-from tensorflow.keras import backend as K
-
-# from tensorflow.keras.callbacks import TensorBoard
+import gc
 
 ###################################################################################################################################
-# STRATEGY = tf.distribute.MirroredStrategy()
-STRATEGY = tf.device("/CPU:1")
+
+gpus = tf.config.experimental.list_physical_devices("GPU")
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+print(f"GPUs available: {len(gpus)}")
+
+STRATEGY = tf.distribute.MirroredStrategy()
+print(f"Number of devices: {STRATEGY.num_replicas_in_sync}")
+
+
+BATCH_SIZE = 64
+
+
+
 
 
 class MyHyperModel(kt.HyperModel):
     def __init__(self, target_dimension, strategy=STRATEGY):
         self.target_dimension = target_dimension
         self.strategy = strategy
+        # K.clear_session()
+
 
     def build(self, hp):
         # with self.strategy.scope():
-        with self.strategy:
+        with tf.device("/GPU:0"):
+
+
+
+            # K.clear_session(free_memory=True)
+            print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+
             n_neurons = hp.Int("n_neurons", min_value=3100, max_value=3400)
-            n_hidden = hp.Int("n_hidden", min_value=2, max_value=24, default=8)
+            n_hidden = hp.Int("n_hidden", min_value=2, max_value=8, default=2)
 
             learning_rate = hp.Float(
                 "lr", min_value=1e-4, max_value=1e-2, sampling="log"
@@ -96,13 +116,16 @@ class MyHyperModel(kt.HyperModel):
                         activation=activation,
                         kernel_initializer=kernel_init,
                         kernel_constraint=tf.keras.constraints.max_norm(1.0),
-                        kernel_regularizer=tf.keras.regularizers.l2(hp.Float('l2_reg', min_value=1e-6, max_value=1e-2, step=1e-6)),
+                        kernel_regularizer=tf.keras.regularizers.l2(
+                            hp.Float(
+                                "l2_reg", min_value=1e-6, max_value=1e-2, step=1e-6
+                            )
+                        ),
                     )
                 )
 
             model.add(Dense(1, activation="sigmoid"))
 
-            hp.Int("batch_size", 32, 512, step=32)
 
             model.compile(
                 optimizer=optimizer,
@@ -110,30 +133,29 @@ class MyHyperModel(kt.HyperModel):
                 metrics=["accuracy", "precision", "recall", "AUC"],
             )
 
+            # K.clear_session()
+
             return model
 
     def fit(self, hp, model, *args, **kwargs):
-        kwargs["batch_size"] = hp.get("batch_size")
-        model =model.fit(*args, **kwargs)
-        K.clear_session()                               # added to prevent memory spill
+        # K.clear_session() 
+        model = model.fit(*args, **kwargs)
+        K.clear_session()  
+        gc.collect()
         return model
 
 
 
-class MyTuner(kt.tuners.BayesianOptimization):
-    def run_trial(self, trial, *args, **kwargs):
-        kwargs["batch_size"] = trial.hyperparameters.get("batch_size")
-        return super(MyTuner, self).run_trial(trial, *args, **kwargs)
-
 
 class Starter:
-    def __init__(self, df_path, strategy=STRATEGY):
+    def __init__(self, df_path, strategy=STRATEGY,batch_size=BATCH_SIZE):
+        self.batch_size = batch_size
         self.strategy = strategy
         self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
         self.df_int = self._sequence_to_int()
         self.target_dimension = len(self.df["Sequences"].max())
         self.padded = self._padder()
-        self.df_one_hot = self._one_hot()
+        # self.df_one_hot = self._one_hot()
         self.padded_label = self._labler()
         # self.train_dataset, self.val_dataset, self.test_dataset = self._splitter()
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
@@ -211,7 +233,6 @@ class Starter:
     def _one_hot(self):
         start_time = time.time()
         with tf.device("/CPU:0"):
-            # with self.strategy.scope():
 
             df_one_hot = [
                 tf.one_hot(int_sequence, 21)
@@ -274,13 +295,6 @@ class Starter:
             val_dataset = val_dataset.shuffle(buffer_size=1000, seed=4213122)
             test_dataset = test_dataset.shuffle(buffer_size=1000, seed=4213122)
 
-            train_dataset = train_dataset.batch(512)
-            val_dataset = val_dataset.batch(512)
-            test_dataset = test_dataset.batch(512)
-
-            train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-            val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-            test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
             train_dataset.save("trainset")
             val_dataset.save("valset")
@@ -308,50 +322,53 @@ class Starter:
         val_dataset = tf.data.Dataset.load("valset")
         test_dataset = tf.data.Dataset.load("testset")
 
+
+        print(f"Train dataset size: {len(train_dataset)}")
+
+
+        train_dataset= train_dataset.take(len(train_dataset)-152)
+
+
+        if len(train_dataset)%4%128 == 0:
+            print("true now")
+            print("division check:",len(train_dataset)%4%128)
+
+
+        print(f"Train dataset size now: {len(train_dataset)}")
+
+
+
+        train_dataset = train_dataset.batch(self.batch_size)
+        val_dataset = val_dataset.batch(self.batch_size)
+        test_dataset = test_dataset.batch(self.batch_size)
+        
+        train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+
         return train_dataset, val_dataset, test_dataset
 
-    def trainer(self):
-        start_time = time.time()
-        # with self.strategy.scope():
-        reduce_lr = ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
-        )
-        log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
-
-        tensorboard_cb = TensorBoard(log_dir=log_dir)
-
-        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-
-        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-            f"models/run_{timestamp}.keras", save_best_only=True
-        )
-
-        early_stopping_cb = keras.callbacks.EarlyStopping(
-            patience=10, restore_best_weights=True, monitor="val_loss"
-        )
-        history = self.model.fit(
-            self.train_dataset,
-            epochs=500,
-            validation_data=self.val_dataset,
-            callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
-            class_weight=self.class_weight_dict,
-        )
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
     def tuner(self):
         start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
-        tuner = MyTuner(
-            hypermodel=MyHyperModel(target_dimension=self.target_dimension),
-            objective="val_accuracy",
-            max_trials=30,
-            executions_per_trial=2,
-            overwrite=False,
-            directory="./logshp",
-            project_name=(f"run_{timestamp}"),
-        )
+        
+        
+        
+        with tf.device("/GPU:0"):
+        # with self.strategy.scope():
+            self.tuner = kt.BayesianOptimization(
+                hypermodel=MyHyperModel(
+                    target_dimension=self.target_dimension, strategy=self.strategy
+                ),
+                objective="val_accuracy",
+                max_trials=1,
+                # executions_per_trial=2,
+                overwrite=False,
+                directory="./logshp",
+                project_name=(f"run_{timestamp}"),
+            )
 
         log_dir = f"./logshp/tb_{datetime.datetime.now().strftime('%Y_%m_%d-%H_%M')}"
         os.makedirs(log_dir, exist_ok=True)
@@ -363,25 +380,58 @@ class Starter:
             "\n",
         )
 
-        tuner.search_space_summary()
+        os.makedirs('logshp/weights', exist_ok=True)
+
+        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            f"logshp/weights/run_{timestamp}.weights.h5",
+            save_best_only=True,
+            save_weights_only=True,
+            monitor="val_loss",
+            mode="min",
+        )
+
+
+        self.tuner.search_space_summary()
 
         print(
             "\n",
             "\n",
             "\n",
         )
-        with self.strategy:
-            tuner.search(
+        for batch in self.train_dataset.take(1):
+            print(f"Dataset batch shape: {batch[0].shape}")
+
+        # with self.strategy.scope():
+        with tf.device("/GPU:0"):
+            self.tuner.search(
                 self.train_dataset,
-                epochs=2,
+                epochs=1,
                 validation_data=self.val_dataset,
-                callbacks=[tensorboard],
+                callbacks=[
+                    tensorboard,
+                    checkpoint_cb
+                ],
                 class_weight=self.class_weight_dict,
             )
 
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done tuning\nElapsed Time: {elapsed_time:.4f} seconds")
+
+
+    def trials_loader(self):
+        trials = self.tuner.oracle.get_best_trials(num_trials=1)
+        # Print out the ID and the score of all trials
+        for trial_id, trial in trials.items():
+            print(trial_id, trial.score)
+
+        # Return best 5 trials
+        best_trials = self.tuner.oracle.get_best_trials(num_trials=2)
+        for trial in best_trials:
+            trial.summary()
+            bestmodel = self.tuner.load_model(trial)
+            # Do some stuff to the model
+        return bestmodel
 
 
 ###################################################################################################################################
@@ -396,3 +446,19 @@ if __name__ == "__main__":
     # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
 
     run.tuner()
+    timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
+    os.makedirs(f"./bestmodels/{timestamp}", exist_ok=True)
+    models = run.tuner.get_best_models(num_models=3)
+    best_model = models[0]
+    best_model.summary()
+    best_model.save(f"./bestmodels/{timestamp}/best_model.keras")
+
+    second_model = models[1]
+    second_model.save(f"./bestmodels/{timestamp}/second_best_model.h5")
+
+    third_model = models[2]
+    third_model.save(f"./bestmodels/{timestamp}/third_best_model.h5")
+
+
+
+
