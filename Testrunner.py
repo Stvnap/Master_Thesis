@@ -1,31 +1,41 @@
 import datetime
+import json
 import os
 import time
 
-import keras_tuner as kt
+import keras
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import keras
-from keras import backend as K
-from keras.callbacks import ReduceLROnPlateau, TensorBoard
+from keras.callbacks import TensorBoard
 from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
+from keras.saving import load_model
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
-import gc
 
-
-BATCH_SIZE = 64
+STRATEGY = tf.distribute.MirroredStrategy()
+BATCH_SIZE = 256
 
 print(tf.keras.__version__)
 print(tf.__version__)
 
 
+# with STRATEGY.scope():
+
+
 class Predictor:
-    def __init__(self,modelpath,df_path='./datatestSwissProt.csv', batch_size=BATCH_SIZE):
+    def __init__(
+        self,
+        modelpath,
+        weightpath,
+        df_path="./datatestSwissProt.csv",
+        batch_size=BATCH_SIZE,
+        strategy=STRATEGY,
+    ):
+        self.strategy = strategy
         self.batch_size = batch_size
         self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
         self.df_int = self._sequence_to_int()
@@ -33,8 +43,79 @@ class Predictor:
         self.padded = self._padder()
         self.padded_label = self._labler()
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
-        self.model=tf.keras.models.load_model(modelpath)        # self.model.summary()
+        # self.weightpath = weightpath
+        # self.json_path=modelpath
+        # # self.model=tf.keras.models.load_model(modelpath)        # self.model.summary()
+        # self.model_values= self.fromjson(self.json_path)
+        # self.model= self.buildfromjson()
 
+    def fromjson(self, json_path):
+        with open(json_path, "r") as f:
+            json_data = json.load(f)
+        # print(json_data)
+        json_data = json_data["hyperparameters"]["values"]
+        # print(json_data)
+
+        return json_data
+
+    def buildfromjson(self):
+        if self.model_values["activation"] == "leaky_relu":
+            activation = tf.keras.layers.LeakyReLU(negative_slope=0.2)
+            kernel_init = "he_normal"
+        elif self.model_values["activation"] == "sigmoid":
+            activation = "sigmoid"
+            kernel_init = "glorot_normal"
+        elif self.model_values["activation"] == "elu":
+            activation = "elu"
+            kernel_init = "he_normal"
+        else:
+            pass
+
+        if self.model_values["optimizer"] == "adam":
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=self.model_values["lr"],
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-07,
+            )
+        else:
+            optimizer = tf.keras.optimizers.SGD(
+                learning_rate=self.model_values["lr"],
+                nesterov=True,  # , decay=1e-4 for power scheduling
+            )
+
+        model = Sequential()
+        model.add(Input(shape=(self.target_dimension, 21)))
+        model.add(Flatten())
+
+        for i in range(self.model_values["n_hidden"]):
+            if i <= 5:
+                model.add(tf.keras.layers.Dropout(rate=self.model_values["drop_rate"]))
+
+            model.add(
+                Dense(
+                    self.model_values["n_neurons"],
+                    activation=activation,
+                    kernel_initializer=kernel_init,
+                    kernel_constraint=tf.keras.constraints.max_norm(1.0),
+                    kernel_regularizer=tf.keras.regularizers.l2(
+                        self.model_values["l2_reg"]
+                    ),
+                ),
+            )
+
+        model.add(Dense(1, activation="sigmoid"))
+
+        model.compile(
+            optimizer=optimizer,
+            loss="binary_crossentropy",
+            metrics=["accuracy", "precision", "recall", "AUC"],
+        )
+
+        model.load_weights(self.weightpath)
+
+        model.summary()
+        return model
 
     def _sequence_to_int(self):
         start_time = time.time()
@@ -67,6 +148,7 @@ class Predictor:
             "O": 21,  # Pyrrolysin
         }
         self.df = self.df.dropna(subset=["Sequences"])
+
         def encode_sequence(seq):
             return [amino_acid_to_int[amino_acid] for amino_acid in seq]
 
@@ -113,7 +195,6 @@ class Predictor:
         elapsed_time = end_time - start_time
         print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
         return self.padded_label
-    
 
     def _loader(self):
         self.class_weights = compute_class_weight(
@@ -122,6 +203,7 @@ class Predictor:
             y=self.padded_label["Labels"],
         )
         self.class_weight_dict = dict(enumerate(self.class_weights))
+        print(self.class_weight_dict)
 
         train_dataset = tf.data.Dataset.load("trainset")
         val_dataset = tf.data.Dataset.load("valset")
@@ -130,7 +212,7 @@ class Predictor:
         train_dataset = train_dataset.batch(self.batch_size)
         val_dataset = val_dataset.batch(self.batch_size)
         test_dataset = test_dataset.batch(self.batch_size)
-        
+
         train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
         val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
         test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
@@ -139,14 +221,12 @@ class Predictor:
 
     def trainer(self):
         start_time = time.time()
-        reduce_lr = ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
-        )
-        log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M_%S"))
+
+        log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M"))
 
         tensorboard_cb = TensorBoard(log_dir=log_dir)
 
-        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+        timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
 
         checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             f"models/run_{timestamp}.keras", save_best_only=True
@@ -155,36 +235,31 @@ class Predictor:
         early_stopping_cb = keras.callbacks.EarlyStopping(
             patience=10, restore_best_weights=True, monitor="val_loss"
         )
+
         self.history = self.model.fit(
             self.train_dataset,
-            epochs=500,
+            epochs=1,
             validation_data=self.val_dataset,
-            callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb, reduce_lr],
+            callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb],
             class_weight=self.class_weight_dict,
         )
+        self.model.save("models/my_model")
+        self.model.save("models/my_model.keras")
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
+    
 
-
-    def predict(self):
-        start_time = time.time()
-        predictions = self.history.predict(self.train_dataset, batch_size=self.batch_size)
-        predictions = np.argmax(predictions, axis=1)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done predicting\nElapsed Time: {elapsed_time:.4f} seconds")
-        return predictions
 
 ##################################################################################################################################################################
 if __name__ == "__main__":
+    # prediction=Predictor("/global/research/students/sapelt/Masters/MasterThesis/bestmodels/2025_04_02-10_42/best_model.keras")
 
-    prediction=Predictor("/global/research/students/sapelt/Masters/MasterThesis/bestmodels/2025_04_02-10_42/best_model.keras")
+    prediction = Predictor(
+        "/global/research/students/sapelt/Masters/MasterThesis/logshp/run_20250406_145252/trial_01/trial.json",
+        "/global/research/students/sapelt/Masters/MasterThesis/logshp/run_20250406_145252/trial_01/checkpoint.weights.h5",
+    )
 
-    prediction.trainer()
-
-
-
-
+    # prediction.trainer()
 
