@@ -1,25 +1,23 @@
-import datetime
-import json
-import os
 import time
-
-import keras
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from keras.callbacks import TensorBoard
-from keras.layers import Dense, Flatten, Input
-from keras.models import Sequential
+gpus = tf.config.list_physical_devices('GPU')
+tf.config.set_visible_devices(  # Disable GPU, for testing purposes, crashes on GPU
+    [], "GPU"
+)
 from keras.preprocessing.sequence import pad_sequences
 from keras.saving import load_model
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.python import keras
+from sklearn.metrics import classification_report, confusion_matrix
+
 from Testrunner import BATCH_SIZE
 
 ##########################################################################################
 
-def predicting():
+df_path="./DataEvalSwiss80%.csv"
+model_path='./models/my_modelnewlabeling.keras'
+
+def predicting(modelpath, Evalset):
     def sequence_to_int(df_path):
         start_time = time.time()
 
@@ -72,7 +70,7 @@ def predicting():
         # print(self.target_dimension)
         padded = pad_sequences(
             sequences,
-            maxlen=len(df_int["Sequences"].max()),
+            maxlen=148,
             padding="post",
             truncating="post",
             value=21,
@@ -88,57 +86,82 @@ def predicting():
 
     def labler(padded):
         start_time = time.time()
-        padded["Labels"] = padded["categories"].apply(lambda x: 0 if x == 0 else 1)
+        padded["Labels"] = padded["overlap"].apply(lambda x: 1 if x == 1 else 0)
         padded_label = padded
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
         return padded_label
-    
+
     def one_hot(padded):
         start_time = time.time()
         with tf.device("/CPU:0"):
-            df_one_hot = np.array([
-                tf.one_hot(int_sequence, 21).numpy() for int_sequence in padded["Sequences"]
-            ])
+            df_one_hot = np.array(
+                [
+                    tf.one_hot(int_sequence, 21).numpy()
+                    for int_sequence in padded["Sequences"]
+                ]
+            )
             end_time = time.time()
             elapsed_time = end_time - start_time
             print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
             return df_one_hot
-        
 
-
-    df = sequence_to_int("./datatestSwissProt.csv")
+    df = sequence_to_int(Evalset)
     padder_df = padder(df)
-    print(padder_df)
+    print(padder_df["Sequences"].apply(len).max())
     labled_df = labler(padder_df)
+
+    # print(labled_df)$
     df_onehot = one_hot(padder_df)
     X_train = df_onehot
     y_train = labled_df["Labels"]
+    # print(y_train)
 
     start_time = time.time()
     print("starting prediction")
     model = load_model(
-        "./models/run_2025_04_03-16_01_43.keras",
+        modelpath,
         custom_objects={"LeakyReLU": tf.keras.layers.LeakyReLU},
     )
     print("model loaded")
     with tf.device("/CPU:0"):
         predictions = model.predict(X_train, batch_size=BATCH_SIZE)
     print("predictions made")
-    predictions = np.argmax(predictions, axis=1)
+    print(predictions)
+    predictions_bool = []
+    for value in predictions:
+        if value >= 0.5:
+            bool = 1
+        else:
+            bool = 0
+        predictions_bool.append(bool)
+
+    print(predictions_bool[0:10])
     true_labels = y_train
-    accuracy = np.mean(predictions == true_labels)
+
+    print(len(true_labels))
+    print(len(predictions_bool))
+
+    def accuracy_score(y_true, y_pred):
+        return (y_true == y_pred).mean()
+
+
+    accuracy = accuracy_score(true_labels, predictions_bool)
+
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"Predictions: {predictions}")
-    print(f"True Labels: {true_labels}")
+    # print(f"Predictions: {predictions}")
+    # print(f"True Labels: {true_labels}")
     print(f"Accuracy: {accuracy * 100:.2f}%")
     print(f"Done predicting\nElapsed Time: {elapsed_time:.4f} seconds")
-    return predictions
+    print(confusion_matrix(true_labels, predictions_bool))
+    print(classification_report(true_labels, predictions_bool))
+
+    return predictions, true_labels
 
 
 #####################################################################################
 
 if __name__ == "__main__":
-    predicting()
+    predictions,true_labels=predicting(model_path, df_path)

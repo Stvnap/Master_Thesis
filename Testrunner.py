@@ -11,10 +11,10 @@ from keras.callbacks import TensorBoard
 from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
-from keras.saving import load_model
-from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.python import keras
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
 STRATEGY = tf.distribute.MirroredStrategy()
 BATCH_SIZE = 256
@@ -26,12 +26,12 @@ print(tf.__version__)
 # with STRATEGY.scope():
 
 
-class Predictor:
+class Testrunning:
     def __init__(
         self,
         modelpath,
         weightpath,
-        df_path="./datatestSwissProt.csv",
+        df_path="./DataTrainSwissProt.csv",
         batch_size=BATCH_SIZE,
         strategy=STRATEGY,
     ):
@@ -40,14 +40,16 @@ class Predictor:
         self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
         self.df_int = self._sequence_to_int()
         self.target_dimension = len(self.df["Sequences"].max())
+        # print(self.target_dimension,'target dimension')
         self.padded = self._padder()
         self.padded_label = self._labler()
+        print(self.padded_label)
+        # self.train_dataset, self.val_dataset, self.test_dataset = self.splitter2()   
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
-        # self.weightpath = weightpath
-        # self.json_path=modelpath
-        # # self.model=tf.keras.models.load_model(modelpath)        # self.model.summary()
-        # self.model_values= self.fromjson(self.json_path)
-        # self.model= self.buildfromjson()
+        self.weightpath = weightpath
+        self.json_path = modelpath
+        self.model_values = self.fromjson(self.json_path)
+        self.model = self.buildfromjson()
 
     def fromjson(self, json_path):
         with open(json_path, "r") as f:
@@ -108,7 +110,8 @@ class Predictor:
 
         model.compile(
             optimizer=optimizer,
-            loss="binary_crossentropy",
+            loss=tf.keras.losses.BinaryFocalCrossentropy(
+                gamma=1.0, apply_class_balancing=True),
             metrics=["accuracy", "precision", "recall", "AUC"],
         )
 
@@ -181,20 +184,54 @@ class Predictor:
         elapsed_time = end_time - start_time
 
         print(f"Done padding\nElapsed Time: {elapsed_time:.4f} seconds")
-        # print(self.df_int)
+        print(self.df_int)
 
         return self.df_int
 
     def _labler(self):
         start_time = time.time()
         self.padded["Labels"] = self.padded["categories"].apply(
-            lambda x: 0 if x == 0 else 1
+            lambda x: 1
+            if x == 0
+            else 0  # SWAPPED LABELING FOR POSITIVE DOMAIN FROM 0 TO 1
         )
         self.padded_label = self.padded
+        self.padded_label = self.padded_label.drop(columns=["categories"])
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
         return self.padded_label
+
+
+
+    def splitter2(self):
+        start_time = time.time()
+
+        train_df, temp_df = train_test_split(
+            self.padded_label,
+            test_size=0.4,
+            stratify=self.padded_label["Labels"],
+            random_state=42,
+        )
+
+        val_df, test_df = train_test_split(
+            temp_df, test_size=0.5, stratify=temp_df["Labels"], random_state=42
+        )
+
+        print(f"Train set shape: {train_df.shape}")
+        print(f"Validation set shape: {val_df.shape}")
+        print(f"Test set shape: {test_df.shape}")
+
+        train_df.to_csv("trainset.csv", index=False)
+        val_df.to_csv("valset.csv", index=False)
+        test_df.to_csv("testset.csv", index=False)
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
+
+        return train_df, val_df, test_df
+
 
     def _loader(self):
         self.class_weights = compute_class_weight(
@@ -236,30 +273,27 @@ class Predictor:
             patience=10, restore_best_weights=True, monitor="val_loss"
         )
 
+        print("Starting training")
+        
         self.history = self.model.fit(
             self.train_dataset,
-            epochs=1,
+            epochs=500,
             validation_data=self.val_dataset,
             callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb],
-            class_weight=self.class_weight_dict,
+            # class_weight=self.class_weight_dict,
         )
-        self.model.save("models/my_model")
-        self.model.save("models/my_model.keras")
+        self.model.save("models/my_modelFocalLoss.keras")
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
 
-    
-
 
 ##################################################################################################################################################################
 if __name__ == "__main__":
-    # prediction=Predictor("/global/research/students/sapelt/Masters/MasterThesis/bestmodels/2025_04_02-10_42/best_model.keras")
 
-    prediction = Predictor(
-        "/global/research/students/sapelt/Masters/MasterThesis/logshp/run_20250406_145252/trial_01/trial.json",
-        "/global/research/students/sapelt/Masters/MasterThesis/logshp/run_20250406_145252/trial_01/checkpoint.weights.h5",
+    Testrun = Testrunning(
+        "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/trial.json",
+        "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/checkpoint.weights.h5",
     )
 
-    # prediction.trainer()
-
+    Testrun.trainer()

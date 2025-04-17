@@ -239,39 +239,41 @@ class databaseCreater:
 
     def _multiplier(self, seqarray_full, sliding):
         start_time = time.time()
-        result_list = []  # List to collect DataFrames
-        category_index = 0
-        for nested_list in sliding:
-            nested_list = pd.DataFrame(nested_list, columns=["Sequences"])
 
-            categories = seqarray_full.iloc[category_index]["categories"]
-            nested_list["categories"] = categories
+        sequences = []
+        categories = []
+
+        category_index = 0
+
+        for nested_list in sliding:
+            # nested_list is expected to be a list of sequences (strings)
+            current_category = seqarray_full.iloc[category_index]["categories"]
+
+            for seq in nested_list:
+                sequences.append(seq)
+                categories.append(current_category)
 
             category_index += 1
 
-            # Append the DataFrame to the result list instead of concatenating
-            temp_df = pd.DataFrame(
-                {
-                    "Sequences": nested_list["Sequences"],
-                    "categories": nested_list["categories"],
-                }
-            )
-            result_list.append(temp_df)
+            if category_index % 10000 == 0:
+                print(f"Iteration: {category_index} / {len(seqarray_full)}")
 
-            if category_index % 1000 == 0:
-                print("iteration:", category_index)
+        # Create DataFrame once
+        sliding_df = pd.DataFrame({
+            "Sequences": sequences,
+            "categories": categories
+        })
 
-        # Concatenate all DataFrames in the result list at once
-        sliding_df = pd.concat(result_list, ignore_index=True)
-        print(sliding_df)
         elapsed_time = time.time() - start_time
-        print(f"\tDone multipling\n\tElapsed Time: {elapsed_time:.4f} seconds")
+        print(f"\t Done multiplying in {elapsed_time:.2f} seconds")
+        print(sliding_df)
+
         return sliding_df
 
     def _saver(self):
         start_time = time.time()
         print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("DataEvalALLHEREREALLY.csv", index=False)
+        self.seqarray_final.to_csv("DataTrainALL.csv", index=False)
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -282,137 +284,62 @@ class databaseCreater:
 ########### FOR CREATING TRAINING DATASET, FOR TRAINING THE MODEL ###########
 
 if __name__ == "__main__":
-    
-    # # positive Domain PF00177
-    # print("Loading positive domain PF00177")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/domains_PF00177.fa"
-    # )
-    # seqarray_clean, seqarraylen_clean, normaltest = (
-    #     fasta.distribution_finder_and_cleaner(fasta.len_finder())
-    # )
-    # dimension_positive = fasta.dimension_finder(seqarraylen_clean)
-    # # print("targeted dimension", dimension_positive)
-
-    # # negative Domains:
-    # print("Loading negative PF00079")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/domains_PF00079.fa"
-    # )
-    # seqarray_clean_PF00079, seqarraylen_clean_PF00079, normaltest_PF00079 = (
-    #     fasta.distribution_finder_and_cleaner(fasta.len_finder())
-    # )
-    # print("Loading negative PF00080")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/domains_PF00080.fa"
-    # )
-    # seqarray_clean_PF00080, seqarraylen_clean_PF00080, normaltest_PF00080 = (
-    #     fasta.distribution_finder_and_cleaner(fasta.len_finder())
-    # )
-    # print("Loading negative PF00118")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/domains_PF00118.fa"
-    # )
-    # seqarray_clean_PF00118, seqarraylen_clean_PF00118, normaltest_PF00118 = (
-    #     fasta.distribution_finder_and_cleaner(fasta.len_finder())
-    # )
-    # print("Loading negative PF00162")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/domains_PF00162.fa"
-    # )
-    # seqarray_clean_PF00162, seqarraylen_clean_PF00162, normaltest_PF00162 = (
-    #     fasta.distribution_finder_and_cleaner(fasta.len_finder())
-    # )
-
-    # # load in swissprot and trembl
-    # print("Loading swissprot")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/alluniprot/sprot_domains.fa"
-    # )
-    # seqarray_clean_rnd_sprot = fasta._load_in_SwissProt()
-
-    # print("Loading trembl")
-    # fasta = DomainProcessing(
-    #     "/global/research/students/sapelt/Masters/alluniprot/trembl_domains.fa"
-    # )
-    # seqarray_clean_rnd_trembl = fasta._load_in_Trembl()
-
-    # ################### Data creation ########################
-    # print("Starting data creation")
-    # dataset = databaseCreater(
-    #     seqarray_clean,
-    #     seqarray_clean_PF00079,
-    #     seqarray_clean_PF00080,
-    #     seqarray_clean_PF00118,
-    #     seqarray_clean_PF00162,
-    #     seqarray_clean_rnd_sprot,
-    #     seqarray_clean_rnd_trembl,
-    #     dimension_positive,
-    #     10,
-    # )
-    # ##############################################################
-    # print("All done creating Training dataset")
-
-    ##################################################################################################################################################
-
-    ###### FOR CREATING FULL SEQUENCE DATASET, FOR EVALUTATING PERFORMANCE ######
-
     # positive Domain PF00177
     print("Loading positive domain PF00177")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00177.fasta"
+        "/global/research/students/sapelt/Masters/domains_PF00177.fa"
     )
     seqarray_clean, seqarraylen_clean, normaltest = (
         fasta.distribution_finder_and_cleaner(fasta.len_finder())
     )
     dimension_positive = fasta.dimension_finder(seqarraylen_clean)
-    print("targeted dimension", dimension_positive)
+    # print("targeted dimension", dimension_positive)
 
     # negative Domains:
     print("Loading negative PF00079")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00079.fasta"
+        "/global/research/students/sapelt/Masters/domains_PF00079.fa"
     )
     seqarray_clean_PF00079, seqarraylen_clean_PF00079, normaltest_PF00079 = (
         fasta.distribution_finder_and_cleaner(fasta.len_finder())
     )
     print("Loading negative PF00080")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00080.fasta"
+        "/global/research/students/sapelt/Masters/domains_PF00080.fa"
     )
     seqarray_clean_PF00080, seqarraylen_clean_PF00080, normaltest_PF00080 = (
         fasta.distribution_finder_and_cleaner(fasta.len_finder())
     )
     print("Loading negative PF00118")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00118.fasta"
+        "/global/research/students/sapelt/Masters/domains_PF00118.fa"
     )
     seqarray_clean_PF00118, seqarraylen_clean_PF00118, normaltest_PF00118 = (
         fasta.distribution_finder_and_cleaner(fasta.len_finder())
     )
     print("Loading negative PF00162")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00162.fasta"
+        "/global/research/students/sapelt/Masters/domains_PF00162.fa"
     )
     seqarray_clean_PF00162, seqarraylen_clean_PF00162, normaltest_PF00162 = (
         fasta.distribution_finder_and_cleaner(fasta.len_finder())
     )
 
     # load in swissprot and trembl
-
+    print("Loading swissprot")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/alluniprot/uniprot_sprot.fasta"
+        "/global/research/students/sapelt/Masters/domains_uniprot_sprot.fa"
     )
     seqarray_clean_rnd_sprot = fasta._load_in_SwissProt()
 
     print("Loading trembl")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/alluniprot/uniprot_trembl.fasta"
+        "/global/research/students/sapelt/Masters/domains_uniprot_trembl.fa"
     )
     seqarray_clean_rnd_trembl = fasta._load_in_Trembl()
 
     ################### Data creation ########################
-    print("Starting data creation for SwissProt validation set")
+    print("Starting data creation")
     dataset = databaseCreater(
         seqarray_clean,
         seqarray_clean_PF00079,
@@ -422,7 +349,8 @@ if __name__ == "__main__":
         seqarray_clean_rnd_sprot,
         seqarray_clean_rnd_trembl,
         dimension_positive,
-        0,
+        10,
     )
     ##############################################################
-    print("All done creating evaluation dataset with full sequences")
+    print("All done creating Training dataset")
+

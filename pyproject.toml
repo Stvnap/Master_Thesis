@@ -9,10 +9,13 @@ dependencies = [
     "datetime>=5.5",
     "keras==3.6",
     "keras-tuner>=1.4.7",
+    "matplotlib>=3.9.4",
     "numpy==1.26.0",
     "nvidia-tensorrt>=99.0.0",
     "pandas>=2.2.3",
+    "pip>=25.0.1",
     "scikit-learn>=1.6.1",
+    "seaborn>=0.13.2",
     "tensorflow[and-cuda]==2.17.0",
     "tensorrt>=10.9.0.34",
 ]

@@ -17,21 +17,20 @@ ish there a fix for this?
 # imports
 
 import datetime
-import gc
 import os
 import time
+
 import keras_tuner as kt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from keras import backend as K
 from keras.callbacks import EarlyStopping, TensorBoard
 from keras.layers import Dense, Flatten, Input
-from keras.losses import BinaryCrossentropy
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+
 ###################################################################################################################################
 
 
@@ -45,7 +44,6 @@ print(BATCH_SIZE)
 
 print(tf.keras.__version__)
 print(tf.__version__)
-
 
 
 class MyHyperModel(kt.HyperModel):
@@ -64,6 +62,8 @@ class MyHyperModel(kt.HyperModel):
         optimizer = hp.Choice("optimizer", values=["adam", "sgd"])
         activation = hp.Choice("activation", values=["leaky_relu", "sigmoid", "elu"])
         dropout_rate = hp.Float("drop_rate", min_value=0.1, max_value=0.5, step=0.1)
+
+        gammaloss = hp.Float("gamma_loss", min_value=0.5, max_value=5.0, step=0.5)
 
         if optimizer == "adam":
             optimizer = tf.keras.optimizers.Adam(
@@ -109,17 +109,21 @@ class MyHyperModel(kt.HyperModel):
 
         model.add(Dense(1, activation="sigmoid"))
 
-        def loss2(y_true, y_pred):
-            bce_loss = BinaryCrossentropy()
-            err = bce_loss(y_true, y_pred)
-            loss = tf.cond(
-                tf.size(y_pred) == 0, lambda: 0.0, lambda: tf.math.reduce_mean(err)
+
+
+        loss_name = hp.Choice("loss", values=["binary_crossentropy", "binary_focal_crossentropy"])
+
+        if loss_name == "binary_crossentropy":
+            loss_fn = tf.keras.losses.BinaryCrossentropy()
+        elif loss_name == "binary_focal_crossentropy":
+            loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
+                gamma=gammaloss, alpha=0.5, apply_class_balancing=False
             )
-            return loss
+
 
         model.compile(
             optimizer=optimizer,
-            loss=loss2,
+            loss=loss_fn,
             metrics=["accuracy", "precision", "recall", "AUC"],
         )
 
@@ -145,14 +149,12 @@ class Starter:
         self.test_df_onehot = self._one_hot(self.test_df)
 
         # self.train_df_ready = self._creater(
-        #     self.train_df, self.train_df_onehot,'trainset')
+        #     self.train_df, self.train_df_onehot, "trainset"
+        # )
 
-        # self.val_df_ready = self._creater(
-        #     self.val_df, self.val_df_onehot,'valset')
+        # self.val_df_ready = self._creater(self.val_df, self.val_df_onehot, "valset")
 
-        # self.test_df_ready = self._creater(
-        #     self.test_df, self.test_df_onehot,'testset')
-
+        # self.test_df_ready = self._creater(self.test_df, self.test_df_onehot, "testset")
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 
@@ -226,17 +228,15 @@ class Starter:
 
         return self.df_int
 
-
     ############### needs to split dataset here to gather the IDs used in the test set #################
     #### then go on to one hot encoding
 
     def _labler(self):
         start_time = time.time()
         self.padded["Labels"] = self.padded["categories"].apply(
-            lambda x: 0 if x == 0 else 1
+            lambda x: 1 if x == 0 else 0
         )
         self.labeled_df = self.padded
-
 
         self.class_weights = compute_class_weight(
             "balanced",
@@ -244,6 +244,8 @@ class Starter:
             y=self.labeled_df["Labels"],
         )
         self.class_weight_dict = dict(enumerate(self.class_weights))
+
+        print(self.class_weight_dict)
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -253,9 +255,16 @@ class Starter:
     def splitter2(self):
         start_time = time.time()
 
-        train_df, temp_df = train_test_split(self.labeled_df, test_size=0.4, stratify=self.labeled_df['Labels'], random_state=42)
+        train_df, temp_df = train_test_split(
+            self.labeled_df,
+            test_size=0.4,
+            stratify=self.labeled_df["Labels"],
+            random_state=42,
+        )
 
-        val_df, test_df = train_test_split(temp_df, test_size=0.5, stratify=temp_df['Labels'], random_state=42)
+        val_df, test_df = train_test_split(
+            temp_df, test_size=0.5, stratify=temp_df["Labels"], random_state=42
+        )
 
         print(f"Train set shape: {train_df.shape}")
         print(f"Validation set shape: {val_df.shape}")
@@ -268,16 +277,14 @@ class Starter:
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
-        
+
         return train_df, val_df, test_df
 
-
-    def _one_hot(self,_df):
+    def _one_hot(self, _df):
         start_time = time.time()
         with tf.device("/CPU:0"):
             df_one_hot = [
-                tf.one_hot(int_sequence, 21)
-                for int_sequence in _df["Sequences"]
+                tf.one_hot(int_sequence, 21) for int_sequence in _df["Sequences"]
             ]
             end_time = time.time()
             elapsed_time = end_time - start_time
@@ -286,32 +293,19 @@ class Starter:
             # print(len(self.padded))
             return df_one_hot
 
-
-
-
-
-    def _creater(self, df,df_onehot,name):
+    def _creater(self, df, df_onehot, name):
         start_time = time.time()
 
         with tf.device("/CPU:0"):
-
-
-            tensor_df = tf.data.Dataset.from_tensor_slices(
-                (df_onehot, df["Labels"])
-            )
-
+            tensor_df = tf.data.Dataset.from_tensor_slices((df_onehot, df["Labels"]))
 
             tensor_df.shuffle(buffer_size=1000, seed=4213122)
 
-
             tensor_df.save(name)
-
 
             print(f"dataset size: {len(tensor_df)}")
 
-            print(
-                f"Creation completed in {time.time() - start_time:.2f} seconds"
-            )
+            print(f"Creation completed in {time.time() - start_time:.2f} seconds")
 
             return tensor_df
 
@@ -338,9 +332,7 @@ class Starter:
         train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
         val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
         test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-        print(
-            f"Loading completed in {time.time() - start_time:.2f} seconds"
-        )
+        print(f"Loading completed in {time.time() - start_time:.2f} seconds")
         return train_dataset, val_dataset, test_dataset
 
     def tuner(self):
@@ -368,9 +360,7 @@ class Starter:
         # Initialize tuner inside strategy scope
         # with self.strategy.scope():
         self.tuner = kt.BayesianOptimization(
-            hypermodel=MyHyperModel(
-                target_dimension=self.target_dimension
-            ),
+            hypermodel=MyHyperModel(target_dimension=self.target_dimension),
             objective="val_loss",
             max_trials=1,
             overwrite=False,
@@ -391,7 +381,7 @@ class Starter:
             epochs=1,
             validation_data=self.val_dataset,
             callbacks=[tensorboard, checkpoint_cb, early_stopping],
-            class_weight=self.class_weight_dict,
+            class_weight=self.class_weight_dict,  # removed when using focal loss
         )
 
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M")
@@ -416,8 +406,6 @@ class Starter:
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
 
-    run = Starter("./datatestSwissProt.csv")
-
-    # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
+    run = Starter("./DataTrainSwissProt.csv")
 
     run.tuner()

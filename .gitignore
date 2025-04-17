@@ -24,6 +24,8 @@ models/
 .venv/
 bestmodels/
 __pycache__/
+Evalresults/
 
 
 fastacutter.py
+Dataset_preprocess_v2old.py
