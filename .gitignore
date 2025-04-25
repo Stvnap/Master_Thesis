@@ -13,6 +13,7 @@
 *.h5
 *.csv
 *.keras
+*.parquet
 
 # directories #
 logs/
@@ -20,6 +21,9 @@ logshp/
 trainset/
 valset/
 testset/
+trainsetOLD/
+valsetOLD/
+testsetOLD/
 models/
 .venv/
 bestmodels/
@@ -29,3 +33,6 @@ Evalresults/
 
 fastacutter.py
 Dataset_preprocess_v2old.py
+
+
+test*

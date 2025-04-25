@@ -64,7 +64,8 @@ class MyHyperModel(kt.HyperModel):
         dropout_rate = hp.Float("drop_rate", min_value=0.1, max_value=0.5, step=0.1)
 
         gammaloss = hp.Float("gamma_loss", min_value=0.5, max_value=5.0, step=0.5)
-
+        alphaloss = hp.Choice("alpha_loss", values=[0.1, 0.25, 0.5, 0.75, 0.9])
+        
         if optimizer == "adam":
             optimizer = tf.keras.optimizers.Adam(
                 learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-07
@@ -117,7 +118,7 @@ class MyHyperModel(kt.HyperModel):
             loss_fn = tf.keras.losses.BinaryCrossentropy()
         elif loss_name == "binary_focal_crossentropy":
             loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
-                gamma=gammaloss, alpha=0.5, apply_class_balancing=False
+                gamma=gammaloss, alpha=alphaloss.5, apply_class_balancing=False
             )
 
 
@@ -148,17 +149,16 @@ class Starter:
         self.val_df_onehot = self._one_hot(self.val_df)
         self.test_df_onehot = self._one_hot(self.test_df)
 
-        # self.train_df_ready = self._creater(
-        #     self.train_df, self.train_df_onehot, "trainset"
-        # )
+        self.train_df_ready = self._creater(
+            self.train_df, self.train_df_onehot, "trainset"
+        )
 
-        # self.val_df_ready = self._creater(self.val_df, self.val_df_onehot, "valset")
+        self.val_df_ready = self._creater(self.val_df, self.val_df_onehot, "valset")
 
-        # self.test_df_ready = self._creater(self.test_df, self.test_df_onehot, "testset")
+        self.test_df_ready = self._creater(self.test_df, self.test_df_onehot, "testset")
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 
-        # self.model = self._modeler(kt.HyperParameters())
 
     def _sequence_to_int(self):
         start_time = time.time()
@@ -245,7 +245,7 @@ class Starter:
         )
         self.class_weight_dict = dict(enumerate(self.class_weights))
 
-        print(self.class_weight_dict)
+        print("Class weights",self.class_weight_dict)
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -406,6 +406,6 @@ class Starter:
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
 
-    run = Starter("./DataTrainSwissProt.csv")
+    run = Starter("./DataTrainALL.csv")
 
     run.tuner()

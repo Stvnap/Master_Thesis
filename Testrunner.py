@@ -2,7 +2,7 @@ import datetime
 import json
 import os
 import time
-
+import polars as pl
 import keras
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ BATCH_SIZE = 256
 
 print(tf.keras.__version__)
 print(tf.__version__)
+print(pl.__version__)
 
 
 # with STRATEGY.scope():
@@ -37,14 +38,38 @@ class Testrunning:
     ):
         self.strategy = strategy
         self.batch_size = batch_size
-        self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
+        print("opening Train data")
+        self.df = pl.read_csv(
+            df_path,
+            dtypes={
+                "Sequences": pl.Utf8,  
+                "categories": pl.Int8, 
+            },
+        )  # Open CSV file
+
         self.df_int = self._sequence_to_int()
-        self.target_dimension = len(self.df["Sequences"].max())
-        # print(self.target_dimension,'target dimension')
+        self.target_dimension = self.df.select(max=pl.col("Sequences").list.len().max()).item()
+        print(self.target_dimension)
         self.padded = self._padder()
         self.padded_label = self._labler()
         print(self.padded_label)
-        # self.train_dataset, self.val_dataset, self.test_dataset = self.splitter2()   
+        self.train_dataset, self.val_dataset, self.test_dataset = self.splitter2()
+        self.train_df_onehot = self._one_hot(self.train_dataset)
+        self.val_df_onehot = self._one_hot(self.val_dataset)
+        self.test_df_onehot = self._one_hot(self.test_dataset)
+
+        self.train_df_ready = self._creater(
+            self.train_dataset, self.train_df_onehot, "trainset"
+        )
+
+        self.val_df_ready = self._creater(
+            self.val_dataset, self.val_df_onehot, "valset"
+        )
+
+        self.test_df_ready = self._creater(
+            self.test_dataset, self.test_df_onehot, "testset"
+        )
+
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
         self.weightpath = weightpath
         self.json_path = modelpath
@@ -110,8 +135,7 @@ class Testrunning:
 
         model.compile(
             optimizer=optimizer,
-            loss=tf.keras.losses.BinaryFocalCrossentropy(
-                gamma=1.0, apply_class_balancing=True),
+            loss=tf.keras.losses.BinaryCrossentropy(),
             metrics=["accuracy", "precision", "recall", "AUC"],
         )
 
@@ -124,38 +148,70 @@ class Testrunning:
         start_time = time.time()
 
         amino_acid_to_int = {
-            "A": 1,  # Alanine
-            "C": 2,  # Cysteine
-            "D": 3,  # Aspartic Acid
-            "E": 4,  # Glutamic Acid
-            "F": 5,  # Phenylalanine
-            "G": 6,  # Glycine
-            "H": 7,  # Histidine
-            "I": 8,  # Isoleucine
-            "K": 9,  # Lysine
-            "L": 10,  # Leucine
-            "M": 11,  # Methionine
-            "N": 12,  # Asparagine
-            "P": 13,  # Proline
-            "Q": 14,  # Glutamine
-            "R": 15,  # Arginine
-            "S": 16,  # Serine
-            "T": 17,  # Threonine
-            "V": 18,  # Valine
-            "W": 19,  # Tryptophan
-            "Y": 20,  # Tyrosine
-            "X": 21,  # Unknown or special character                (21 for all other AA)
-            "Z": 21,  # Glutamine (Q) or Glutamic acid (E)
-            "B": 21,  # Asparagine (N) or Aspartic acid (D)
-            "U": 21,  # Selenocysteine
-            "O": 21,  # Pyrrolysin
+            "A": 1,
+            "a": 1,  # Alanine
+            "C": 2,
+            "c": 2,  # Cysteine
+            "D": 3,
+            "d": 3,  # Aspartic Acid
+            "E": 4,
+            "e": 4,  # Glutamic Acid
+            "F": 5,
+            "f": 5,  # Phenylalanine
+            "G": 6,
+            "g": 6,  # Glycine
+            "H": 7,
+            "h": 7,  # Histidine
+            "I": 8,
+            "i": 8,  # Isoleucine
+            "K": 9,
+            "k": 9,  # Lysine
+            "L": 10,
+            "l": 10,  # Leucine
+            "M": 11,
+            "m": 11,  # Methionine
+            "N": 12,
+            "n": 12,  # Asparagine
+            "P": 13,
+            "p": 13,  # Proline
+            "Q": 14,
+            "q": 14,  # Glutamine
+            "R": 15,
+            "r": 15,  # Arginine
+            "S": 16,
+            "s": 16,  # Serine
+            "T": 17,
+            "t": 17,  # Threonine
+            "V": 18,
+            "v": 18,  # Valine
+            "W": 19,
+            "w": 19,  # Tryptophan
+            "Y": 20,
+            "y": 20,  # Tyrosine
+            "X": 21,
+            "x": 21,  # Unknown or special character
+            "Z": 21,
+            "z": 21,  # Glutamine or Glutamic Acid
+            "B": 21,
+            "b": 21,  # Asparagine or Aspartic Acid
+            "U": 21,
+            "u": 21,  # Selenocysteine
+            "O": 21,
+            "o": 21,  # Pyrrolysine
         }
-        self.df = self.df.dropna(subset=["Sequences"])
+
+        self.df = self.df.drop_nulls(subset=["Sequences"])
 
         def encode_sequence(seq):
             return [amino_acid_to_int[amino_acid] for amino_acid in seq]
+        print(type(self.df))
 
-        self.df["Sequences"] = self.df["Sequences"].apply(encode_sequence)
+        self.df = self.df.with_columns(
+            pl.col("Sequences").map_elements(encode_sequence,return_dtype=pl.List(pl.Int16)).alias("Sequences")
+        )
+
+
+
 
         # print(self.df)
         # print(type(self.df))
@@ -167,7 +223,7 @@ class Testrunning:
 
     def _padder(self):
         start_time = time.time()
-        sequences = self.df_int["Sequences"].tolist()
+        sequences = self.df_int["Sequences"].to_list()
         # print(type(sequences))
         # print(sequences[0:3])
         # print(self.target_dimension)
@@ -179,7 +235,9 @@ class Testrunning:
             value=21,
         )
         # print(padded)
-        self.df_int["Sequences"] = list(padded)
+        self.df_int = self.df_int.with_columns(
+            pl.lit(padded).alias("Sequences")
+)        
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -190,19 +248,18 @@ class Testrunning:
 
     def _labler(self):
         start_time = time.time()
-        self.padded["Labels"] = self.padded["categories"].apply(
-            lambda x: 1
-            if x == 0
-            else 0  # SWAPPED LABELING FOR POSITIVE DOMAIN FROM 0 TO 1
+        self.padded = self.padded.with_columns(
+            pl.when(pl.col("categories") == 0)
+            .then(1)
+            .otherwise(0)
+            .alias("Labels")
         )
         self.padded_label = self.padded
-        self.padded_label = self.padded_label.drop(columns=["categories"])
+        self.padded_label = self.padded_label.drop("categories")
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
         return self.padded_label
-
-
 
     def splitter2(self):
         start_time = time.time()
@@ -222,9 +279,10 @@ class Testrunning:
         print(f"Validation set shape: {val_df.shape}")
         print(f"Test set shape: {test_df.shape}")
 
-        train_df.to_csv("trainset.csv", index=False)
-        val_df.to_csv("valset.csv", index=False)
-        test_df.to_csv("testset.csv", index=False)
+        train_df.write_parquet("trainsetALL.parquet")
+        val_df.write_parquet("valsetALL.parquet")
+        test_df.write_parquet("testsetALL.parquet")
+
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -232,6 +290,34 @@ class Testrunning:
 
         return train_df, val_df, test_df
 
+    def _one_hot(self, _df):
+        start_time = time.time()
+        with tf.device("/CPU:0"):
+            df_one_hot = [
+                tf.one_hot(int_sequence, 21) for int_sequence in _df["Sequences"]
+            ]
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
+            # print(len(df_one_hot))
+            # print(len(self.padded))
+            return df_one_hot
+
+    def _creater(self, df, df_onehot, name):
+        start_time = time.time()
+
+        with tf.device("/CPU:0"):
+            tensor_df = tf.data.Dataset.from_tensor_slices((df_onehot, df["Labels"]))
+
+            tensor_df.shuffle(buffer_size=1000, seed=4213122)
+
+            tensor_df.save(name)
+
+            print(f"dataset size: {len(tensor_df)}")
+
+            print(f"Creation completed in {time.time() - start_time:.2f} seconds")
+
+            return tensor_df
 
     def _loader(self):
         self.class_weights = compute_class_weight(
@@ -274,7 +360,7 @@ class Testrunning:
         )
 
         print("Starting training")
-        
+
         self.history = self.model.fit(
             self.train_dataset,
             epochs=500,
@@ -290,7 +376,6 @@ class Testrunning:
 
 ##################################################################################################################################################################
 if __name__ == "__main__":
-
     Testrun = Testrunning(
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/trial.json",
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/checkpoint.weights.h5",
