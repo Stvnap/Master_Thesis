@@ -33,6 +33,7 @@ Evalresults/
 
 fastacutter.py
 Dataset_preprocess_v2old.py
-
+csv_to_fasta.py
+Dataset_preprocess.py
 
 test*

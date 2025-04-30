@@ -15,7 +15,7 @@ dependencies = [
     "nvidia-tensorrt>=99.0.0",
     "pandas>=2.2.3",
     "pip>=25.0.1",
-    "polars>=1.27.1",
+    "polars-u64-idx>=1.28.1",
     "scikit-learn>=1.6.1",
     "seaborn>=0.13.2",
     "tensorflow[and-cuda]==2.17.0",
