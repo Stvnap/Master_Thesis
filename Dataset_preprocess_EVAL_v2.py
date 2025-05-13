@@ -22,6 +22,11 @@ from Bio import SeqIO
 
 
 class DomainProcessing:
+    """
+    Class processing the load in and creation of all dataframes needed. 
+    As well as the determination of the dimension length of the target domain.
+    """
+
     def __init__(self, domain_path):
         self.domain_path = domain_path
         self.boundaries_all = []
@@ -29,19 +34,10 @@ class DomainProcessing:
         self.id_all = []
         self._opener()
 
-        # if (
-        #     domain_path
-        #     == "/global/research/students/sapelt/Masters/alluniprot/sprot_domains.fa"
-        # ):
-        #     self._load_in_SwissProt()
-
-        # if (
-        #     domain_path
-        #     == "/global/research/students/sapelt/Masters/alluniprot/trembl_domains.fa"
-        # ):
-        #     self._load_in_Trembl()
-
     def _opener(self):
+        """
+        Opens the .csv file and creates of type IDs, Sequence and found Boundaries by Interproscan
+        """
         start_time = time.time()
         with open(self.domain_path, "r") as file:
             records = list(SeqIO.parse(file, "fasta"))
@@ -111,15 +107,6 @@ class DomainProcessing:
 
         sequence_all = pd.DataFrame({"ID": self.id_all, "Sequences": self.sequence_all})
 
-        # print('length boudnaries from array',len(boundary_array))
-
-        # print('lenth seqlist',len(sequence_all))
-
-        # if len(boundary_array)== len(sequence_all):
-        #     print('lengths match')
-        # else:
-        #     print("MISMATCH")
-
         self.merged_df = pd.merge(boundary_array, sequence_all, on="ID", how="outer")
 
         print("MERGED", self.merged_df)
@@ -129,9 +116,15 @@ class DomainProcessing:
         print(f"\tDone opening\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
     def len_finder(self):
+        """
+        Function to determine the Sequence length of every sequence
+        """
         return [len(seq) for seq in self.sequence_all]
 
-    def distribution_finder_and_cleaner(self, seqlen):
+    def distribution_finder(self, seqlen):
+        """
+        Finds the distribution of sequence lengths of the corresponding domain, options for shapiro test.
+        """
         start_time = time.time()
         seqarraylen = np.array(seqlen)
         # shapiro = stats.shapiro(seqarraylen)
@@ -139,21 +132,6 @@ class DomainProcessing:
         seqarraylen_clean = seqarraylen  # [(seqarraylen>=np.quantile(seqarraylen,0.125/2)) & (seqarraylen<=np.quantile(seqarraylen,0.875))]
         # print(seqarraylen_clean)
         seqarray = self.merged_df
-
-        # addition of minimultiplier for boundaries
-
-        def minimultiplier(seqarray, boundaries_all):
-            seqarray = seqarray.copy()
-            for i in range(len(seqarray)):
-                if seqarray["ID"][i] == seqarray["ID"][i - 1]:
-                    seqarray["Sequences"][i] = seqarray["Sequences"][i][
-                        int(boundaries_all[i].split("-")[0]) : int(
-                            boundaries_all[i].split("-")[1]
-                        )
-                    ]
-                    # print(seqarray['Sequences'][i])
-                    # print(seqarray['ID'][i])
-                    # print(boundaries_all[i])
 
         print(seqarray)
         seqarray_clean = seqarray  # [(np.char.str_len(seqarray)>=np.quantile(seqarraylen,0.125/2)) & (np.char.str_len(seqarray)<=np.quantile(seqarraylen,0.875))]
@@ -167,6 +145,9 @@ class DomainProcessing:
         return seqarray_clean, self.boundaries_all
 
     def dimension_finder(self, seqarray_len):
+        """
+        Finds the dimension for the target domain by using the 0.65 quantile of all seqlengths
+        """
         start_time = time.time()
         # print(seqarray_len)
         seqarray_len_clean = int(np.quantile(seqarray_len, 0.65))
@@ -175,9 +156,14 @@ class DomainProcessing:
         return seqarray_len_clean
 
     def _load_in_SwissProt(self):
+        """
+        loads in the SwissProt database and performs the functions len_finder() 
+        and distribution_finder() on this dataset. 
+        Returns the seqarray with the IDs and Sequences as well as a list of boundaries for this dataset
+        """
         start_time = time.time()
         seqlen_rnd_sprot = self.len_finder()
-        seqarray_clean_rnd_sprot, boundaries_all = self.distribution_finder_and_cleaner(
+        seqarray_clean_rnd_sprot, boundaries_all = self.distribution_finder(
             seqlen_rnd_sprot
         )
         # print(seqarray_clean_rnd_sprot)
@@ -186,12 +172,17 @@ class DomainProcessing:
         return seqarray_clean_rnd_sprot, boundaries_all
 
     def _load_in_Trembl(self):
+        """
+        loads in the Trembl database and performs the functions len_finder() 
+        and distribution_finder() on this dataset. 
+        Returns the seqarray with the IDs and Sequences as well as a list of boundaries for this dataset
+        """
         start_time = time.time()
         seqlen_rnd_trembl = self.len_finder()
         (
             seqarray_clean_rnd_trembl,
             boundaries_all,
-        ) = self.distribution_finder_and_cleaner(seqlen_rnd_trembl)
+        ) = self.distribution_finder(seqlen_rnd_trembl)
         # print(seqarray_clean_rnd_sprot)
         elapsed_time = time.time() - start_time
         print(f"\tDone loading Trembl\n\tElapsed Time: {elapsed_time:.4f} seconds")
@@ -199,6 +190,13 @@ class DomainProcessing:
 
 
 class databaseCreater:
+    """
+    Class for creating the actual file for model evaluation. 
+    Used as input are the target domain df, random other domain df, sprot and trembl df, 
+    dimension of the target domain, stepsize (default no overlap), and all boudnaries of all domains. 
+    All variables are created with the class DomainProcessing
+    """
+
     def __init__(
         self,
         seqarray_clean,
@@ -212,6 +210,8 @@ class databaseCreater:
         stepsize,
         boundaries_all,
     ):
+        ##################################################################################
+
         self.seqarray_clean = seqarray_clean
         self.seqarray_clean_PF00079 = seqarray_clean_PF00079
         self.seqarray_clean_PF00080 = seqarray_clean_PF00080
@@ -227,7 +227,10 @@ class databaseCreater:
         self.stepsize = stepsize
         self.boundaries_all = boundaries_all
 
+        ##################################################################################
+
         self.seqarray_full = self._concat_double_delete()
+
         print("after concat", self.seqarray_full)
         print(len(self.boundaries_all), len(self.seqarray_full))
 
@@ -241,11 +244,16 @@ class databaseCreater:
 
         self.seqarray_multiplied = self._multiplier(self.seqarray_full, self.sliding)
 
-        self.seqarray_final = self._overlapChecker(self.seqarray_multiplied)
+        self.seqarray_final = self._overlapCalculater(self.seqarray_multiplied)
 
         self._saver()
 
     def _concat_double_delete(self):
+        """
+        Concatinates and deletes identical entries to one df. 
+        Categories are added: 0 = target domain, 1 = rnd domains, 2 = rnd protein sequences.
+        Returns the full df with all sequences.
+        """
         start_time = time.time()
         seq_labels_positive = self.seqarray_clean[1:]
         seq_labels_positive = seq_labels_positive.copy()
@@ -267,9 +275,6 @@ class databaseCreater:
 
         seqarray_clean_rnd_all = seqarray_clean_rnd_all.copy()
         seqarray_clean_rnd_all["categories"] = 2
-
-        # print(seq_labels_negative_domains)
-        # print(seq_labels_positive)
 
         seq_labels_all_domains = pd.concat(
             [seq_labels_positive, seq_labels_negative_domains]
@@ -302,6 +307,12 @@ class databaseCreater:
         return seqarray_full
 
     def _sliding_window(self, seqarray, dimension, stepsize=1):
+        """
+        Produces sliding windows of a fixed length (dimension) over each entry in the df, with a set stepsize.
+        If the final window doesn't fit within the full dimension, 
+        the last positions (counting backward, len = dimension) are added to the list of windows.
+        Returns a series with all sliding window sequences.
+        """
         start_time = time.time()
         seqarray_sliding = []
         self.end_window = []
@@ -328,7 +339,14 @@ class databaseCreater:
         return pd.Series(seqarray_sliding)
 
     def _multiplier(self, seqarray_full, sliding):
+        """
+        Multiplies the IDs, boundaries, categories corresponding to the number of additionally created windows, 
+        to have one sliding widnow sequence, with the corresponding IDS, boudnaries and Category. 
+        Additionally the window position of the windows are given in a new column.
+        Returned is a final df with: Sequences, Categories, IDs, Boundaries, WindowPos.
+        """
         import time
+
         start_time = time.time()
 
         # Predefine lists for better performance
@@ -358,12 +376,18 @@ class databaseCreater:
                 # Calculate WindowPos as string
                 if i == len_nested - 1 and len_nested > 1:
                     # last window gets special end_window value
-                    last_window_start = self.end_window[category_index] - self.dimension_positive
+                    last_window_start = (
+                        self.end_window[category_index] - self.dimension_positive
+                    )
                     last_window_end = self.end_window[category_index]
                     window_pos = f"{last_window_start}-{last_window_end}"
                 else:
-                    start = i * self.dimension_positive - (self.stepsize * i if i > 0 else 0)
-                    end = (i + 1) * self.dimension_positive - (self.stepsize * i if i > 0 else 0)
+                    start = i * self.dimension_positive - (
+                        self.stepsize * i if i > 0 else 0
+                    )
+                    end = (i + 1) * self.dimension_positive - (
+                        self.stepsize * i if i > 0 else 0
+                    )
                     window_pos = f"{start}-{end}"
 
                 window_positions.append(window_pos)
@@ -371,28 +395,33 @@ class databaseCreater:
             category_index += 1
 
             if category_index % 10000 == 0:
-                print("Multiplication iteration:", category_index, "/", len(seqarray_full))
+                print(
+                    "Multiplication iteration:", category_index, "/", len(seqarray_full)
+                )
 
         # Convert once to DataFrame at the end
-        sliding_df = pd.DataFrame({
-            "Sequences": sequences,
-            "categories": categories,
-            "ID": ids,
-            "Boundaries": boundaries_all,
-            "WindowPos": window_positions
-        })
+        sliding_df = pd.DataFrame(
+            {
+                "Sequences": sequences,
+                "categories": categories,
+                "ID": ids,
+                "Boundaries": boundaries_all,
+                "WindowPos": window_positions,
+            }
+        )
 
         elapsed_time = time.time() - start_time
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
         return sliding_df
 
-
-    def _overlapChecker(self, seqarray_multiplied):
+    def _overlapCalculater(self, seqarray_multiplied):
         """
         Calculates the maximum overlap percentage between the window and any of the boundaries.
-        Stores the overlap percentage (0.0 to 1.0) in the 'overlap' column.
+        Stores the overlap percentage (0.0 to 1.0) in the 'overlap' column. 
+        Returned is the same df as entered with the addition of the 'overlap' column
         """
         import time  # Make sure time is imported
+
         start_time = time.time()
 
         overlaps = []
@@ -422,7 +451,9 @@ class databaseCreater:
                     boundary_length = boundary_end - boundary_start
 
                     # Compute overlap
-                    overlap = min(window_end, boundary_end) - max(window_start, boundary_start)
+                    overlap = min(window_end, boundary_end) - max(
+                        window_start, boundary_start
+                    )
                     overlap = max(overlap, 0)
 
                     reference_length = min(window_length, boundary_length)
@@ -431,7 +462,9 @@ class databaseCreater:
                         overlap_pct = overlap / reference_length
                         max_overlap_pct = max(max_overlap_pct, overlap_pct)
 
-                overlaps.append(round(max_overlap_pct, 4))  # Rounded to 4 decimal places
+                overlaps.append(
+                    round(max_overlap_pct, 4)
+                )  # Rounded to 4 decimal places
 
             except Exception:
                 overlaps.append(0.0)
@@ -441,11 +474,15 @@ class databaseCreater:
         print(f"\t Done checking overlap\n\t Elapsed Time: {elapsed_time:.4f} seconds")
         return seqarray_multiplied
 
-
     def _saver(self):
+        """
+        Saves the final df in a .csv file. Name of file is hardcoded
+        """
         start_time = time.time()
         print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("DataAllRegression.csv", index=False)
+        self.seqarray_final.to_csv(
+            "DataAllRegression.csv", index=False
+        )  # hardcoded filename
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -460,7 +497,7 @@ if __name__ == "__main__":
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawPF00177.fasta"
     )
-    seqarray_clean, boundaries_allPF00177 = fasta.distribution_finder_and_cleaner(
+    seqarray_clean, boundaries_allPF00177 = fasta.distribution_finder(
         fasta.len_finder()
     )
     dimension_positive = fasta.dimension_finder(fasta.len_finder())
@@ -471,29 +508,29 @@ if __name__ == "__main__":
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawPF00079.fasta"
     )
-    seqarray_clean_PF00079, boundaries_allPF00079 = (
-        fasta.distribution_finder_and_cleaner(fasta.len_finder())
+    seqarray_clean_PF00079, boundaries_allPF00079 = fasta.distribution_finder(
+        fasta.len_finder()
     )
     print("Loading negative PF00080")
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawPF00080.fasta"
     )
-    seqarray_clean_PF00080, boundaries_allPF00080 = (
-        fasta.distribution_finder_and_cleaner(fasta.len_finder())
+    seqarray_clean_PF00080, boundaries_allPF00080 = fasta.distribution_finder(
+        fasta.len_finder()
     )
     print("Loading negative PF00118")
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawPF00118.fasta"
     )
-    seqarray_clean_PF00118, boundaries_allPF00118 = (
-        fasta.distribution_finder_and_cleaner(fasta.len_finder())
+    seqarray_clean_PF00118, boundaries_allPF00118 = fasta.distribution_finder(
+        fasta.len_finder()
     )
     print("Loading negative PF00162")
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawPF00162.fasta"
     )
-    seqarray_clean_PF00162, boundaries_allPF00162 = (
-        fasta.distribution_finder_and_cleaner(fasta.len_finder())
+    seqarray_clean_PF00162, boundaries_allPF00162 = fasta.distribution_finder(
+        fasta.len_finder()
     )
 
     # load in swissprot and trembl
@@ -501,13 +538,13 @@ if __name__ == "__main__":
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawuniprot_sprot.fasta"
     )
-    seqarray_clean_rnd_sprot,boundaries_allSwissprot = fasta._load_in_SwissProt()
+    seqarray_clean_rnd_sprot, boundaries_allSwissprot = fasta._load_in_SwissProt()
 
     print("Loading trembl")
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/rawuniprot_trembl.fasta"
     )
-    seqarray_clean_rnd_trembl,boundaries_allTrembl = fasta._load_in_Trembl()
+    seqarray_clean_rnd_trembl, boundaries_allTrembl = fasta._load_in_Trembl()
 
     boundaries_all = [
         boundaries_allPF00177,

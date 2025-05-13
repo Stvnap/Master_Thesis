@@ -1,20 +1,14 @@
 ###################################################################################################################################
-"""'
-File after Dataset_preprocessing.pya
+"""
+File after Dataset_preprocessing.py
 This file is used to create a DNN model using the preprocessed dataset
 
 INFOS:
-HARDt CODED CPU:1 USE FOR TESTING PURPOSES
+HARD CODED CPU:1 USE FOR TESTING PURPOSES
 Switch to STRATEGY = tf.distribute.MirroredStrategy() and change the with self.strategy: to with self.strategy.scope(): for GPU usage
-
-QUESTIONS:
-Still uses double batching (batch two times during data creation and during tuning)
-due to the mismatch inc input dimension (dimension expected: [none,target_dimension,21]; without the batching during data creation its [21,target_dimension])
-ish there a fix for this?
 
 """
 ###################################################################################################################################
-# imports
 
 import datetime
 import os
@@ -47,11 +41,17 @@ print(tf.__version__)
 
 
 class MyHyperModel(kt.HyperModel):
+    """
+    Hypermodel for model structure and HP dimension.
+    """
+
     def __init__(self, target_dimension):
         self.target_dimension = target_dimension
 
     def build(self, hp):
-        # with self.strategy.scope():
+        """
+        actual build of the model with all HP variables
+        """
 
         print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
 
@@ -65,7 +65,7 @@ class MyHyperModel(kt.HyperModel):
 
         gammaloss = hp.Float("gamma_loss", min_value=0.5, max_value=5.0, step=0.5)
         alphaloss = hp.Choice("alpha_loss", values=[0.1, 0.25, 0.5, 0.75, 0.9])
-        
+
         if optimizer == "adam":
             optimizer = tf.keras.optimizers.Adam(
                 learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-07
@@ -110,17 +110,16 @@ class MyHyperModel(kt.HyperModel):
 
         model.add(Dense(1, activation="sigmoid"))
 
-
-
-        loss_name = hp.Choice("loss", values=["binary_crossentropy", "binary_focal_crossentropy"])
+        loss_name = hp.Choice(
+            "loss", values=["binary_crossentropy", "binary_focal_crossentropy"]
+        )
 
         if loss_name == "binary_crossentropy":
             loss_fn = tf.keras.losses.BinaryCrossentropy()
         elif loss_name == "binary_focal_crossentropy":
             loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
-                gamma=gammaloss, alpha=alphaloss.5, apply_class_balancing=False
+                gamma=gammaloss, alpha=alphaloss, apply_class_balancing=False
             )
-
 
         model.compile(
             optimizer=optimizer,
@@ -131,11 +130,18 @@ class MyHyperModel(kt.HyperModel):
         return model
 
     def fit(self, hp, model, *args, **kwargs):
+        """
+        Fits the created model
+        """
         model = model.fit(*args, **kwargs)
         return model
 
 
 class Starter:
+    """
+    Class for preparing starting the HP search
+    """
+
     def __init__(self, df_path, strategy=STRATEGY, batch_size=BATCH_SIZE):
         self.batch_size = batch_size
         self.strategy = strategy
@@ -159,8 +165,11 @@ class Starter:
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 
-
     def _sequence_to_int(self):
+        """
+        Function to translate the sequences into a list of int
+        Returns the translated df
+        """
         start_time = time.time()
 
         amino_acid_to_int = {
@@ -190,27 +199,26 @@ class Starter:
             "U": 21,  # Selenocysteine
             "O": 21,  # Pyrrolysin
         }
-        self.df = self.df.dropna(subset=["Sequences"])
+        self.df = self.df.dropna(subset=["Sequences"])  # drop empty entries
 
         def encode_sequence(seq):
             return [amino_acid_to_int[amino_acid] for amino_acid in seq]
 
         self.df["Sequences"] = self.df["Sequences"].apply(encode_sequence)
 
-        # print(self.df)
-        # print(type(self.df))
-        # print(self.df['Sequences'][0])
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done encoding\nElapsed Time: {elapsed_time:.4f} seconds")
         return self.df
 
     def _padder(self):
+        """
+        Pads the sequences to the target dimension with value 21 = unidentified aa
+        Returns the padded df
+        """
         start_time = time.time()
         sequences = self.df_int["Sequences"].tolist()
-        # print(type(sequences))
-        # print(sequences[0:3])
-        # print(self.target_dimension)
+
         padded = pad_sequences(
             sequences,
             maxlen=self.target_dimension,
@@ -228,10 +236,11 @@ class Starter:
 
         return self.df_int
 
-    ############### needs to split dataset here to gather the IDs used in the test set #################
-    #### then go on to one hot encoding
-
     def _labler(self):
+        """
+        Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
+        Returns the df with added 'Labels' column
+        """
         start_time = time.time()
         self.padded["Labels"] = self.padded["categories"].apply(
             lambda x: 1 if x == 0 else 0
@@ -245,7 +254,7 @@ class Starter:
         )
         self.class_weight_dict = dict(enumerate(self.class_weights))
 
-        print("Class weights",self.class_weight_dict)
+        print("Class weights", self.class_weight_dict)
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -253,6 +262,10 @@ class Starter:
         return self.labeled_df
 
     def splitter2(self):
+        """
+        splits the whole df into three sets: train, val and test set.
+        Returns these three df
+        """
         start_time = time.time()
 
         train_df, temp_df = train_test_split(
@@ -281,6 +294,10 @@ class Starter:
         return train_df, val_df, test_df
 
     def _one_hot(self, _df):
+        """
+        Creates one hot tensors for further pipelining it into the model
+        Returns a new tensor with only the one hot encoded sequences
+        """
         start_time = time.time()
         with tf.device("/CPU:0"):
             df_one_hot = [
@@ -294,6 +311,10 @@ class Starter:
             return df_one_hot
 
     def _creater(self, df, df_onehot, name):
+        """
+        Creates a tf.Dataset with the one_hot tensor and the df column 'Labels'
+        Returned is this tf.Dataset aswell as it is saved as a directory
+        """
         start_time = time.time()
 
         with tf.device("/CPU:0"):
@@ -310,20 +331,14 @@ class Starter:
             return tensor_df
 
     def _loader(self):
+        """
+        Loads the data from the directory to use as the mdoel input, to cut time
+        Used for all further hp seaches when the sets are created
+        """
         start_time = time.time()
         train_dataset = tf.data.Dataset.load("trainset")
         val_dataset = tf.data.Dataset.load("valset")
         test_dataset = tf.data.Dataset.load("testset")
-
-        # print(f"Train dataset size: {len(train_dataset)}")
-
-        # train_dataset = train_dataset.take(len(train_dataset) - 152)
-
-        # if len(train_dataset) % 4 % 128 == 0:
-        #     print("true now")
-        #     print("division check:", len(train_dataset) % 4 % 128)
-
-        # print(f"Train dataset size now: {len(train_dataset)}")
 
         train_dataset = train_dataset.batch(self.batch_size)
         val_dataset = val_dataset.batch(self.batch_size)
@@ -336,6 +351,13 @@ class Starter:
         return train_dataset, val_dataset, test_dataset
 
     def tuner(self):
+        """
+        Iniziation function for the HP search, BayesianOptimization search is used with tensorbaord callbacks,
+        as well as model saves for the best model so far. Early stopping is used with patience on 5 and val_loss
+        as monitor.
+        Finally the best 3 models are saved after one HP search run
+        Can be used for multiple HP searches, overwrite=False
+        """
         start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 

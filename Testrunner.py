@@ -1,20 +1,32 @@
+###################################################################################################################################
+"""
+File after DNN_pipeline.py
+This file is used to train the final model found via the HP search
+
+INFOS:
+the trial.json and checkpoint.weights.h5 are both needed to initialize the model sturcture correctly.
+
+"""
+###################################################################################################################################
+
 import datetime
 import json
 import os
 import time
-import polars as pl
+
 import keras
 import numpy as np
-import pandas as pd
+import polars as pl
 import tensorflow as tf
 from keras.callbacks import TensorBoard
 from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
-from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.python import keras
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.python import keras
+
+###################################################################################################################################
 
 STRATEGY = tf.distribute.MirroredStrategy()
 BATCH_SIZE = 256
@@ -24,36 +36,41 @@ print(tf.__version__)
 print(pl.__version__)
 
 
-# with STRATEGY.scope():
-
-
 class Testrunning:
+    """
+    Class to prepare the model and start the model training
+    """
+
     def __init__(
         self,
         modelpath,
         weightpath,
-        df_path="./DataTrainSwissProt.csv",
+        df_path="./DataTrainSwissProt.csv",  # the Dataset_path used to train the model
         batch_size=BATCH_SIZE,
         strategy=STRATEGY,
     ):
         self.strategy = strategy
         self.batch_size = batch_size
+
         print("opening Train data")
-        self.df = pl.read_csv(
+        self.df = pl.read_csv(  # Open CSV file
             df_path,
             dtypes={
-                "Sequences": pl.Utf8,  
-                "categories": pl.Int8, 
+                "Sequences": pl.Utf8,
+                "categories": pl.Int8,
             },
-        )  # Open CSV file
+        )
 
         self.df_int = self._sequence_to_int()
-        self.target_dimension = self.df.select(max=pl.col("Sequences").list.len().max()).item()
-        print(self.target_dimension)
+        self.target_dimension = self.df.select(
+            max=pl.col("Sequences").list.len().max()
+        ).item()
+
         self.padded = self._padder()
         self.padded_label = self._labler()
-        print(self.padded_label)
+
         self.train_dataset, self.val_dataset, self.test_dataset = self.splitter2()
+
         self.train_df_onehot = self._one_hot(self.train_dataset)
         self.val_df_onehot = self._one_hot(self.val_dataset)
         self.test_df_onehot = self._one_hot(self.test_dataset)
@@ -71,12 +88,19 @@ class Testrunning:
         )
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
+
         self.weightpath = weightpath
         self.json_path = modelpath
+
         self.model_values = self.fromjson(self.json_path)
+
         self.model = self.buildfromjson()
 
     def fromjson(self, json_path):
+        """
+        Retrives the model structure from the trial.json file
+        Returns the infos in json_data
+        """
         with open(json_path, "r") as f:
             json_data = json.load(f)
         # print(json_data)
@@ -86,6 +110,12 @@ class Testrunning:
         return json_data
 
     def buildfromjson(self):
+        """
+        The model is rebuild via the data from the trial.json
+        Additionally the already learned weights are loaded and applied to the model
+        Returned is the ready to be trained model
+        """
+
         if self.model_values["activation"] == "leaky_relu":
             activation = tf.keras.layers.LeakyReLU(negative_slope=0.2)
             kernel_init = "he_normal"
@@ -145,6 +175,10 @@ class Testrunning:
         return model
 
     def _sequence_to_int(self):
+        """
+        Function to translate the sequences into a list of int
+        Returns the translated df
+        """
         start_time = time.time()
 
         amino_acid_to_int = {
@@ -204,29 +238,28 @@ class Testrunning:
 
         def encode_sequence(seq):
             return [amino_acid_to_int[amino_acid] for amino_acid in seq]
+
         print(type(self.df))
 
         self.df = self.df.with_columns(
-            pl.col("Sequences").map_elements(encode_sequence,return_dtype=pl.List(pl.Int16)).alias("Sequences")
+            pl.col("Sequences")
+            .map_elements(encode_sequence, return_dtype=pl.List(pl.Int16))
+            .alias("Sequences")
         )
 
-
-
-
-        # print(self.df)
-        # print(type(self.df))
-        # print(self.df['Sequences'][0])
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done encoding\nElapsed Time: {elapsed_time:.4f} seconds")
         return self.df
 
     def _padder(self):
+        """
+        Pads the sequences to the target dimension with value 21 = unidentified aa
+        Returns the padded df
+        """
         start_time = time.time()
         sequences = self.df_int["Sequences"].to_list()
-        # print(type(sequences))
-        # print(sequences[0:3])
-        # print(self.target_dimension)
+
         padded = pad_sequences(
             sequences,
             maxlen=self.target_dimension,
@@ -235,9 +268,7 @@ class Testrunning:
             value=21,
         )
         # print(padded)
-        self.df_int = self.df_int.with_columns(
-            pl.lit(padded).alias("Sequences")
-)        
+        self.df_int = self.df_int.with_columns(pl.lit(padded).alias("Sequences"))
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -247,12 +278,13 @@ class Testrunning:
         return self.df_int
 
     def _labler(self):
+        """
+        Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
+        Returns the df with added 'Labels' column
+        """
         start_time = time.time()
         self.padded = self.padded.with_columns(
-            pl.when(pl.col("categories") == 0)
-            .then(1)
-            .otherwise(0)
-            .alias("Labels")
+            pl.when(pl.col("categories") == 0).then(1).otherwise(0).alias("Labels")
         )
         self.padded_label = self.padded
         self.padded_label = self.padded_label.drop("categories")
@@ -262,6 +294,10 @@ class Testrunning:
         return self.padded_label
 
     def splitter2(self):
+        """
+        Splits the whole df into three sets: train, val and test set.
+        Returns these three df
+        """
         start_time = time.time()
 
         train_df, temp_df = train_test_split(
@@ -283,7 +319,6 @@ class Testrunning:
         val_df.write_parquet("valsetALL.parquet")
         test_df.write_parquet("testsetALL.parquet")
 
-
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
@@ -291,6 +326,10 @@ class Testrunning:
         return train_df, val_df, test_df
 
     def _one_hot(self, _df):
+        """
+        Creates one hot tensors for further pipelining it into the model
+        Returns a new tensor with only the one hot encoded sequences
+        """
         start_time = time.time()
         with tf.device("/CPU:0"):
             df_one_hot = [
@@ -304,6 +343,10 @@ class Testrunning:
             return df_one_hot
 
     def _creater(self, df, df_onehot, name):
+        """
+        Creates a tf.Dataset with the one_hot tensor and the df column 'Labels'
+        Returned is this tf.Dataset aswell as it is saved as a directory
+        """
         start_time = time.time()
 
         with tf.device("/CPU:0"):
@@ -320,6 +363,10 @@ class Testrunning:
             return tensor_df
 
     def _loader(self):
+        """
+        Loads the data from the directory to use as the mdoel input, to cut time
+        Used for all further hp seaches when the sets are created
+        """
         self.class_weights = compute_class_weight(
             "balanced",
             classes=np.unique(self.padded_label["Labels"]),
@@ -342,7 +389,12 @@ class Testrunning:
 
         return train_dataset, val_dataset, test_dataset
 
-    def trainer(self):
+    def trainer(self, epochnumber, modelname):
+        """
+        Function to start the training of the previously created model.
+        Tensorboard, early stopping on val-loss and save checkpoints are used
+        Finally the model is saved with the name inputted in modelname
+        """
         start_time = time.time()
 
         log_dir = os.path.join("logs", time.strftime("run_%Y_%m_%d-%H_%M"))
@@ -363,12 +415,12 @@ class Testrunning:
 
         self.history = self.model.fit(
             self.train_dataset,
-            epochs=500,
+            epochs=epochnumber,
             validation_data=self.val_dataset,
             callbacks=[tensorboard_cb, early_stopping_cb, checkpoint_cb],
             # class_weight=self.class_weight_dict,
         )
-        self.model.save("models/my_modelFocalLoss.keras")
+        self.model.save(f"models/{modelname}.keras")
         end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Done training\nElapsed Time: {elapsed_time:.4f} seconds")
@@ -381,4 +433,4 @@ if __name__ == "__main__":
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/checkpoint.weights.h5",
     )
 
-    Testrun.trainer()
+    Testrun.trainer(500, "model1305")
