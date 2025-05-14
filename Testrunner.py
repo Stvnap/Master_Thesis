@@ -75,17 +75,17 @@ class Testrunning:
         self.val_df_onehot = self._one_hot(self.val_dataset)
         self.test_df_onehot = self._one_hot(self.test_dataset)
 
-        self.train_df_ready = self._creater(
-            self.train_dataset, self.train_df_onehot, "trainset"
-        )
+        # self.train_df_ready = self._creater(
+        #     self.train_dataset, self.train_df_onehot, "trainset"
+        # )
 
-        self.val_df_ready = self._creater(
-            self.val_dataset, self.val_df_onehot, "valset"
-        )
+        # self.val_df_ready = self._creater(
+        #     self.val_dataset, self.val_df_onehot, "valset"
+        # )
 
-        self.test_df_ready = self._creater(
-            self.test_dataset, self.test_df_onehot, "testset"
-        )
+        # self.test_df_ready = self._creater(
+        #     self.test_dataset, self.test_df_onehot, "testset"
+        # )
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 

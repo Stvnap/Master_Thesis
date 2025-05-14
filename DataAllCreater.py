@@ -124,73 +124,99 @@ def _labler(padded):
 
 def splitter2(padded_label):
     """
-    Splits the whole df into three sets: train, val and test set.
-    Returns these three df
+    Splits padded_label into train/val/test (60/20/20), grouping all rows with the same ID
+    in the same split *and* stratifying by label.
+    Writes each split to a parquet, and returns the three DataFrames.
     """
-    start_time = time.time()
+    t0 = time.time()
 
-    train_df, temp_df = train_test_split(
-        padded_label,
+    # 1) Build an ID→label table (here taking the first label seen per ID)
+    ids_df = (
+        padded_label
+        .select(["IDs", "Labels"])
+        .unique(subset="IDs")          # keep one row per ID
+        # .groupby("IDs").agg(pl.col("Labels").mode().first())  # if you want the mode instead
+        .rename({"Labels": "Label"})   # so column names don't collide
+    )
+    # Convert to Pandas for sklearn
+    ids_pd    = ids_df.to_pandas()
+    id_values = ids_pd["IDs"].values
+    label_vals= ids_pd["Label"].values
+
+    # 2) Split IDs → train vs temp (60% train, 40% temp), stratified by ID-label
+    train_ids, temp_ids = train_test_split(
+        id_values,
         test_size=0.4,
-        stratify=padded_label["Labels"],
-        random_state=42,
+        stratify=label_vals,
+        random_state=42
     )
 
-    val_df, test_df = train_test_split(
-        temp_df, test_size=0.5, stratify=temp_df["Labels"], random_state=42
+    # 3) From temp_ids split into val vs test (each half of the 40%), again stratified
+    temp_labels = ids_pd.set_index("IDs").loc[temp_ids, "Label"].values
+    val_ids, test_ids = train_test_split(
+        temp_ids,
+        test_size=0.5,
+        stratify=temp_labels,
+        random_state=42
     )
 
-    print(f"Train set shape: {train_df.shape}")
+    # 4) Filter the original padded_label into three DataFrames
+    train_df = padded_label.filter(pl.col("IDs").is_in(train_ids))
+    val_df   = padded_label.filter(pl.col("IDs").is_in(val_ids))
+    test_df  = padded_label.filter(pl.col("IDs").is_in(test_ids))
+
+    # 5) Report shapes
+    print(f"Train set shape:      {train_df.shape}")
     print(f"Validation set shape: {val_df.shape}")
-    print(f"Test set shape: {test_df.shape}")
+    print(f"Test set shape:       {test_df.shape}")
 
+    # 6) Write to parquet
     train_df.write_parquet("trainsetALL.parquet")
-    val_df.write_parquet("valsetALL.parquet")
-    test_df.write_parquet("testsetALL.parquet")
+    val_df.write_parquet(  "valsetALL.parquet")
+    test_df.write_parquet( "testsetALL.parquet")
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
+    print(f"Done splitting in {time.time() - t0:.3f}s")
 
+    
     return train_df, val_df, test_df
 
 
 
-
-def make_dataset(df, batch_size=512, shuffle_buffer=1000, save_path=None):
+def make_dataset(df, shuffle_buffer=1000, save_path=None):
     """
-    Builds a tf.data.Dataset that:
-      1. Reads your integer sequences directly from the Polars DF.
-      2. One‐hots them in‐batch with dtype=tf.uint8 (1 byte per entry).
-      3. Shuffles, batches & prefetches.
-      4. (Optionally) saves to disk in TFRecord style.
-
-    Returns a tf.data.Dataset ready to be used for training
+    Builds a tf.data.Dataset that yields (one_hot_seq, label, id):
+      - one_hot_seq: tf.uint8 tensor of shape (L, 21)
+      - label:     tf.int32 scalar
+      - id:        tf.int32 scalar (from your DF’s “IDs” column)
     """
-    # 1) Pull out the raw numpy arrays (no Python-list-of-tensors!)
-    seqs   = tf.constant(df["Sequences"].to_list(), dtype=tf.int32)  # shape=(N,148)
+    # 1) Pull out the raw NumPy arrays
+    seqs   = tf.constant(df["Sequences"].to_list(), dtype=tf.int32)  # shape=(N, L)
     labels = tf.constant(df["Labels"].to_list(),    dtype=tf.int32)
+    # ids    = tf.constant(df["IDs"].to_list(),       dtype=tf.int32)
 
-    # 2) Build the base dataset
+    # 2) Build the base dataset (triples)
     ds = tf.data.Dataset.from_tensor_slices((seqs, labels))
 
     # 3) One‐hot & cast in the map step
     ds = ds.map(
-        lambda seq, lab: (tf.one_hot(seq, depth=21, dtype=tf.uint8), lab),
+        lambda seq, lab, id: (
+            tf.one_hot(seq, depth=21, dtype=tf.uint8),  # (L,21)
+            lab,                                        # ()
+            # id                                          # ()
+        ),
         num_parallel_calls=tf.data.AUTOTUNE
     )
 
-    # 4) Shuffle, batch, prefetch
+    # 4) Shuffle
     ds = ds.shuffle(shuffle_buffer)
-    ds = ds.batch(batch_size)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
 
     # 5) Optionally save it as a TFRecord-style directory
     if save_path:
-        tf.data.Dataset.save(ds, save_path)
+        tf.data.experimental.save(ds, save_path)
 
-    print(f"Dataset built: {ds.cardinality().numpy()} batches of up to {batch_size}")
+    print(f"Dataset built: {ds.cardinality().numpy()}")
     return ds
+
 
 
 
@@ -205,6 +231,7 @@ if __name__ == "__main__":
         schema_overrides={
             "Sequences": pl.Utf8,
             "categories": pl.Int8,
+            "ID": pl.Utf8,
         },
     ).lazy()
     print("Done loading")
@@ -220,8 +247,11 @@ if __name__ == "__main__":
     df = _padder(df)
     print("Done padding")
 
-    # train_dataset, val_dataset, test_dataset = splitter2(padded_label)
-    # print("Done splitting")
+    train_dataset, val_dataset, test_dataset = splitter2(df)
+    print("Done splitting")
+
+    df=None
+
 
     # train_df_onehot = _one_hot(train_dataset)
     # print("Done one hot train set")
@@ -242,6 +272,13 @@ if __name__ == "__main__":
     # df = _creater(df, df_onehot, "AllSet")
 
 
-    df = make_dataset(df, batch_size=512, save_path='./saved_dataset')
+    make_dataset(train_dataset, save_path='./trainsetALL')
+
+    make_dataset(val_dataset, save_path='./valsetALL')
+
+    make_dataset(test_dataset, save_path='./testsetALL')
+
+
+
 
     print("Data preparation completed.")

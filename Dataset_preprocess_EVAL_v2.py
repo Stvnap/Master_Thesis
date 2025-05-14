@@ -362,7 +362,14 @@ class databaseCreater:
             current_row = seqarray_full.iloc[category_index]
             current_category = current_row["categories"]
             current_id = current_row["ID"]
-            current_boundary = current_row["Boundaries"]
+
+
+            try:
+                if isinstance (current_row["Boundaries"],list):
+                    current_boundary = current_row["Boundaries"]
+            except:
+                current_boundary = None
+                pass
 
             len_nested = len(nested_list)
 
@@ -371,7 +378,12 @@ class databaseCreater:
                 sequences.append(seq)
                 categories.append(current_category)
                 ids.append(current_id)
-                boundaries_all.append(current_boundary)
+                try:
+                    if current_boundary:
+                        boundaries_all.append(current_boundary)
+                except:
+                    pass
+            
 
                 # Calculate WindowPos as string
                 if i == len_nested - 1 and len_nested > 1:
@@ -400,15 +412,26 @@ class databaseCreater:
                 )
 
         # Convert once to DataFrame at the end
-        sliding_df = pd.DataFrame(
-            {
-                "Sequences": sequences,
-                "categories": categories,
-                "ID": ids,
-                "Boundaries": boundaries_all,
-                "WindowPos": window_positions,
-            }
-        )
+
+        if boundaries_all:
+            sliding_df = pd.DataFrame(
+                {
+                    "Sequences": sequences,
+                    "categories": categories,
+                    "ID": ids,
+                    "Boundaries": boundaries_all,
+                    "WindowPos": window_positions,
+                }
+            )
+        else:
+            sliding_df = pd.DataFrame(
+                {
+                    "Sequences": sequences,
+                    "categories": categories,
+                    "ID": ids,
+                    "WindowPos": window_positions,
+                }
+            )
 
         elapsed_time = time.time() - start_time
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
