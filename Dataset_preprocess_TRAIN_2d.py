@@ -1,5 +1,7 @@
 ###################################################################################################################################
 """
+ADDED SECOND POSITVE DOMAIN FOR A CLASSIFCIATION
+
 This scipt creates a final dataset ready for training the model.
 all input files need to be preprocessed annotated by InterproScan & striped by sequence-fairies-extractDomains
 it uses one positive Domain file that is targeted to be classified, negative domains (4 in this test case)
@@ -148,7 +150,8 @@ class databaseCreater:
     """
     def __init__(
         self,
-        seqarray_clean,
+        seqarray_clean1,
+        seqarray_clean2,
         seqarray_clean_PF00079,
         seqarray_clean_PF00080,
         seqarray_clean_PF00118,
@@ -160,7 +163,9 @@ class databaseCreater:
     ):
         ##################################################################################
 
-        self.seqarray_clean = seqarray_clean
+        self.seqarray_clean1 = seqarray_clean1
+        self.seqarray_clean2 = seqarray_clean2
+
         self.seqarray_clean_PF00079 = seqarray_clean_PF00079
         self.seqarray_clean_PF00080 = seqarray_clean_PF00080
         self.seqarray_clean_PF00118 = seqarray_clean_PF00118
@@ -195,8 +200,12 @@ class databaseCreater:
         Returns the full df with all sequences
         """
         start_time = time.time()
-        seq_labels_positive = self.seqarray_clean[1:]
-        seq_labels_positive.loc[:, "categories"] = 0
+        seq_labels_positive1= self.seqarray_clean1[1:]
+        seq_labels_positive2= self.seqarray_clean2[1:]
+
+
+        seq_labels_positive1.loc[:, "categories"] = 0
+        seq_labels_positive2.loc[:, "categories"] = 1
         seq_labels_negative_domains = pd.concat(
             (
                 self.seqarray_clean_PF00079,
@@ -206,14 +215,13 @@ class databaseCreater:
             )
         )
         seq_labels_negative_domains = seq_labels_negative_domains[1:]
-        seq_labels_negative_domains.loc[:, "categories"] = 1
+        seq_labels_negative_domains.loc[:, "categories"] = 2
 
         seqarray_clean_rnd_all = self.seqarray_clean_rnd_all[1:]
 
-        seqarray_clean_rnd_all.loc[:, "categories"] = 2
-
+        seqarray_clean_rnd_all.loc[:, "categories"] = 3
         seq_labels_all_domains = pd.concat(
-            [seq_labels_positive, seq_labels_negative_domains]
+            [seq_labels_positive1, seq_labels_positive2, seq_labels_negative_domains]
         )
 
         seqarray_clean_rnd_without_double_domains = seqarray_clean_rnd_all.loc[
@@ -225,7 +233,7 @@ class databaseCreater:
         seqarray_full = pd.concat(
             [seqarray_clean_rnd_without_double_domains, seq_labels_all_domains]
         )
-        ratio_positive = len(seqarray_clean) / len(seqarray_full)
+        ratio_positive = len(seqarray_clean1) / len(seqarray_full)
         print("ratio positive:", ratio_positive)
 
         ratio_negative_domains = (
@@ -323,7 +331,7 @@ class databaseCreater:
         """
         start_time = time.time()
         print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("DataTrainALL.csv", index=False)
+        self.seqarray_final.to_csv("DataTrainALL2d.csv", index=False)
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -339,11 +347,27 @@ if __name__ == "__main__":
     fasta = DomainProcessing(
         "/global/research/students/sapelt/Masters/domains_PF00177.fa"
     )
-    seqarray_clean, seqarraylen_clean, normaltest = (
+    seqarray_clean1, seqarraylen_clean1, normaltest = (
         fasta.distribution_finder(fasta.len_finder())
     )
-    dimension_positive = fasta.dimension_finder(seqarraylen_clean)
-    # print("targeted dimension", dimension_positive)
+    dimension_positive1 = fasta.dimension_finder(seqarraylen_clean1)
+    print("targeted dimension", dimension_positive1)
+
+
+
+    # 2nd positive Domain PF00210
+    print("Loading positive domain PF00210")
+    fasta = DomainProcessing(
+        "/global/research/students/sapelt/Masters/domains_PF00210.fa"
+    )
+    seqarray_clean2, seqarraylen_clean2, normaltest = (
+        fasta.distribution_finder(fasta.len_finder())
+    )
+    dimension_positive2 = fasta.dimension_finder(seqarraylen_clean2)
+    print("targeted dimension", dimension_positive2)
+
+    dimension_positive = max(dimension_positive1, dimension_positive2)
+
 
     # negative Domains:
     print("Loading negative PF00079")
@@ -391,7 +415,8 @@ if __name__ == "__main__":
     ################### Data creation ########################
     print("Starting data creation")
     dataset = databaseCreater(
-        seqarray_clean,
+        seqarray_clean1,
+        seqarray_clean2,
         seqarray_clean_PF00079,
         seqarray_clean_PF00080,
         seqarray_clean_PF00118,

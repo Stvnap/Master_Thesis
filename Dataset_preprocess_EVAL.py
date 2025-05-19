@@ -345,7 +345,6 @@ class databaseCreater:
         Additionally the window position of the windows are given in a new column.
         Returned is a final df with: Sequences, Categories, IDs, Boundaries, WindowPos.
         """
-        import time
 
         start_time = time.time()
 

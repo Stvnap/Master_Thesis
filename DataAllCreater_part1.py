@@ -14,14 +14,15 @@ import polars as pl
 import tensorflow as tf
 
 gpus = tf.config.list_physical_devices("GPU")
-tf.config.set_visible_devices(                                       # Disable GPU, crashes on GPU
+tf.config.set_visible_devices(  # Disable GPU, crashes on GPU
     [], "GPU"
 )
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+# from Dataset_preprocess_TRAIN import dimension_positive             # change here to 2d if u want to create a ds for multi categorial classification
 
 ###################################################################################################################################
-
+dimension_positive=148
 
 def _sequence_to_int(df):
     """
@@ -89,7 +90,7 @@ def _padder(df_int):
     # print(self.target_dimension)
     padded = pad_sequences(
         sequences,
-        maxlen=148,
+        maxlen=dimension_positive,
         padding="post",
         truncating="post",
         value=21,
@@ -121,6 +122,25 @@ def _labler(padded):
     print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
     return padded_label
 
+def _labler2d(padded):
+    """
+    Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
+    Returns the df with added 'Labels' column
+    """
+    start_time = time.time()
+    padded = padded.with_columns(
+        pl.when(pl.col("categories") == 0).then(1)
+        .when(pl.col("categories") == 1).then(2)
+        .otherwise(0)
+        .alias("Labels")
+    )
+    padded_label = padded
+    padded_label = padded_label.drop("categories")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
+    return padded_label
+
 
 def splitter2(padded_label):
     """
@@ -132,38 +152,31 @@ def splitter2(padded_label):
 
     # 1) Build an ID→label table (here taking the first label seen per ID)
     ids_df = (
-        padded_label
-        .select(["IDs", "Labels"])
-        .unique(subset="IDs")          # keep one row per ID
+        padded_label.select(["IDs", "Labels"])
+        .unique(subset="IDs")  # keep one row per ID
         # .groupby("IDs").agg(pl.col("Labels").mode().first())  # if you want the mode instead
-        .rename({"Labels": "Label"})   # so column names don't collide
+        .rename({"Labels": "Label"})  # so column names don't collide
     )
     # Convert to Pandas for sklearn
-    ids_pd    = ids_df.to_pandas()
+    ids_pd = ids_df.to_pandas()
     id_values = ids_pd["IDs"].values
-    label_vals= ids_pd["Label"].values
+    label_vals = ids_pd["Label"].values
 
     # 2) Split IDs → train vs temp (60% train, 40% temp), stratified by ID-label
     train_ids, temp_ids = train_test_split(
-        id_values,
-        test_size=0.4,
-        stratify=label_vals,
-        random_state=42
+        id_values, test_size=0.4, stratify=label_vals, random_state=42
     )
 
     # 3) From temp_ids split into val vs test (each half of the 40%), again stratified
     temp_labels = ids_pd.set_index("IDs").loc[temp_ids, "Label"].values
     val_ids, test_ids = train_test_split(
-        temp_ids,
-        test_size=0.5,
-        stratify=temp_labels,
-        random_state=42
+        temp_ids, test_size=0.5, stratify=temp_labels, random_state=42
     )
 
     # 4) Filter the original padded_label into three DataFrames
     train_df = padded_label.filter(pl.col("IDs").is_in(train_ids))
-    val_df   = padded_label.filter(pl.col("IDs").is_in(val_ids))
-    test_df  = padded_label.filter(pl.col("IDs").is_in(test_ids))
+    val_df = padded_label.filter(pl.col("IDs").is_in(val_ids))
+    test_df = padded_label.filter(pl.col("IDs").is_in(test_ids))
 
     # 5) Report shapes
     print(f"Train set shape:      {train_df.shape}")
@@ -172,68 +185,87 @@ def splitter2(padded_label):
 
     # 6) Write to parquet
     train_df.write_parquet("trainsetALL.parquet")
-    val_df.write_parquet(  "valsetALL.parquet")
-    test_df.write_parquet( "testsetALL.parquet")
+    val_df.write_parquet("valsetALL.parquet")
+    test_df.write_parquet("testsetALL.parquet")
 
     print(f"Done splitting in {time.time() - t0:.3f}s")
 
-    
     return train_df, val_df, test_df
 
 
-
-def make_dataset(df, shuffle_buffer=1000, save_path=None):
+def make_dataset(
+    df,
+    save_path,
+    shuffle_buffer: int = 1000,
+):
     """
-    Builds a tf.data.Dataset that yields (one_hot_seq, label, id):
-      - one_hot_seq: tf.uint8 tensor of shape (L, 21)
-      - label:     tf.int32 scalar
-      - id:        tf.int32 scalar (from your DF’s “IDs” column)
+    Streams Sequences, Labels, and IDs out of the Polars DF one row at a time,
+    pads to length dimension_positive, one‐hots to depth=21 (uint8), then shuffles & batches.
+    Peak memory stays at ~batch_size×dimension_positive×21 elements.
     """
-    # 1) Pull out the raw NumPy arrays
-    seqs   = tf.constant(df["Sequences"].to_list(), dtype=tf.int32)  # shape=(N, L)
-    labels = tf.constant(df["Labels"].to_list(),    dtype=tf.int32)
-    # ids    = tf.constant(df["IDs"].to_list(),       dtype=tf.int32)
+    def gen():
+        """
+        Generator reading each row of the df
+        """
+        for seq, lab, id_ in zip(
+            df["Sequences"].to_list(), df["Labels"].to_list(), df["ID"].to_list()
+        ):
+            yield seq, int(lab), id_
 
-    # 2) Build the base dataset (triples)
-    ds = tf.data.Dataset.from_tensor_slices((seqs, labels))
-
-    # 3) One‐hot & cast in the map step
-    ds = ds.map(
-        lambda seq, lab, id: (
-            tf.one_hot(seq, depth=21, dtype=tf.uint8),  # (L,21)
-            lab,                                        # ()
-            # id                                          # ()
+    # Predefine the shape of the ds
+    ds = tf.data.Dataset.from_generator(
+        gen,
+        output_signature=(
+            tf.TensorSpec(shape=(None,), dtype=tf.int32),  # seq (variable length)
+            tf.TensorSpec(shape=(), dtype=tf.int32),  # label
+            tf.TensorSpec(shape=(), dtype=tf.string),  # id
         ),
-        num_parallel_calls=tf.data.AUTOTUNE
     )
 
-    # 4) Shuffle
+    def pad_and_one_hot(seq, lab, id_):
+        """
+        Pad and onehot encode
+        """
+        seq = tf.pad(seq, [[0, dimension_positive - tf.shape(seq)[0]]], constant_values=21)
+        oh = tf.one_hot(seq, depth=21, dtype=tf.uint8)
+        return oh, lab, id_
+
+    # apply to the ds
+    ds = ds.map(pad_and_one_hot, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Shuffle
     ds = ds.shuffle(shuffle_buffer)
 
-    # 5) Optionally save it as a TFRecord-style directory
+    # Save
     if save_path:
-        tf.data.experimental.save(ds, save_path)
+        ds.save(save_path)
 
-    print(f"Dataset built: {ds.cardinality().numpy()}")
+    print("Dataset built")
     return ds
-
-
 
 
 ##################################################################################
 
 if __name__ == "__main__":
     print("Starting data preparation...")
-    df_path = "./DataTrainALL.csv"
+    df_path = "./DataTrainSwissProt.csv"
 
+    # load in
     df = pl.read_csv(
         df_path,
         schema_overrides={
             "Sequences": pl.Utf8,
             "categories": pl.Int8,
-            "ID": pl.Utf8,
+            # "ID": pl.Utf8,
         },
+        # n_rows=100000,
     ).lazy()
+
+
+    df = df.with_columns([
+    pl.lit("xyz").alias("ID")       ############### TEST PURPUSE ################
+    ]) 
+
     print("Done loading")
 
     df = _sequence_to_int(df)
@@ -244,41 +276,6 @@ if __name__ == "__main__":
 
     df = df.collect()
 
-    df = _padder(df)
-    print("Done padding")
-
-    train_dataset, val_dataset, test_dataset = splitter2(df)
-    print("Done splitting")
-
-    df=None
-
-
-    # train_df_onehot = _one_hot(train_dataset)
-    # print("Done one hot train set")
-    # val_df_onehot = _one_hot(val_dataset)
-    # print("Done one hot val set")
-    # test_df_onehot = _one_hot(test_dataset)
-    # print("Done one hot test set")
-
-    # df_onehot = _one_hot(df)
-
-    # train_df_ready = _creater(train_dataset, train_df_onehot, "trainset")
-    # print("Done creating train set")
-    # val_df_ready = _creater(val_dataset, val_df_onehot, "valset")
-    # print("Done creating val set")
-    # test_df_ready = _creater(test_dataset, test_df_onehot, "testset")
-    # print("Done creating test set")
-
-    # df = _creater(df, df_onehot, "AllSet")
-
-
-    make_dataset(train_dataset, save_path='./trainsetALL')
-
-    make_dataset(val_dataset, save_path='./valsetALL')
-
-    make_dataset(test_dataset, save_path='./testsetALL')
-
-
-
+    df = make_dataset(df, save_path="./saved_dataset")
 
     print("Data preparation completed.")

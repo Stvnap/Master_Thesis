@@ -4,8 +4,6 @@ File after Dataset_preprocessing.py
 This file is used to create a DNN model using the preprocessed dataset
 
 INFOS:
-HARD CODED CPU:1 USE FOR TESTING PURPOSES
-Switch to STRATEGY = tf.distribute.MirroredStrategy() and change the with self.strategy: to with self.strategy.scope(): for GPU usage
 
 """
 ###################################################################################################################################
@@ -16,14 +14,16 @@ import time
 
 import keras_tuner as kt
 import numpy as np
-import pandas as pd
 import tensorflow as tf
+import tensorflow_addons as tfa
 from keras.callbacks import EarlyStopping, TensorBoard
 from keras.layers import Dense, Flatten, Input
 from keras.models import Sequential
 from keras.preprocessing.sequence import pad_sequences
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+
+from Dataset_preprocess_TRAIN import dimension_positive
 
 ###################################################################################################################################
 
@@ -35,6 +35,8 @@ print(f"Number of devices: {STRATEGY.num_replicas_in_sync}")
 BATCH_SIZE = 128 * STRATEGY.num_replicas_in_sync
 print(BATCH_SIZE)
 
+DIMENSION_POSITIVE = dimension_positive
+
 
 print(tf.keras.__version__)
 print(tf.__version__)
@@ -45,8 +47,9 @@ class MyHyperModel(kt.HyperModel):
     Hypermodel for model structure and HP dimension.
     """
 
-    def __init__(self, target_dimension):
+    def __init__(self, target_dimension,dimension):
         self.target_dimension = target_dimension
+        self.dimension=int(dimension)
 
     def build(self, hp):
         """
@@ -55,7 +58,7 @@ class MyHyperModel(kt.HyperModel):
 
         print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
 
-        n_neurons = hp.Int("n_neurons", min_value=3100, max_value=3400)
+        n_neurons = hp.Int("n_neurons", min_value=3100*self.dimension, max_value=3400*self.dimension)
         n_hidden = hp.Int("n_hidden", min_value=4, max_value=24, default=8)
 
         learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
@@ -108,18 +111,34 @@ class MyHyperModel(kt.HyperModel):
                 )
             )
 
-        model.add(Dense(1, activation="sigmoid"))
 
-        loss_name = hp.Choice(
+        if self.dimension==1:
+            model.add(Dense(1, activation="sigmoid"))
+            loss_name = hp.Choice(
             "loss", values=["binary_crossentropy", "binary_focal_crossentropy"]
-        )
-
-        if loss_name == "binary_crossentropy":
-            loss_fn = tf.keras.losses.BinaryCrossentropy()
-        elif loss_name == "binary_focal_crossentropy":
-            loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
-                gamma=gammaloss, alpha=alphaloss, apply_class_balancing=False
             )
+            if loss_name == "binary_crossentropy":
+                loss_fn = tf.keras.losses.BinaryCrossentropy()
+            elif loss_name == "binary_focal_crossentropy":
+                loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
+                    gamma=gammaloss, alpha=alphaloss, apply_class_balancing=False
+                )
+
+
+        else:
+            model.add(Dense(3, activation="softmax"))
+            loss_name = hp.Choice(
+            "loss", values=["categorical_crossentropy", "sigmoid_focal_crossentropy"]
+            )
+            if loss_name == "categorical_crossentropy":
+                loss_fn =  tf.keras.losses.categorical_crossentropy()
+            elif loss_name == "Sigmoid_Focal_Crossentropy":
+                loss_fn =  tfa.losses.SigmoidFocalCrossEntropy(
+                    gamma=gammaloss, alpha=alphaloss, apply_class_balancing=False
+                )
+
+
+
 
         model.compile(
             optimizer=optimizer,
@@ -142,26 +161,35 @@ class Starter:
     Class for preparing starting the HP search
     """
 
-    def __init__(self, df_path, strategy=STRATEGY, batch_size=BATCH_SIZE):
+    def __init__(
+        self,
+        df_path,
+        dimension,
+        strategy=STRATEGY,
+        batch_size=BATCH_SIZE,
+        dimension_positive=DIMENSION_POSITIVE,
+    ):
         self.batch_size = batch_size
         self.strategy = strategy
-        self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
-        self.df_int = self._sequence_to_int()
-        self.target_dimension = len(self.df_int["Sequences"].max())
-        self.padded = self._padder()
-        self.labeled_df = self._labler()
-        self.train_df, self.val_df, self.test_df = self.splitter2()
-        self.train_df_onehot = self._one_hot(self.train_df)
-        self.val_df_onehot = self._one_hot(self.val_df)
-        self.test_df_onehot = self._one_hot(self.test_df)
+        self.target_dimension = dimension_positive
+        self.dimension=dimension
+        # self.df = pd.read_csv(df_path, index_col=False)  # Open CSV file
+        # self.df_int = self._sequence_to_int()
+        # self.target_dimension = len(self.df_int["Sequences"].max())
+        # self.padded = self._padder()
+        # self.labeled_df = self._labler()
+        # self.train_df, self.val_df, self.test_df = self.splitter2()
+        # self.train_df_onehot = self._one_hot(self.train_df)
+        # self.val_df_onehot = self._one_hot(self.val_df)
+        # self.test_df_onehot = self._one_hot(self.test_df)
 
-        self.train_df_ready = self._creater(
-            self.train_df, self.train_df_onehot, "trainset"
-        )
+        # self.train_df_ready = self._creater(
+        #     self.train_df, self.train_df_onehot, "trainset"
+        # )
 
-        self.val_df_ready = self._creater(self.val_df, self.val_df_onehot, "valset")
+        # self.val_df_ready = self._creater(self.val_df, self.val_df_onehot, "valset")
 
-        self.test_df_ready = self._creater(self.test_df, self.test_df_onehot, "testset")
+        # self.test_df_ready = self._creater(self.test_df, self.test_df_onehot, "testset")
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 
@@ -263,7 +291,7 @@ class Starter:
 
     def splitter2(self):
         """
-        splits the whole df into three sets: train, val and test set.
+        Splits the whole df into three sets: train, val and test set.
         Returns these three df
         """
         start_time = time.time()
@@ -336,9 +364,9 @@ class Starter:
         Used for all further hp seaches when the sets are created
         """
         start_time = time.time()
-        train_dataset = tf.data.Dataset.load("trainset")
-        val_dataset = tf.data.Dataset.load("valset")
-        test_dataset = tf.data.Dataset.load("testset")
+        train_dataset = tf.data.Dataset.load("trainsetALL")
+        val_dataset = tf.data.Dataset.load("valsetALL")
+        test_dataset = tf.data.Dataset.load("testsetALL")
 
         train_dataset = train_dataset.batch(self.batch_size)
         val_dataset = val_dataset.batch(self.batch_size)
@@ -382,13 +410,13 @@ class Starter:
         # Initialize tuner inside strategy scope
         # with self.strategy.scope():
         self.tuner = kt.BayesianOptimization(
-            hypermodel=MyHyperModel(target_dimension=self.target_dimension),
+            hypermodel=MyHyperModel(target_dimension=self.target_dimension,dimension=self.dimension),
             objective="val_loss",
             max_trials=1,
             overwrite=False,
             directory="./logshp",
             # distribution_strategy=tf.distribute.MirroredStrategy(),
-            project_name="test2",
+            project_name="ModelForAllData",
         )
 
         self.tuner.search_space_summary()
@@ -428,6 +456,6 @@ class Starter:
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
 
-    run = Starter("./DataTrainALL.csv")
+    run = Starter("./DataTrainALL.csv",dimension=1)
 
     run.tuner()

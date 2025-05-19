@@ -45,12 +45,14 @@ class Testrunning:
         self,
         modelpath,
         weightpath,
+        dimension,
         df_path="./DataTrainSwissProt.csv",  # the Dataset_path used to train the model
         batch_size=BATCH_SIZE,
         strategy=STRATEGY,
     ):
         self.strategy = strategy
         self.batch_size = batch_size
+        self.dimension=dimension
 
         print("opening Train data")
         self.df = pl.read_csv(  # Open CSV file
@@ -161,7 +163,12 @@ class Testrunning:
                 ),
             )
 
-        model.add(Dense(1, activation="sigmoid"))
+        if self.dimension==1:
+            model.add(Dense(1, activation="sigmoid"))
+        else:
+            model.add(Dense(3, activation="softmax"))
+
+
 
         model.compile(
             optimizer=optimizer,
@@ -182,56 +189,31 @@ class Testrunning:
         start_time = time.time()
 
         amino_acid_to_int = {
-            "A": 1,
-            "a": 1,  # Alanine
-            "C": 2,
-            "c": 2,  # Cysteine
-            "D": 3,
-            "d": 3,  # Aspartic Acid
-            "E": 4,
-            "e": 4,  # Glutamic Acid
-            "F": 5,
-            "f": 5,  # Phenylalanine
-            "G": 6,
-            "g": 6,  # Glycine
-            "H": 7,
-            "h": 7,  # Histidine
-            "I": 8,
-            "i": 8,  # Isoleucine
-            "K": 9,
-            "k": 9,  # Lysine
-            "L": 10,
-            "l": 10,  # Leucine
-            "M": 11,
-            "m": 11,  # Methionine
-            "N": 12,
-            "n": 12,  # Asparagine
-            "P": 13,
-            "p": 13,  # Proline
-            "Q": 14,
-            "q": 14,  # Glutamine
-            "R": 15,
-            "r": 15,  # Arginine
-            "S": 16,
-            "s": 16,  # Serine
-            "T": 17,
-            "t": 17,  # Threonine
-            "V": 18,
-            "v": 18,  # Valine
-            "W": 19,
-            "w": 19,  # Tryptophan
-            "Y": 20,
-            "y": 20,  # Tyrosine
-            "X": 21,
-            "x": 21,  # Unknown or special character
-            "Z": 21,
-            "z": 21,  # Glutamine or Glutamic Acid
-            "B": 21,
-            "b": 21,  # Asparagine or Aspartic Acid
-            "U": 21,
-            "u": 21,  # Selenocysteine
-            "O": 21,
-            "o": 21,  # Pyrrolysine
+            "A": 1,  # Alanine
+            "C": 2,  # Cysteine
+            "D": 3,  # Aspartic Acid
+            "E": 4,  # Glutamic Acid
+            "F": 5,  # Phenylalanine
+            "G": 6,  # Glycine
+            "H": 7,  # Histidine
+            "I": 8,  # Isoleucine
+            "K": 9,  # Lysine
+            "L": 10,  # Leucine
+            "M": 11,  # Methionine
+            "N": 12,  # Asparagine
+            "P": 13,  # Proline
+            "Q": 14,  # Glutamine
+            "R": 15,  # Arginine
+            "S": 16,  # Serine
+            "T": 17,  # Threonine
+            "V": 18,  # Valine
+            "W": 19,  # Tryptophan
+            "Y": 20,  # Tyrosine
+            "X": 21,  # Unknown or special character                (21 for all other AA)
+            "Z": 21,  # Glutamine (Q) or Glutamic acid (E)
+            "B": 21,  # Asparagine (N) or Aspartic acid (D)
+            "U": 21,  # Selenocysteine
+            "O": 21,  # Pyrrolysin
         }
 
         self.df = self.df.drop_nulls(subset=["Sequences"])
@@ -431,6 +413,7 @@ if __name__ == "__main__":
     Testrun = Testrunning(
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/trial.json",
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1/trial_00/checkpoint.weights.h5",
+        dimension=2
     )
 
-    Testrun.trainer(500, "model1305")
+    Testrun.trainer(500, "model1605")

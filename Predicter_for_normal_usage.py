@@ -16,7 +16,7 @@ from keras.preprocessing.sequence import pad_sequences
 from keras.saving import load_model
 from sklearn.metrics import classification_report, confusion_matrix
 
-from Testrunner import BATCH_SIZE
+from FinalTrainer import BATCH_SIZE
 
 ##########################################################################################
 
@@ -31,11 +31,12 @@ class Predicter_pipeline:
     Executes the complete program in __init__()
     """
 
-    def __init__(self, model_path, df_path, flank_size, step, batch_size=32):
+    def __init__(self, model_path, df_path,outfilepath, flank_size, step, batch_size=32):
         self.flank_size = flank_size
         self.step = step
         self.model_path = model_path
         self.df_path = df_path
+        self.outfilepath = outfilepath
         self.batch_size = batch_size
         self.model = None
         self.df = None
@@ -63,7 +64,10 @@ class Predicter_pipeline:
 
         ###################### NEW WINDOWS AROUND POSITIVE HITS & SECOND PREDICTION ######################
 
-        df = pd.read_csv(df_path, index_col=False)  # ,nrows=100000)
+        try:
+            df = pd.read_csv(df_path, index_col=False)  # ,nrows=100000)
+        except:
+            df = self.df_path
         self.new_windows = self._newwindower(df, concatenated_results)
 
         self.slididing_new_windows = self._sliding_window_around_hits(
@@ -100,9 +104,9 @@ class Predicter_pipeline:
             "ConcatenatedWindow"
         ].apply(self._simplify_windows)
 
-        self.concatenated_results.to_csv(
-            "./Evalresults/concatenated_resultsSecond.csv", index=False
-        )
+        # self.concatenated_results.to_csv(
+        #     "./Evalresults/concatenated_resultsSecond.csv", index=False
+        # )
 
         ###################### EVALUATION, HIT REFINEMENT & FINAL FILE CREATION ####################
 
@@ -125,7 +129,7 @@ class Predicter_pipeline:
 
         df_filtered = self.df2[thr_flags].reset_index(drop=True)
 
-        df_final = self._lastlistcreater(df_filtered)
+        df_final = self._lastlistcreater(df_filtered,outfilepath)
 
     def _predicting(self, modelpath, Evalset):
         """
@@ -864,7 +868,7 @@ class Predicter_pipeline:
 
         return baseline_flags, thr_flags, true_flags, pos_IDs, pos_preds
 
-    def _lastlistcreater(self, df_filtered):
+    def _lastlistcreater(self, df_filtered,outfilepath):
         """
         Creates the last df that is represented as the final resuls,
         containign the IDs and their corresponding predicted domain boundaries.
@@ -891,7 +895,7 @@ class Predicter_pipeline:
 
         print(df_final.head(50))
         print("Final count of hits:",len(df_final))
-        df_final.to_csv("./Evalresults/df_final.csv", index=False)
+        df_final.to_csv(outfilepath, index=False)
 
         return df_final
 
@@ -902,5 +906,5 @@ if __name__ == "__main__":
     df_path = "./TESTESTESTSS.csv"
     model_path = "./models/my_modelnewlabeling.keras"
     Predicter = Predicter_pipeline(
-        model_path, df_path, flank_size=30, step=10, batch_size=BATCH_SIZE
+        model_path, df_path,outfilepath="./Outtest.csv", flank_size=30, step=10, batch_size=BATCH_SIZE
     )

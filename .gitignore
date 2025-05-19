@@ -29,12 +29,15 @@ models/
 bestmodels/
 __pycache__/
 Evalresults/
+saved_dataset/
 
-
+# scripts #
 fastacutter.py
 Dataset_preprocess_v2old.py
 csv_to_fasta.py
-Dataset_preprocess.py
+Dataset_preprocessold.py
+LengthHistoPlotter.py
 
 test*
-DataAllCreater_part2.py
+train*
+val*

@@ -927,7 +927,7 @@ class Predicter_pipeline:
 #####################################################################################
 
 if __name__ == "__main__":
-    df_path = "./DataEvalSwiss70%.csv"
+    df_path = "./TESTESTESTSS.csv"
     model_path = "./models/my_modelnewlabeling.keras"
     Predicter = Predicter_pipeline(
         model_path, df_path, flank_size=30, step=10, batch_size=BATCH_SIZE

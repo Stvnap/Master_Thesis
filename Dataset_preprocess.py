@@ -16,6 +16,7 @@ import time
 import numpy as np
 import pandas as pd
 from Bio import SeqIO
+from Dataset_preprocess_TRAIN import dimension_positive
 
 
 class DomainProcessing:
@@ -55,7 +56,7 @@ class DomainProcessing:
         start_time = time.time()
         self.sequence_all = pd.DataFrame(self.sequence_all, self.id_all)
         self.sequence_all.columns = ["Sequences", "ID"]
-        print(self.sequence_all)
+        # print(self.sequence_all)
         elapsed_time = time.time() - start_time
         print(f"\tDone Returning\n\tElapsed Time: {elapsed_time:.4f} seconds")
         return self.sequence_all
@@ -78,7 +79,7 @@ class DomainProcessing:
         # print(seqarraylen_clean)
 
         seqarray = pd.DataFrame({"ID": self.id_all, "Sequences": self.sequence_all})
-        print(seqarray)
+        # print(seqarray)
         seqarray_clean = seqarray  # [(np.char.str_len(seqarray)>=np.quantile(seqarraylen,0.125/2)) & (np.char.str_len(seqarray)<=np.quantile(seqarraylen,0.875))]
 
         # shapiro = stats.shapiro(seqarraylen_clean)
@@ -240,14 +241,13 @@ class databaseCreater:
                 )
 
         # Convert once to DataFrame at the end
-        else:
-            sliding_df = pd.DataFrame(
-                {
-                    "Sequences": sequences,
-                    "ID": ids,
-                    "WindowPos": window_positions,
-                }
-            )
+        sliding_df = pd.DataFrame(
+            {
+                "Sequences": sequences,
+                "ID": ids,
+                "WindowPos": window_positions,
+            }
+        )
 
         elapsed_time = time.time() - start_time
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
@@ -258,8 +258,9 @@ class databaseCreater:
         Saves the final df in a .csv file. Name of file is hardcoded
         """
         start_time = time.time()
-        print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("TESTESTESTSS.csv", index=False)
+        # print("Final array:", self.seqarray_final)
+        if __name__ == "__main__":
+            self.seqarray_final.to_csv("TESTESTESTSS.csv", index=False)
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -282,7 +283,7 @@ if __name__ == "__main__":
     print("Starting data creation")
     dataset = databaseCreater(
         seqarray_clean_rnd_trembl,
-        148,
+        dimension_positive,
         10,
     )
     ##############################################################
