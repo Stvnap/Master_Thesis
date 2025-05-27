@@ -1,7 +1,7 @@
 import Dataset_preprocess_TRAIN
 import Dataset_preprocess_EVAL
-import DNN_pipeline
-import Testrunner
+import HPsearch
+import FinalTrainer
 import Predictor
 
 #################################################################################################
@@ -153,7 +153,7 @@ if __name__ == "__main__":
 
     ### HYPERPARAMETER TUNING ###
 
-    run = DNN_pipeline.Starter(
+    run = HPsearch.Starter(
         "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
     )
 
@@ -166,7 +166,7 @@ if __name__ == "__main__":
 
     ### FINAL TRAINING ###
 
-    Testrun = Testrunner.Testrunning(
+    Testrun = FinalTrainer.Testrunning(
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1_palma/trial.json",
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1_palma/checkpoint.weights.h5",
     )

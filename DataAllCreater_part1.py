@@ -12,17 +12,17 @@ import time
 
 import polars as pl
 import tensorflow as tf
-
+import numpy
 gpus = tf.config.list_physical_devices("GPU")
 tf.config.set_visible_devices(  # Disable GPU, crashes on GPU
     [], "GPU"
 )
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-# from Dataset_preprocess_TRAIN import dimension_positive             # change here to 2d if u want to create a ds for multi categorial classification
+
+from Dataset_preprocess_TRAIN_2d import dimension_positive             # change here to 2d if u want to create a ds for multi categorial classification
 
 ###################################################################################################################################
-dimension_positive=148
 
 def _sequence_to_int(df):
     """
@@ -122,6 +122,7 @@ def _labler(padded):
     print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
     return padded_label
 
+
 def _labler2d(padded):
     """
     Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
@@ -129,8 +130,10 @@ def _labler2d(padded):
     """
     start_time = time.time()
     padded = padded.with_columns(
-        pl.when(pl.col("categories") == 0).then(1)
-        .when(pl.col("categories") == 1).then(2)
+        pl.when(pl.col("categories") == 0)
+        .then(1)
+        .when(pl.col("categories") == 1)
+        .then(2)
         .otherwise(0)
         .alias("Labels")
     )
@@ -142,55 +145,76 @@ def _labler2d(padded):
     return padded_label
 
 
+
 def splitter2(padded_label):
     """
-    Splits padded_label into train/val/test (60/20/20), grouping all rows with the same ID
-    in the same split *and* stratifying by label.
-    Writes each split to a parquet, and returns the three DataFrames.
+    Splits the whole df into three sets: train, val and test set.
+    Returns these three df
     """
-    t0 = time.time()
+    start_time = time.time()
 
-    # 1) Build an ID→label table (here taking the first label seen per ID)
-    ids_df = (
-        padded_label.select(["IDs", "Labels"])
-        .unique(subset="IDs")  # keep one row per ID
-        # .groupby("IDs").agg(pl.col("Labels").mode().first())  # if you want the mode instead
-        .rename({"Labels": "Label"})  # so column names don't collide
-    )
-    # Convert to Pandas for sklearn
-    ids_pd = ids_df.to_pandas()
-    id_values = ids_pd["IDs"].values
-    label_vals = ids_pd["Label"].values
-
-    # 2) Split IDs → train vs temp (60% train, 40% temp), stratified by ID-label
-    train_ids, temp_ids = train_test_split(
-        id_values, test_size=0.4, stratify=label_vals, random_state=42
+    train_df, temp_df = train_test_split(
+        padded_label,
+        test_size=0.4,
+        stratify=padded_label["Labels"],
+        random_state=42,
     )
 
-    # 3) From temp_ids split into val vs test (each half of the 40%), again stratified
-    temp_labels = ids_pd.set_index("IDs").loc[temp_ids, "Label"].values
-    val_ids, test_ids = train_test_split(
-        temp_ids, test_size=0.5, stratify=temp_labels, random_state=42
+    val_df, test_df = train_test_split(
+        temp_df, test_size=0.5, stratify=temp_df["Labels"], random_state=42
     )
 
-    # 4) Filter the original padded_label into three DataFrames
-    train_df = padded_label.filter(pl.col("IDs").is_in(train_ids))
-    val_df = padded_label.filter(pl.col("IDs").is_in(val_ids))
-    test_df = padded_label.filter(pl.col("IDs").is_in(test_ids))
-
-    # 5) Report shapes
-    print(f"Train set shape:      {train_df.shape}")
+    print(f"Train set shape: {train_df.shape}")
     print(f"Validation set shape: {val_df.shape}")
-    print(f"Test set shape:       {test_df.shape}")
+    print(f"Test set shape: {test_df.shape}")
 
-    # 6) Write to parquet
-    train_df.write_parquet("trainsetALL.parquet")
-    val_df.write_parquet("valsetALL.parquet")
-    test_df.write_parquet("testsetALL.parquet")
+    # train_df.write_parquet("trainsetALL.parquet")
+    # val_df.write_parquet("valsetALL.parquet")
+    # test_df.write_parquet("testsetALL.parquet")
 
-    print(f"Done splitting in {time.time() - t0:.3f}s")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
 
     return train_df, val_df, test_df
+
+def one_hot(_df):
+    """
+    Creates one hot tensors for further pipelining it into the model
+    Returns a new tensor with only the one hot encoded sequences
+    """
+    start_time = time.time()
+    with tf.device("/CPU:0"):
+        df_one_hot = [
+            tf.one_hot(int_sequence, 21) for int_sequence in _df["Sequences"]
+        ]
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
+        # print(len(df_one_hot))
+        # print(len(self.padded))
+        return df_one_hot
+
+def creater(df, df_onehot, name):
+    """
+    Creates a tf.Dataset with the one_hot tensor and the df column 'Labels'
+    Returned is this tf.Dataset aswell as it is saved as a directory
+    """
+    start_time = time.time()
+
+    with tf.device("/CPU:0"):
+        tensor_df = tf.data.Dataset.from_tensor_slices((df_onehot, df["Labels"]))
+
+        tensor_df.shuffle(buffer_size=1000, seed=4213122)
+
+        tensor_df.save(name)
+
+        print(f"dataset size: {len(tensor_df)}")
+
+        print(f"Creation completed in {time.time() - start_time:.2f} seconds")
+
+        return tensor_df
+
 
 
 def make_dataset(
@@ -203,6 +227,7 @@ def make_dataset(
     pads to length dimension_positive, one‐hots to depth=21 (uint8), then shuffles & batches.
     Peak memory stays at ~batch_size×dimension_positive×21 elements.
     """
+
     def gen():
         """
         Generator reading each row of the df
@@ -226,8 +251,12 @@ def make_dataset(
         """
         Pad and onehot encode
         """
-        seq = tf.pad(seq, [[0, dimension_positive - tf.shape(seq)[0]]], constant_values=21)
+        seq = tf.pad(
+            seq, [[0, dimension_positive - tf.shape(seq)[0]]], constant_values=21
+        )
         oh = tf.one_hot(seq, depth=21, dtype=tf.uint8)
+
+        # laboh = tf.one_hot(lab,depth=3,dtype=tf.uint8)
         return oh, lab, id_
 
     # apply to the ds
@@ -239,7 +268,26 @@ def make_dataset(
     # Save
     if save_path:
         ds.save(save_path)
+        print("Saved")
 
+    inputs = []
+    labels = []
+    ids = []
+
+    for x, y, z in ds:
+        inputs.append(x.numpy().flatten())
+        labels.append(y.numpy().tolist())
+        ids.append(z.numpy())
+
+    # Annahme: Inputs sind flattenbar
+    df = pl.DataFrame({
+        'input': inputs,
+        'label': labels,
+        'id': ids
+    })
+
+    df.write_csv('./saved_dataset2dNew.csv')
+    
     print("Dataset built")
     return ds
 
@@ -247,8 +295,11 @@ def make_dataset(
 ##################################################################################
 
 if __name__ == "__main__":
+
+    dimension=1
+
     print("Starting data preparation...")
-    df_path = "./DataTrainSwissProt.csv"
+    df_path = "./Dataframes/DataTrainPF00120.csv"
 
     # load in
     df = pl.read_csv(
@@ -256,26 +307,38 @@ if __name__ == "__main__":
         schema_overrides={
             "Sequences": pl.Utf8,
             "categories": pl.Int8,
-            # "ID": pl.Utf8,
+            "ID": pl.Utf8,
         },
-        # n_rows=100000,
     ).lazy()
-
-
-    df = df.with_columns([
-    pl.lit("xyz").alias("ID")       ############### TEST PURPUSE ################
-    ]) 
 
     print("Done loading")
 
     df = _sequence_to_int(df)
     print("Done encoding")
 
-    df = _labler(df)
-    print("Done labeling")
+    if dimension == 1:
+        df = df.collect()
+        df= _padder(df)
+        df = _labler(df)
+        print("Done labeling")
 
-    df = df.collect()
+        train_df, val_df, test_df=splitter2(df) # Split the dataset into train/val/test sets old approach used for the binary classification
+        train_df_oh=one_hot(_df=train_df)
+        val_df_oh=one_hot(_df=val_df)
+        test_df_oh=one_hot(_df=test_df)
 
-    df = make_dataset(df, save_path="./saved_dataset")
+        creater(train_df, train_df_oh, name="./Datasets/PF00210/trainset")
+        creater(val_df, val_df_oh, name="./Datasets/PF00210/valset")
+        creater(test_df, test_df_oh, name="./Datasets/PF00210/testset")
+        
+        # this creates the ready to go datasets, so you can skip DataAllCreater_part2.py and use it directly for training
+    else:
+        df = _labler2d(df)
+        df= df.collect()
+        df = make_dataset(df, save_path="./Datasets/2dNew")
+
+
+
+
 
     print("Data preparation completed.")

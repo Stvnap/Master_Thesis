@@ -15,11 +15,12 @@ import time
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+
 from keras.preprocessing.sequence import pad_sequences
 from keras.saving import load_model
 from sklearn.metrics import classification_report, confusion_matrix
 
-from Testrunner import BATCH_SIZE
+from FinalTrainer import BATCH_SIZE
 
 ##########################################################################################
 
@@ -34,7 +35,7 @@ class Predicter_pipeline:
     Executes the complete program in __init__()
     """
 
-    def __init__(self, model_path, df_path, flank_size, step, batch_size=32):
+    def __init__(self, model_path, df_path, flank_size, step,dimension, batch_size=32):
         self.flank_size = flank_size
         self.step = step
         self.model_path = model_path
@@ -43,6 +44,7 @@ class Predicter_pipeline:
         self.model = None
         self.df = None
         self.dimension_positive = 148
+        self.dimension = dimension
 
         ########################### FIRST PREDICTION & POSTPROCESSING ############################
 
@@ -127,7 +129,7 @@ class Predicter_pipeline:
 
         df_filtered = self.df2[thr_flags].reset_index(drop=True)
 
-        df_final = self._lastlistcreater(df_filtered)
+        self._lastlistcreater(df_filtered)
 
     def _predicting(self, modelpath, Evalset):
         """
@@ -224,6 +226,30 @@ class Predicter_pipeline:
             elapsed_time = end_time - start_time
             print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
             return padded_label
+        
+
+        def _labler2d(padded):
+            """
+            Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
+            Returns the df with added 'Labels' column
+            """
+            start_time = time.time()
+            print("Padded LAST:",padded[0:10])
+
+            try:
+                padded["Labels"] = np.where(
+                    padded["categories"] == 0, 1,
+                    np.where(padded["categories"] == 1, 2, 0)
+                )
+                padded_label = padded
+            except:
+                padded_label = padded
+                
+            # padded_label = padded_label.drop("categories")
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
+            return padded_label
 
         def one_hot(padded):
             """
@@ -247,11 +273,34 @@ class Predicter_pipeline:
 
         df = sequence_to_int(Evalset)
         padder_df = padder(df)
-        labled_df = labler(padder_df)
+
+        if self.dimension == 1:
+            labled_df = labler(padder_df)
+
+        else:
+            labled_df = _labler2d(padder_df)
 
         df_onehot = one_hot(padder_df)
         X_train = df_onehot
-        y_train = labled_df["Labels"]
+
+        X_train = tf.data.Dataset.from_tensor_slices(X_train)  # wrap your tensor as a Dataset
+        X_train = X_train.shuffle(buffer_size=X_train.cardinality(), seed=42)
+
+
+
+        y_train=[]
+
+        if self.dimension == 1:
+            for _,entry in labled_df.iterrows():
+                if entry["Labels"]== 1 and entry["overlap"] >= 0.70:
+                    y_train.append(1)
+                elif entry["Labels"]== 2 and entry["overlap"] >= 0.70:
+                    y_train.append(2)
+                else:
+                    y_train.append(0)
+        else:
+            y_train = labled_df["Labels"]
+
 
         ########################### START OF PREDICTION ##############################
 
@@ -269,14 +318,19 @@ class Predicter_pipeline:
         predictions = model.predict(X_train, batch_size=BATCH_SIZE)
         print("predictions made")
 
-        # bool predictions
-        predictions_bool = []
-        for value in predictions:
-            if value >= 0.5:
-                bool = 1
-            else:
-                bool = 0
-            predictions_bool.append(bool)
+
+        if self.dimension== 1:
+            predictions_bool = []
+            for value in predictions:
+                if value >= 0.5:
+                    bool = 1
+                else:
+                    bool = 0
+                predictions_bool.append(bool)
+
+        else:
+            predictions_bool = np.argmax(predictions, axis=1)          
+
 
         true_labels = y_train
 
@@ -366,43 +420,43 @@ class Predicter_pipeline:
             flat_predictions.extend(group_labels)
             flat_windows.extend(group_windows)
 
-        # Optional: Compare to true labels (if provided)
-        if true_labels is not None:
-            if len(true_labels) != len(flat_predictions):
-                print(
-                    f"❌ Mismatch: predictions ({len(flat_predictions)}) vs true labels ({len(true_labels)})"
-                )
-            else:
-                # print("✅ Length check passed: predictions match true labels.")
-                combined_df = pd.DataFrame(
-                    {
-                        "ID": flat_IDs,
-                        "Prediction": flat_predictions,
-                        "TrueLabel": true_labels,
-                        "WindowPos": flat_windows,
-                    }
-                )
+        # # Optional: Compare to true labels (if provided)
+        # if true_labels is not None:
+        #     if len(true_labels) != len(flat_predictions):
+        #         print(
+        #             f"❌ Mismatch: predictions ({len(flat_predictions)}) vs true labels ({len(true_labels)})"
+        #         )
+        #     else:
+        #         # print("✅ Length check passed: predictions match true labels.")
+        #         combined_df = pd.DataFrame(
+        #             {
+        #                 "ID": flat_IDs,
+        #                 "Prediction": flat_predictions,
+        #                 "TrueLabel": true_labels,
+        #                 "WindowPos": flat_windows,
+        #             }
+        #         )
 
-        else:
-            combined_df = None
+        # else:
+        #     combined_df = None
 
-        # Step: Find groups where prediction == 1
-        positive_entries = []
-        for i, labels in enumerate(master_labels):
-            if 1 in labels:
-                positions = [j for j, val in enumerate(labels) if val == 1]
+        # # Step: Find groups where prediction == 1
+        # positive_entries = []
+        # for i, labels in enumerate(master_labels):
+        #     if 1 in labels:
+        #         positions = [j for j, val in enumerate(labels) if val == 1]
 
-                ids_with_1 = [master_IDs[i][j] for j in positions]
-                windows_with_1 = [masterWindowPos[i][j] for j in positions]
+        #         ids_with_1 = [master_IDs[i][j] for j in positions]
+        #         windows_with_1 = [masterWindowPos[i][j] for j in positions]
 
-                positive_entries.append(
-                    {
-                        "GroupIndex": i,
-                        "PositionsInGroup": positions,
-                        "IDs": ids_with_1,
-                        "WindowPos": windows_with_1,
-                    }
-                )
+        #         positive_entries.append(
+        #             {
+        #                 "GroupIndex": i,
+        #                 "PositionsInGroup": positions,
+        #                 "IDs": ids_with_1,
+        #                 "WindowPos": windows_with_1,
+        #             }
+        #         )
 
         positive_rows = []
 
@@ -927,8 +981,8 @@ class Predicter_pipeline:
 #####################################################################################
 
 if __name__ == "__main__":
-    df_path = "./TESTESTESTSS.csv"
-    model_path = "./models/my_modelnewlabeling.keras"
+    df_path = "./DataEvalSwissProt2d.csv"
+    model_path = "./models/modelSP2d_NEWEST.keras"
     Predicter = Predicter_pipeline(
-        model_path, df_path, flank_size=30, step=10, batch_size=BATCH_SIZE
+        model_path, df_path, flank_size=30, step=10,dimension=2, batch_size=BATCH_SIZE,
     )

@@ -16,13 +16,10 @@ import keras_tuner as kt
 import numpy as np
 import tensorflow as tf
 from keras.callbacks import EarlyStopping, TensorBoard
-from keras.layers import Dense, Flatten, Input
+from keras.layers import Dense, Flatten, Input, LSTM, GlobalAveragePooling1D
 from keras.models import Sequential
-from keras.preprocessing.sequence import pad_sequences
 from keras.losses import SparseCategoricalCrossentropy
 from focal_loss import SparseCategoricalFocalLoss
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
 # from Dataset_preprocess_TRAIN_2d import dimension_positive
 # from DataAllCreater_part2 import class_weights
 
@@ -36,12 +33,14 @@ STRATEGY = tf.distribute.MirroredStrategy()
 print(f"Number of devices: {STRATEGY.num_replicas_in_sync}")
 
 
-BATCH_SIZE = 64 * STRATEGY.num_replicas_in_sync
+BATCH_SIZE = 128 * STRATEGY.num_replicas_in_sync
 print("Batch Size:",BATCH_SIZE)
 
+### CHANGE THESE ACCORDINGLY ###
 DIMENSION_POSITIVE = 148
 CLASS_WEIGHTS = {0: 0.35972796, 1: 8.42605461, 2: 9.85784824}
 BASE_WEIGHTS = [0.35972796,8.42605461,9.85784824]
+
 
 print(tf.keras.__version__)
 print(tf.__version__)
@@ -61,11 +60,10 @@ class MyHyperModel(kt.HyperModel):
         actual build of the model with all HP variables
         """
 
-
         print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
 
         n_neurons = hp.Int("n_neurons", min_value=3100, max_value=3400)
-        n_hidden = hp.Int("n_hidden", min_value=16, max_value=16, step=2)
+        n_hidden = hp.Int("n_hidden", min_value=16, max_value=32)
 
         learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
         optimizer = hp.Choice("optimizer", values=["adam", "sgd"])
@@ -96,8 +94,20 @@ class MyHyperModel(kt.HyperModel):
 
         model = Sequential()
         model.add(Input(shape=(self.target_dimension, 21)))
-        model.add(Flatten())
+        # model.add(Flatten())
 
+        model.add(LSTM(
+            units=hp.Int("lstm_units1", min_value=128, max_value=512, step=128),
+            return_sequences=True,
+            dropout=hp.Float("lstm_drop1", 0.0, 0.1, step=0.1)
+        ))
+
+        # Layer 2: LSTM, only keep last output
+        model.add(LSTM(
+            units=hp.Int("lstm_units2", min_value=64, max_value=256, step=64),
+            return_sequences=False,
+            dropout=hp.Float("lstm_drop2", 0.0, 0.1, step=0.1)
+        ))
 
 
 
@@ -147,10 +157,6 @@ class MyHyperModel(kt.HyperModel):
                 )
 
 
-
-
-
-
         model.compile(
             optimizer=optimizer,
             loss=loss_fn,
@@ -160,11 +166,8 @@ class MyHyperModel(kt.HyperModel):
             tf.keras.metrics.Recall(   name="rec_1", class_id=1),
             tf.keras.metrics.Precision(name="prec_2", class_id=2),
             tf.keras.metrics.Recall(   name="rec_2",  class_id=2),
-            #tf.keras.metrics.AUC(name="auc_overall"),
                 ]
             )
-
-
 
 
         return model
@@ -186,6 +189,9 @@ class Starter:
         self,
         # df_path,
         dimension,
+        trainpath,
+        valpath,
+        testpath,
         strategy=STRATEGY,
         batch_size=BATCH_SIZE,
         dimension_positive=DIMENSION_POSITIVE,
@@ -196,6 +202,10 @@ class Starter:
         self.target_dimension = dimension_positive
         self.dimension=dimension
         self.class_weights = class_weights
+        self.trainpath=trainpath
+        self.valpath=valpath
+        self.testpath=testpath
+
 
         self.train_dataset, self.val_dataset, self.test_dataset = self._loader()
 
@@ -207,13 +217,13 @@ class Starter:
         """
 
         start_time = time.time()
-        train_dataset = tf.data.Dataset.load("trainsetSP2d")
-        val_dataset = tf.data.Dataset.load("valsetSP2d")
-        test_dataset = tf.data.Dataset.load("testsetSP2d")
+        train_dataset = tf.data.Dataset.load(self.trainpath)
+        val_dataset = tf.data.Dataset.load(self.valpath)
+        test_dataset = tf.data.Dataset.load(self.testpath)
 
-        train_dataset = train_dataset.shuffle(buffer_size=train_dataset.cardinality(), seed=42)
-        val_dataset   = val_dataset.shuffle(buffer_size=val_dataset.cardinality(), seed=42)
-        test_dataset  = test_dataset.shuffle(buffer_size=test_dataset.cardinality(), seed=42)
+        train_dataset = train_dataset.shuffle(buffer_size=10000, seed=42)
+        val_dataset   = val_dataset.shuffle(buffer_size=10000, seed=42)
+        test_dataset  = test_dataset.shuffle(buffer_size=10000, seed=42)
 
         train_dataset = train_dataset.batch(self.batch_size)
         val_dataset = val_dataset.batch(self.batch_size)
@@ -225,10 +235,14 @@ class Starter:
         val_dataset = val_dataset.prefetch(tf.data.experimental.AUTOTUNE)
         test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
+        for x, y in train_dataset.take(1):
+            print("Input shape:", x.shape)
+            print("Label shape:", y.shape)
+
         print(f"Loading completed in {time.time() - start_time:.2f} seconds")
         return train_dataset, val_dataset, test_dataset
 
-    def tuner(self,ProjectName):
+    def tuner(self,trials,epochs):
         """
         Iniziation function for the HP search, BayesianOptimization search is used with tensorbaord callbacks,
         as well as model saves for the best model so far. Early stopping is used with patience on 5 and val_loss
@@ -241,15 +255,14 @@ class Starter:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Create directories outside strategy scope
-        log_dir = f"./logshp/{ProjectName}"
+        log_dir = "./logshp/ModelForSP2d_RNN_tb"
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs("logshp/weights", exist_ok=True)
-        os.makedirs(f"{log_dir}/weights/{ProjectName}", exist_ok=True)
 
         # Setup callbacks
         tensorboard = TensorBoard(log_dir=log_dir)
         checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-            f"{log_dir}/weights/{ProjectName}/run_{timestamp}.weights.h5",
+            f"logshp/weights/run_{timestamp}.weights.h5",
             save_best_only=True,
             save_weights_only=True,
             monitor="val_loss",
@@ -264,20 +277,19 @@ class Starter:
         self.tuner = kt.BayesianOptimization(
             hypermodel=MyHyperModel(target_dimension=self.target_dimension,dimension=self.dimension),
             objective="val_loss",
-            max_trials=15,
-            overwrite=True,
+            max_trials=trials,
+            overwrite=False,
             directory="./logshp",
-            distribution_strategy=tf.distribute.MirroredStrategy(),
-            project_name=ProjectName,
+            # distribution_strategy=tf.distribute.MirroredStrategy(),
+            project_name="ModelForSP2drun2_RNN",
         )
 
         self.tuner.search_space_summary()
 
-
         # Search outside strategy scope
         self.tuner.search(
             self.train_dataset,
-            epochs=10,
+            epochs=epochs,
             validation_data=self.val_dataset,
             callbacks=[tensorboard, checkpoint_cb, early_stopping],
             class_weight=self.class_weights,  # removed when using focal loss
@@ -305,6 +317,6 @@ class Starter:
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
 
-    run = Starter(dimension=2)
+    run = Starter(dimension=2,trainpath='./trainsetSP2d',valpath='./valsetSP2d',testpath='./testsetSP2d')
 
-    run.tuner("HPsearch2d_Home")
+    run.tuner(trials=15,epochs=10)

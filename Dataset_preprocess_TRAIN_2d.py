@@ -157,7 +157,7 @@ class databaseCreater:
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         dimension_positive,
         stepsize,
     ):
@@ -172,10 +172,10 @@ class databaseCreater:
         self.seqarray_clean_PF00162 = seqarray_clean_PF00162
         self.seqarray_clean_rnd_sprot = seqarray_clean_rnd_sprot
         self.seqarray_clean_rnd_all = self.seqarray_clean_rnd_sprot
-        self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
-        self.seqarray_clean_rnd_all = pd.concat(
-            [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
-        )
+        # self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
+        # self.seqarray_clean_rnd_all = pd.concat(
+        #     [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
+        # )
         self.dimension_positive = dimension_positive
         self.stepsize = stepsize
 
@@ -331,7 +331,7 @@ class databaseCreater:
         """
         start_time = time.time()
         print("Final array:", self.seqarray_final)
-        self.seqarray_final.to_csv("DataTrainALL2d.csv", index=False)
+        self.seqarray_final.to_csv("DataTrainSwissProt2d.csv", index=False)
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -341,34 +341,37 @@ class databaseCreater:
 
 ########### FOR CREATING TRAINING DATASET, FOR TRAINING THE MODEL ###########
 
+# positive Domain PF00177
+print("Loading positive domain PF00177")
+fasta = DomainProcessing(
+    "/global/research/students/sapelt/Masters/domains_PF00177.fa"
+)
+seqarray_clean1, seqarraylen_clean1, normaltest = (
+    fasta.distribution_finder(fasta.len_finder())
+)
+dimension_positive1 = fasta.dimension_finder(seqarraylen_clean1)
+print("targeted dimension", dimension_positive1)
+
+
+
+# 2nd positive Domain PF00210
+print("Loading positive domain PF00210")
+fasta = DomainProcessing(
+    "/global/research/students/sapelt/Masters/domains_PF00210.fa"
+)
+seqarray_clean2, seqarraylen_clean2, normaltest = (
+    fasta.distribution_finder(fasta.len_finder())
+)
+dimension_positive2 = fasta.dimension_finder(seqarraylen_clean2)
+print("targeted dimension", dimension_positive2)
+
+dimension_positive = max(dimension_positive1, dimension_positive2)
+
+print('\n,\n')
+print("Final Target Dimension:",dimension_positive)
+
+
 if __name__ == "__main__":
-    # positive Domain PF00177
-    print("Loading positive domain PF00177")
-    fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/domains_PF00177.fa"
-    )
-    seqarray_clean1, seqarraylen_clean1, normaltest = (
-        fasta.distribution_finder(fasta.len_finder())
-    )
-    dimension_positive1 = fasta.dimension_finder(seqarraylen_clean1)
-    print("targeted dimension", dimension_positive1)
-
-
-
-    # 2nd positive Domain PF00210
-    print("Loading positive domain PF00210")
-    fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/domains_PF00210.fa"
-    )
-    seqarray_clean2, seqarraylen_clean2, normaltest = (
-        fasta.distribution_finder(fasta.len_finder())
-    )
-    dimension_positive2 = fasta.dimension_finder(seqarraylen_clean2)
-    print("targeted dimension", dimension_positive2)
-
-    dimension_positive = max(dimension_positive1, dimension_positive2)
-
-
     # negative Domains:
     print("Loading negative PF00079")
     fasta = DomainProcessing(
@@ -406,11 +409,11 @@ if __name__ == "__main__":
     )
     seqarray_clean_rnd_sprot = fasta._load_in_SwissProt()
 
-    print("Loading trembl")
-    fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/domains_uniprot_trembl.fa"
-    )
-    seqarray_clean_rnd_trembl = fasta._load_in_Trembl()
+    # print("Loading trembl")
+    # fasta = DomainProcessing(
+    #     "/global/research/students/sapelt/Masters/domains_uniprot_trembl.fa"
+    # )
+    # seqarray_clean_rnd_trembl = fasta._load_in_Trembl()
 
     ################### Data creation ########################
     print("Starting data creation")
@@ -422,7 +425,7 @@ if __name__ == "__main__":
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         dimension_positive,
         10,
     )

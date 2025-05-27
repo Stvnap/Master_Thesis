@@ -214,19 +214,6 @@ class Predicter_pipeline:
 
             return df_int
 
-        def labler(padded):
-            """
-            Creates a new column 'Labels' that translates the categories column to 1 = target domain, 0 = all other
-            Returns the df with added 'Labels' column
-            """
-            start_time = time.time()
-            padded["Labels"] = padded["overlap"].apply(lambda x: 1 if x == 1 else 0)
-            padded_label = padded
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            print(f"Done labeling\nElapsed Time: {elapsed_time:.4f} seconds")
-            return padded_label
-
         def one_hot(padded):
             """
             Creates one hot tensors for further pipelining it into the model
@@ -355,42 +342,42 @@ class Predicter_pipeline:
             flat_windows.extend(group_windows)
 
         # Optional: Compare to true labels (if provided)
-        if true_labels is not None:
-            if len(true_labels) != len(flat_predictions):
-                print(
-                    f"❌ Mismatch: predictions ({len(flat_predictions)}) vs true labels ({len(true_labels)})"
-                )
-            else:
-                # print("✅ Length check passed: predictions match true labels.")
-                combined_df = pd.DataFrame(
-                    {
-                        "ID": flat_IDs,
-                        "Prediction": flat_predictions,
-                        "TrueLabel": true_labels,
-                        "WindowPos": flat_windows,
-                    }
-                )
+        # if true_labels is not None:
+        #     if len(true_labels) != len(flat_predictions):
+        #         print(
+        #             f"❌ Mismatch: predictions ({len(flat_predictions)}) vs true labels ({len(true_labels)})"
+        #         )
+        #     else:
+        #         # print("✅ Length check passed: predictions match true labels.")
+        #         combined_df = pd.DataFrame(
+        #             {
+        #                 "ID": flat_IDs,
+        #                 "Prediction": flat_predictions,
+        #                 "TrueLabel": true_labels,
+        #                 "WindowPos": flat_windows,
+        #             }
+        #         )
 
-        else:
-            combined_df = None
+        # else:
+        #     combined_df = None
 
-        # Step: Find groups where prediction == 1
-        positive_entries = []
-        for i, labels in enumerate(master_labels):
-            if 1 in labels:
-                positions = [j for j, val in enumerate(labels) if val == 1]
+        # # Step: Find groups where prediction == 1
+        # positive_entries = []
+        # for i, labels in enumerate(master_labels):
+        #     if 1 in labels:
+        #         positions = [j for j, val in enumerate(labels) if val == 1]
 
-                ids_with_1 = [master_IDs[i][j] for j in positions]
-                windows_with_1 = [masterWindowPos[i][j] for j in positions]
+        #         ids_with_1 = [master_IDs[i][j] for j in positions]
+        #         windows_with_1 = [masterWindowPos[i][j] for j in positions]
 
-                positive_entries.append(
-                    {
-                        "GroupIndex": i,
-                        "PositionsInGroup": positions,
-                        "IDs": ids_with_1,
-                        "WindowPos": windows_with_1,
-                    }
-                )
+        #         positive_entries.append(
+        #             {
+        #                 "GroupIndex": i,
+        #                 "PositionsInGroup": positions,
+        #                 "IDs": ids_with_1,
+        #                 "WindowPos": windows_with_1,
+        #             }
+        #         )
 
         positive_rows = []
 

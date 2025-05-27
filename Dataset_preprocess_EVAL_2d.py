@@ -206,7 +206,7 @@ class databaseCreater:
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         dimension_positive,
         stepsize,
         boundaries_all,
@@ -219,11 +219,11 @@ class databaseCreater:
         self.seqarray_clean_PF00118 = seqarray_clean_PF00118
         self.seqarray_clean_PF00162 = seqarray_clean_PF00162
         self.seqarray_clean_rnd_sprot = seqarray_clean_rnd_sprot
-        # self.seqarray_clean_rnd_all = self.seqarray_clean_rnd_sprot
-        self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
-        self.seqarray_clean_rnd_all = pd.concat(
-            [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
-        )
+        self.seqarray_clean_rnd_all = self.seqarray_clean_rnd_sprot
+        # self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
+        # self.seqarray_clean_rnd_all = pd.concat(
+        #     [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
+        # )
         self.dimension_positive = dimension_positive
         self.stepsize = stepsize
         self.boundaries_all = boundaries_all
@@ -365,8 +365,8 @@ class databaseCreater:
 
 
             try:
-                if isinstance (current_row["Boundaries"],list):
-                    current_boundary = current_row["Boundaries"]
+                current_boundary = current_row["Boundaries"]
+                # print("current boundary is list", current_boundary)
             except:
                 current_boundary = None
                 pass
@@ -437,65 +437,56 @@ class databaseCreater:
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
         return sliding_df
 
-    def _overlapCalculater(self, seqarray_multiplied):
+    def _overlapCalculater(self, seqarray_multiplied,binary_threshold=None):
         """
         Calculates the maximum overlap percentage between the window and any of the boundaries.
         Stores the overlap percentage (0.0 to 1.0) in the 'overlap' column. 
         Returned is the same df as entered with the addition of the 'overlap' column
         """
-        import time  # Make sure time is imported
-
         start_time = time.time()
 
         overlaps = []
+        n = len(seqarray_multiplied)
 
-        for idx in range(len(seqarray_multiplied)):
-            if idx % 100000 == 0:
-                print(f"Overlap check iteration: {idx}/{len(seqarray_multiplied)}")
+        for idx in range(n):
+            if idx % 100000 == 0 and idx > 0:
+                print(f"Overlap check iteration: {idx}/{n}")
 
             try:
                 row = seqarray_multiplied.iloc[idx]
+                # parse window
+                ws, we = map(int, row["WindowPos"].split("-"))
+                window_length = we - ws
 
-                # Parse window range
-                window_start, window_end = map(int, row["WindowPos"].split("-"))
-                window_length = window_end - window_start
-
-                # If the category is not 0, we skip computing overlap
-                if row["categories"] != 0:
+                # skip non-zero categories
+                if row["categories"] != 0 and row["categories"] != 1:
                     overlaps.append(0.0)
                     continue
 
-                # Parse multiple boundaries
-                boundary_ranges = row["Boundaries"].split(",")
                 max_overlap_pct = 0.0
+                for br in row["Boundaries"].split(","):
+                    bs, be = map(int, br.split("-"))
+                    overlap = max(0, min(we, be) - max(ws, bs))
+                    ref_len = min(window_length, be - bs)
+                    if ref_len > 0:
+                        max_overlap_pct = max(max_overlap_pct, overlap / ref_len)
 
-                for br in boundary_ranges:
-                    boundary_start, boundary_end = map(int, br.split("-"))
-                    boundary_length = boundary_end - boundary_start
+                # decide what to store
+                if binary_threshold is not None:
+                    val = 1.0 if max_overlap_pct >= binary_threshold else 0.0
+                else:
+                    val = round(max_overlap_pct, 4)
 
-                    # Compute overlap
-                    overlap = min(window_end, boundary_end) - max(
-                        window_start, boundary_start
-                    )
-                    overlap = max(overlap, 0)
-
-                    reference_length = min(window_length, boundary_length)
-
-                    if reference_length > 0:
-                        overlap_pct = overlap / reference_length
-                        max_overlap_pct = max(max_overlap_pct, overlap_pct)
-
-                overlaps.append(
-                    round(max_overlap_pct, 4)
-                )  # Rounded to 4 decimal places
+                overlaps.append(val)
 
             except Exception:
                 overlaps.append(0.0)
 
         seqarray_multiplied["overlap"] = overlaps
         elapsed_time = time.time() - start_time
-        print(f"\t Done checking overlap\n\t Elapsed Time: {elapsed_time:.4f} seconds")
+        print(f"\tDone checking overlap in {elapsed_time:.2f}s")
         return seqarray_multiplied
+
 
     def _saver(self):
         """
@@ -504,7 +495,7 @@ class databaseCreater:
         start_time = time.time()
         print("Final array:", self.seqarray_final)
         self.seqarray_final.to_csv(
-            "DataEvalAll2d.csv", index=False
+            "DataEvalSwissProt2d.csv", index=False
         )  # hardcoded filename
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
@@ -580,11 +571,11 @@ if __name__ == "__main__":
     )
     seqarray_clean_rnd_sprot, boundaries_allSwissprot = fasta._load_in_SwissProt()
 
-    print("Loading trembl")
-    fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawuniprot_trembl.fasta"
-    )
-    seqarray_clean_rnd_trembl, boundaries_allTrembl = fasta._load_in_Trembl()
+    # print("Loading trembl")
+    # fasta = DomainProcessing(
+    #     "/global/research/students/sapelt/Masters/rawuniprot_trembl.fasta"
+    # )
+    # seqarray_clean_rnd_trembl, boundaries_allTrembl = fasta._load_in_Trembl()
 
     boundaries_all = [
         boundaries_allPF00177,
@@ -594,7 +585,7 @@ if __name__ == "__main__":
         boundaries_allPF00118,
         boundaries_allPF00162,
         boundaries_allSwissprot,
-        boundaries_allTrembl,
+        # boundaries_allTrembl,
     ]
     boundaries_all = [item for sublist in boundaries_all for item in sublist]
 
@@ -602,13 +593,13 @@ if __name__ == "__main__":
     print("Starting data creation for SwissProt validation set")
     dataset = databaseCreater(
         seqarray_clean1,
-        seqarray_clean1,
+        seqarray_clean2,
         seqarray_clean_PF00079,
         seqarray_clean_PF00080,
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         dimension_positive,  
         0,
         boundaries_all,

@@ -14,6 +14,7 @@
 *.csv
 *.keras
 *.parquet
+*.swp
 
 # directories #
 logs/
@@ -30,6 +31,16 @@ bestmodels/
 __pycache__/
 Evalresults/
 saved_dataset/
+saved_dataset2d/
+saved_dataset2dSparse/
+saved_dataset2dNew/
+saved_datasetPF00210/
+Datasets/
+shells/
+Dataframes/
+sideScripts/
+
+
 
 # scripts #
 fastacutter.py
@@ -37,6 +48,7 @@ Dataset_preprocess_v2old.py
 csv_to_fasta.py
 Dataset_preprocessold.py
 LengthHistoPlotter.py
+tf.dataset_to_csv.py
 
 test*
 train*
