@@ -51,7 +51,6 @@ class Testrunning:
         dimension,
         target_dimension,
         load_weight,
-        df_path="./DataTrainSwissProt.csv",  # the Dataset_path used to train the model
         batch_size=BATCH_SIZE,
         strategy=STRATEGY,
     ):

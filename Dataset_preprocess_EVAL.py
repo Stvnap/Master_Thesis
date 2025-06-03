@@ -205,7 +205,7 @@ class databaseCreater:
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         dimension_positive,
         stepsize,
         boundaries_all,
@@ -218,11 +218,11 @@ class databaseCreater:
         self.seqarray_clean_PF00118 = seqarray_clean_PF00118
         self.seqarray_clean_PF00162 = seqarray_clean_PF00162
         self.seqarray_clean_rnd_sprot = seqarray_clean_rnd_sprot
-        # self.seqarray_clean_rnd_all = self.seqarray_clean_rnd_sprot
-        self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
-        self.seqarray_clean_rnd_all = pd.concat(
-            [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
-        )
+        self.seqarray_clean_rnd_all = self.seqarray_clean_rnd_sprot
+        # self.seqarray_clean_rnd_trembl = seqarray_clean_rnd_trembl
+        # self.seqarray_clean_rnd_all = pd.concat(
+        #     [self.seqarray_clean_rnd_sprot, self.seqarray_clean_rnd_trembl]
+        # )
         self.dimension_positive = dimension_positive
         self.stepsize = stepsize
         self.boundaries_all = boundaries_all
@@ -244,7 +244,7 @@ class databaseCreater:
 
         self.seqarray_multiplied = self._multiplier(self.seqarray_full, self.sliding)
 
-        self.seqarray_final = self._overlapCalculater(self.seqarray_multiplied)
+        self.seqarray_final = self._overlapCalculater(self.seqarray_multiplied,binary_threshold=0.7)
 
         self._saver()
 
@@ -364,8 +364,8 @@ class databaseCreater:
 
 
             try:
-                if isinstance (current_row["Boundaries"],list):
-                    current_boundary = current_row["Boundaries"]
+                current_boundary = current_row["Boundaries"]
+                # print("current boundary is list", current_boundary)
             except:
                 current_boundary = None
                 pass
@@ -381,7 +381,7 @@ class databaseCreater:
                     if current_boundary:
                         boundaries_all.append(current_boundary)
                 except:
-                    pass
+                    boundaries_all.append(None)  # Explicitly add None for missing boundaries
             
 
                 # Calculate WindowPos as string
@@ -436,7 +436,8 @@ class databaseCreater:
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
         return sliding_df
 
-    def _overlapCalculater(self, seqarray_multiplied):
+
+    def _overlapCalculater(self, seqarray_multiplied,binary_threshold=0.7):
         """
         Calculates the maximum overlap percentage between the window and any of the boundaries.
         Stores the overlap percentage (0.0 to 1.0) in the 'overlap' column. 
@@ -484,12 +485,16 @@ class databaseCreater:
                         overlap_pct = overlap / reference_length
                         max_overlap_pct = max(max_overlap_pct, overlap_pct)
 
-                overlaps.append(
-                    round(max_overlap_pct, 4)
-                )  # Rounded to 4 decimal places
+
+                if binary_threshold is not None:
+                    val = 1 if max_overlap_pct >= binary_threshold else 0
+                else:
+                    val = round(max_overlap_pct, 4)
+
+                overlaps.append(val)
 
             except Exception:
-                overlaps.append(0.0)
+                overlaps.append(0)
 
         seqarray_multiplied["overlap"] = overlaps
         elapsed_time = time.time() - start_time
@@ -503,8 +508,8 @@ class databaseCreater:
         start_time = time.time()
         print("Final array:", self.seqarray_final)
         self.seqarray_final.to_csv(
-            "DataAllRegression.csv", index=False
-        )  # hardcoded filename
+            "./Dataframes/Evalsets/DataEvalPF00210.csv", index=False        # hardcoded filename
+        )  
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -514,10 +519,10 @@ class databaseCreater:
 ###### FOR CREATING FULL SEQUENCE DATASET, FOR EVALUTATING PERFORMANCE ######
 
 if __name__ == "__main__":
-    # positive Domain PF00177
-    print("Loading positive domain PF00177")
+    # positive Domain PF00210
+    print("Loading positive domain PF00210")
     fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawPF00177.fasta"
+        "/global/research/students/sapelt/Masters/rawPF00210.fasta"
     )
     seqarray_clean, boundaries_allPF00177 = fasta.distribution_finder(
         fasta.len_finder()
@@ -562,11 +567,11 @@ if __name__ == "__main__":
     )
     seqarray_clean_rnd_sprot, boundaries_allSwissprot = fasta._load_in_SwissProt()
 
-    print("Loading trembl")
-    fasta = DomainProcessing(
-        "/global/research/students/sapelt/Masters/rawuniprot_trembl.fasta"
-    )
-    seqarray_clean_rnd_trembl, boundaries_allTrembl = fasta._load_in_Trembl()
+    # print("Loading trembl")
+    # fasta = DomainProcessing(
+    #     "/global/research/students/sapelt/Masters/rawuniprot_trembl.fasta"
+    # )
+    # seqarray_clean_rnd_trembl, boundaries_allTrembl = fasta._load_in_Trembl()
 
     boundaries_all = [
         boundaries_allPF00177,
@@ -575,7 +580,7 @@ if __name__ == "__main__":
         boundaries_allPF00118,
         boundaries_allPF00162,
         boundaries_allSwissprot,
-        boundaries_allTrembl,
+        # boundaries_allTrembl,
     ]
     boundaries_all = [item for sublist in boundaries_all for item in sublist]
 
@@ -588,7 +593,7 @@ if __name__ == "__main__":
         seqarray_clean_PF00118,
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
-        seqarray_clean_rnd_trembl,
+        # seqarray_clean_rnd_trembl,
         148,  # HARDCODED change if dimension of positive domain changes
         0,
         boundaries_all,

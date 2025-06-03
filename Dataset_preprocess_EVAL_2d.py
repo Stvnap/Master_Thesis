@@ -473,7 +473,7 @@ class databaseCreater:
 
                 # decide what to store
                 if binary_threshold is not None:
-                    val = 1.0 if max_overlap_pct >= binary_threshold else 0.0
+                    val = 1 if max_overlap_pct >= binary_threshold else 0
                 else:
                     val = round(max_overlap_pct, 4)
 
