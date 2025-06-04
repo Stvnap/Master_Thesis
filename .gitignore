@@ -42,6 +42,7 @@ sideScripts/
 lightning_logs/
 tuner_dir/
 pickle/
+checkpoints/
 
 
 

@@ -495,7 +495,7 @@ class databaseCreater:
         start_time = time.time()
         print("Final array:", self.seqarray_final)
         self.seqarray_final.to_csv(
-            "DataEvalSwissProt2d.csv", index=False
+            "./Dataframes/Evalsets/DataEvalSwissProt2d_esm_150wsize.csv", index=False
         )  # hardcoded filename
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
@@ -600,7 +600,7 @@ if __name__ == "__main__":
         seqarray_clean_PF00162,
         seqarray_clean_rnd_sprot,
         # seqarray_clean_rnd_trembl,
-        dimension_positive,  
+        150,  
         0,
         boundaries_all,
     )
