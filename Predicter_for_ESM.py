@@ -1,38 +1,47 @@
+import math
+import gc
 import os
 import pickle
-
-import esm
-import pandas as pd
-import pytorch_lightning as pl
-import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, precision_score, confusion_matrix, recall_score
+import pytorch_lightning as pl
+import esm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import ruptures as rpt
+import torch
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+)
 from torch.utils.data import DataLoader, Dataset, TensorDataset
-from torchmetrics import Precision, Recall
-from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
-
+from ESM_Embeddings_HP_search import LitClassifier,FFNClassifier
 
 # -------------------------
 # 1. GLobal settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/Evalsets/DataTrainSwissPro_esm_shuffled.csv"
+CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissProt2d_esm_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
 MODEL_PATH = "./models/optuna_bestmodel.pt"
-CACHE_PATH = "pickle/Predicer_embeddings_test_10000_domains.pkl"
-
+CACHE_PATH = "pickle/Predicer_embeddings_test.pkl"
 
 
 NUM_CLASSES = 3
 BATCH_SIZE = 16
-EMB_BATCH = 4
+EMB_BATCH = 16
+NUM_WORKERS = 64
+NUM_WORKERS_EMB = 8
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 500
 
-DEVICE = "cpu"
-# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # -------------------------
 # 2. Dataset & embedding
@@ -49,7 +58,7 @@ class SeqDataset(Dataset):
 
 
 class ESMDataset:
-    def __init__(self,skip_df=None):
+    def __init__(self, skip_df=None):
         def map_label(cat):
             if cat == 0:
                 return 1
@@ -58,14 +67,11 @@ class ESMDataset:
             else:
                 return 0
 
-        if skip_df == None:
-            df = pd.read_csv(CSV_PATH,nrows=10000)
+        if skip_df is None:
+            df = pd.read_csv(
+                CSV_PATH)
             df["label"] = df[CATEGORY_COL].apply(map_label)
             # print(df["label"][0:10])
-
-            test_ids="./Dataframes/test_IDsSP2d.parquet"
-
-
 
             df.drop(columns=[CATEGORY_COL, "ID"], inplace=True)
 
@@ -73,88 +79,132 @@ class ESMDataset:
 
             print("Data loaded")
         else:
-            self.skip_df = skip_df
+            self.df = skip_df
 
         self.model, self.alphabet, self.batch_converter = self.esm_loader()
 
-
-
         self.embeddings = self._embed(self.df[SEQUENCE_COL].tolist()).cpu()
 
-        self.labels = torch.tensor(
-            self.df["label"].values, dtype=torch.long
-        )
+        self.labels = torch.tensor(self.df["label"].values, dtype=torch.long)
 
         print("Embeddings computed")
 
     def esm_loader(self):
         model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
         model = model.to(DEVICE).eval()
+                
         return model, alphabet, alphabet.get_batch_converter()
 
     def _embed(self, seqs):
         """
-        Tokenize & run ESM in minibatches.
-        The pooling below is done in one vectorized step per batch,
+        Use DataLoader for efficient batching.
         """
+        if torch.cuda.device_count() > 1:
+            if not hasattr(self.model, 'module'):
+                self.model = torch.nn.DataParallel(self.model)
+        
+        # Create dataset and loader
+        dataset = SeqDataset(seqs)
+        
+
+        
         loader = DataLoader(
-            SeqDataset(seqs),
+            dataset,
             batch_size=EMB_BATCH,
             shuffle=False,
-            num_workers=8,
+            num_workers=NUM_WORKERS_EMB,
             pin_memory=True,
-            collate_fn=self.batch_converter,
+            collate_fn=lambda batch: self.batch_converter(batch),
             drop_last=False,
         )
+        
         all_vecs = []
-        total_batches = len(loader)
-        for idx, (_, _, batch_tokens) in enumerate(
-            loader
-        ):  # loop based on chatGPT code
-            if idx % 100 == 0 or idx == total_batches - 1:
-                print(f"Embedding batch {idx + 1}/{total_batches}")
-
-            # print(batch_tokens[0])
-
-            batch_tokens = batch_tokens.to(DEVICE, non_blocking=True)
-            with torch.no_grad():
-                results = self.model(
-                    batch_tokens, repr_layers=[33], return_contacts=False
-                )
-            token_repr = results["representations"][33]
-
-            mask = batch_tokens != self.alphabet.padding_idx
-
-            lengths = mask.sum(dim=1).unsqueeze(-1)
-
-            masked_repr = token_repr * mask.unsqueeze(-1)
-
-            pooled = masked_repr.sum(dim=1) / lengths
-
-            all_vecs.append(pooled)
-
+        
+        for batch_idx, (batch_labels, batch_strs, batch_tokens) in enumerate(loader):
+            try:
+                if batch_idx % 10 == 0:
+                    print(f"Processing batch {batch_idx + 1}/{len(loader)}")
+                
+                torch.cuda.empty_cache()
+                
+                with torch.amp.autocast('cuda',enabled=True):
+                    with torch.no_grad():
+                        batch_tokens = batch_tokens.to(DEVICE, non_blocking=True)
+                        
+                        if hasattr(self.model, 'module'):
+                            results = self.model(
+                                tokens=batch_tokens, repr_layers=[33], return_contacts=False
+                            )
+                        else:
+                            results = self.model(
+                                batch_tokens, repr_layers=[33], return_contacts=False
+                            )
+                        
+                        token_repr = results["representations"][33]
+                        mask = batch_tokens != self.alphabet.padding_idx
+                        lengths = mask.sum(dim=1).unsqueeze(-1)
+                        masked_repr = token_repr * mask.unsqueeze(-1)
+                        pooled = masked_repr.sum(dim=1) / lengths
+                        
+                        all_vecs.append(pooled.cpu())
+                        
+                        del results, token_repr, mask, lengths, masked_repr, pooled, batch_tokens
+                
+                torch.cuda.empty_cache()
+                
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print(f"OOM in batch {batch_idx}, processing individually")
+                    # Process this batch individually
+                    for i, (label, seq_str) in enumerate(zip(batch_labels, batch_strs)):
+                        individual_batch = self.batch_converter([(label, seq_str)])
+                        # Process individual sequence...
+                else:
+                    raise e
+        
         return torch.cat(all_vecs, dim=0)
-
 
 # -------------------------
 # 3. Predicter
 # -------------------------
 
-def predict(modelpath, loader, df):
+
+def predict(modelpath, loader, df_labels):
     model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
-    model = model.to(DEVICE).eval()
-    print("Model loaded successfully.\n")
+    model = model.to(DEVICE)
+    model.eval()
+
+    # print(model)
+    # print("Model loaded successfully.\n")
+
+    # sd = model.state_dict()
+
+    # first_key = next(iter(sd.keys()))
+    # print("First key:", first_key)
+    # print("First-weight tensor:\n", sd[first_key])
 
     predictions = []
+    predictions_raw = []
     with torch.no_grad():
         for batch in loader:
             inputs, _ = batch
             inputs = inputs.to(DEVICE)
             output = model(inputs)
-            _, preds = torch.max(output, dim=1)
-            predictions.extend(preds.cpu().numpy())
+            # print("OUTPUT:",output)
 
-    true_labels = df["label"].to_numpy()
+            # probs = torch.softmax(output, dim=1)
+            preds_raw, preds = torch.max(
+                output, dim=1
+            )  #### SWITCH TO PROBABILITIES MAYBE? ####
+            # print("PREDS:",preds)
+
+            predictions.extend(preds.cpu().numpy())
+            predictions_raw.extend(preds_raw.cpu().numpy())
+
+    true_labels = df_labels
+
+    # print(true_labels[:30],print(len(true_labels)))
+    # print(predictions[:30],print(len(predictions)))
 
     # Overall metrics
     accuracy = accuracy_score(true_labels, predictions)
@@ -165,9 +215,7 @@ def predict(modelpath, loader, df):
     prec_per_class = precision_score(
         true_labels, predictions, labels=[1, 2], average=None
     )
-    rec_per_class = recall_score(
-        true_labels, predictions, labels=[1, 2], average=None
-    )
+    rec_per_class = recall_score(true_labels, predictions, labels=[1, 2], average=None)
 
     # Print results
     print(f"Accuracy: {accuracy:.4f}")
@@ -178,82 +226,349 @@ def predict(modelpath, loader, df):
     print(f"Recall    for class 2: {rec_per_class[1]:.4f}\n")
     print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
 
-    return predictions, true_labels
+    print("raw", predictions_raw[:30])
+    print("maxed", predictions[:30])
 
+    return predictions, true_labels, predictions_raw
 
 
 # -------------------------
-# 5. Main
+# 5. Cutter / Re-embedder
 # -------------------------
+
+
+def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True):
+    positive_embeddings = []
+    positive_labels = []
+
+    for i in range(len(predictions)):
+        if predictions[i] != 0:
+            if cut_front is True:
+                if i == 0:
+                    print(
+                        "Len pre cut",
+                        len((df[SEQUENCE_COL][i])),
+                        "seq",
+                        df[SEQUENCE_COL][i][cut_size:],
+                    )
+                positive_embeddings.append((df[SEQUENCE_COL][i])[cut_size:])
+                positive_labels.append(true_labels[i].item())
+
+            else:
+                if i == 0:
+                    print(
+                        "Len pre cut",
+                        len((df[SEQUENCE_COL][i])),
+                        "seq",
+                        df[SEQUENCE_COL][i][:-cut_size],
+                    )
+                positive_embeddings.append((df[SEQUENCE_COL][i])[:-cut_size])
+                positive_labels.append(true_labels[i].item())
+
+    print("Len first seq", len(positive_embeddings[0]))
+
+    df = pd.DataFrame(
+        {
+            SEQUENCE_COL: positive_embeddings,
+            "label": positive_labels,
+        }
+    )
+
+    # print(df.head())
+
+    esm_data = ESMDataset(skip_df=df)
+
+    df_embeddings = esm_data.embeddings
+    df_labels = esm_data.labels
+    df = esm_data.df
+
+    df_embeddings = TensorDataset(df_embeddings, df_labels)
+
+    # print("Dataset building complete")
+
+    df_embeddings = DataLoader(
+        df_embeddings,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return df_embeddings, df_labels
+
+# -------------------------
+# 6. Main
+# -------------------------
+
 
 def main():
     os.makedirs("pickle", exist_ok=True)
 
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "rb") as f:
-            df_embeddings, df = pickle.load(f)
+            df_embeddings, df_labels, df = pickle.load(f)
         print("Loaded cached embeddings & labels from disk.")
 
-
     else:
-
         esm_data = ESMDataset()
         df_embeddings = esm_data.embeddings
         df_labels = esm_data.labels
-        df= esm_data.df
-
-
+        df = esm_data.df
 
         df_embeddings = TensorDataset(df_embeddings, df_labels)
-
 
         print("Dataset building complete")
 
         df_embeddings = DataLoader(
-            df_embeddings, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True
+            df_embeddings,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
         )
         print("Data loader created")
 
         with open(CACHE_PATH, "wb") as f:
             pickle.dump(
-                (df_embeddings, df),
+                (df_embeddings, df_labels, df),
                 f,
             )
         print("Computed embeddings & labels, then wrote them to cache.")
 
-
     # print(df["label"][0:10])
 
-    predictions,true_labels = predict(MODEL_PATH, df_embeddings,df)
-    print("Predictions made")
+    predictions, true_labels, _ = predict(MODEL_PATH, df_embeddings, df_labels)
+    pos_indices = [i for i, p in enumerate(predictions) if p != 0]
+    if not pos_indices:
+        print("No positives found.")
+        return
+
+    true_start = df["Boundaries"].to_list()
+    pos_true_start = [true_start[i] for i in pos_indices]
+    # print(pos_true_start)
+
+    boundary_intervals = [] 
+
+    for b in pos_true_start:
+        if isinstance(b, str):
+            segs = [seg.strip() for seg in b.split(",") if seg.strip()]
+            row_pairs = []
+            for seg in segs:
+                if "-" in seg:
+                    s_str, e_str = seg.split("-", 1)
+                    s, e = int(s_str), int(e_str)
+                else:
+                    s = e = int(seg)
+                row_pairs.append((s, e))
+            boundary_intervals.append(row_pairs)
+
+        elif isinstance(b, float) and math.isnan(b):
+            # no boundary at all
+            boundary_intervals.append([])
+
+        else:
+            raise ValueError(f"Unexpected type for boundary: {b!r}")
+
+    starts_nested = [[s for s, e in row] for row in boundary_intervals]
+    ends_nested = [[e for s, e in row] for row in boundary_intervals]
+
+    print(boundary_intervals)
+    print(starts_nested)
+    print(ends_nested)
+
+    true_class = df["label"].to_list()
+
+    true_class = [true_class[i] for i in pos_indices]
+
+    print("\nLengths:")
+    print(len(starts_nested))
+    print(len(ends_nested))
+    print(len(true_class))
+    print(true_class[0], starts_nested[0], ends_nested[0])
+    print("\n")
+
+    pos_true_start = starts_nested
+    pos_true_end = ends_nested
+    # print(pos_true_start)
 
 
-    #############################
-    # SECOND ROUND: collect all positive predictions
-    #############################
 
-    # positive_embeddings = []
-    # positive_labels = []
+    # Dynamic cut sizes based on sequence lengths
+    seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
+    max_len = max(seq_lengths)
+    mean_len = np.mean(seq_lengths)
+    cut_sizes = [0] + list(range(5, min(int(mean_len * 0.8), max_len // 4), 5))
+    Npos, K = len(pos_indices), len(cut_sizes)
 
-    # for i in range(len(predictions)):
-    #     if predictions[i] != 0:
-    #         # print(df.iloc[i][SEQUENCE_COL])
-    #         positive_embeddings.append(df_embeddings.dataset[i][0])
-    #         positive_labels.append(true_labels[i])
+    # cut front
+    raw_matrix = np.zeros((Npos, K), dtype=float)
+    for j, cut in enumerate(cut_sizes):
+        sub_loader, sub_labels = cut_inputs_embedding(
+            predictions, true_labels, df, cut_size=cut, cut_front=True
+        )
+        _, _, raw_scores = predict(MODEL_PATH, sub_loader, sub_labels)
+        raw_matrix[:, j] = raw_scores
+
+    all_start_residues = []
+    errors_start = []
+    for row_idx, seq_idx in enumerate(pos_indices):
+        curve = raw_matrix[row_idx]
+        best_j = int(np.argmax(curve))
+        start_residue = cut_sizes[best_j]
+        pred_start = cut_sizes[best_j]
+        true_start = pos_true_start[row_idx]
+
+        if not true_start:
+            err = None
+        else:
+            err = min(abs(pred_start - ts) for ts in true_start)
+
+        errors_start.append(err)
+
+        print(f"Sequence #{seq_idx} → domain starts at residue {start_residue}")
+        print(f"Seq#{seq_idx}: predicted={pred_start}, true={true_start}, error={err}")
+        all_start_residues.append(start_residue)
+
+    print("All domain‐start predictions done.")
+
+    errors_start_wo_nones = [e for e in errors_start if e is not None]  # filter out None errors
+
+    print(
+        f"\nMean absolute error over {len(errors_start)} positives: {np.mean(errors_start_wo_nones):.1f} residues"
+    )
+    print(f"Median absolute error: {np.median(errors_start_wo_nones):.1f} residues")
+
+    print(
+        "#####################################################################################################"
+    )
+    print(
+        "----------------------------------------- CUT FRONT DONE --------------------------------------------"
+    )
+    print(
+        "#####################################################################################################"
+    )
+
+    # cut behind
+    raw_matrix = np.zeros((Npos, K), dtype=float)
+    for j, cut in enumerate(cut_sizes):
+        sub_loader, sub_labels = cut_inputs_embedding(
+            predictions, true_labels, df, cut_size=cut, cut_front=False
+        )
+        _, _, raw_scores = predict(MODEL_PATH, sub_loader, sub_labels)
+        raw_matrix[:, j] = raw_scores
+
+    all_end_residues = []
+    errors_end = []
+
+    for row_idx, seq_idx in enumerate(pos_indices):
+        curve = raw_matrix[row_idx]
+        best_j = int(np.argmax(curve))
+        sequence_length = len(df[SEQUENCE_COL][seq_idx])
+        pred_end = sequence_length - cut_sizes[best_j]
+
+        if seq_idx == 300:
+            print(
+                f"DEBUG: Seq#{seq_idx} → domain ends at residue {pred_end} (cut size {cut_sizes[best_j]})"
+            )
+            print(
+                f"DEBUG: {df[SEQUENCE_COL][seq_idx]},{pred_end}"
+            )
+
+        true_ends = pos_true_end[row_idx] 
+        if not true_ends:
+            err = None
+        else:
+            err = min(abs(pred_end - te) for te in true_ends)
+
+        errors_end.append(err)
+        all_end_residues.append(pred_end)
+
+        print(f"Seq#{seq_idx}: true_ends={true_ends}, pred_end={pred_end}, error={err}")
 
 
-    # print(f"Positive predictions: {len(positive_embeddings)}")
+    print("All domain‐end predictions done.")
+
+    errors_end_wo_nones = [e for e in errors_end if e is not None]
+
+    print(
+        f"\nMean absolute error over {len(errors_end)} positives: {np.mean(errors_end_wo_nones):.1f} residues"
+    )
+    print(f"Median absolute error: {np.median(errors_end_wo_nones):.1f} residues")
+
+    print("ERRORS LENGHTS:", len(errors_start), len(errors_end))
+    print("OTHER LENGHTS:", len(all_start_residues),len(all_end_residues),)
+    print("BOUNDARIES:",len(ends_nested),len(true_class))
+
+    print(
+        "#####################################################################################################"
+    )
+    print(
+        "----------------------------------------- CUT BACK DONE --------------------------------------------"
+    )
+    print(
+        "#####################################################################################################"
+    )
+
+    return all_start_residues, errors_start, all_end_residues, errors_end, true_class
 
 
-    # print("Positive Data loader created")
-    # positive_predictions,positive_true_labels = predict(MODEL_PATH, positive_embeddings,positive_labels)
-
-    # print("Second predictions made")
-
+def plotter(
+    errors,
+    Name,
+    bin_width=5,
+):
     
+    errors = [e for e in errors if e is not None]  # filter out None errors
+    max_err = int(max(errors))
+    bins = np.arange(0, max_err + bin_width, bin_width)
+
+    plt.figure(figsize=(27, 10))
+    plt.hist(errors, bins=bins, density=True, edgecolor="k", alpha=0.7)
+    plt.xticks(bins, fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.title(f"Normalized Distribution of {Name} Boundary Absolute Errors")
+    plt.xlabel(f"Absolute Error (residues), bins of {bin_width}")
+    plt.ylabel("Probability Density")
+    plt.grid(axis="y", alpha=0.5, linestyle="--")
+    plt.tight_layout()
+    plt.savefig(f"histogram_{Name}_errors.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+def boxplotter(errors, classes, Name):
+    # Filter out None values from errors and their corresponding classes
+    filtered_data = [(e, c) for e, c in zip(errors, classes) if e is not None]
+    filtered_errors, filtered_classes = zip(*filtered_data) if filtered_data else ([], [])
+
+    # Separate errors by class
+    class1 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 1]
+    class2 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 2]
+
+    data = [class1, class2]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.boxplot(
+        data,
+        labels=["Class 1", "Class 2"],
+        patch_artist=True,
+        boxprops=dict(facecolor="C0", edgecolor="k"),
+        medianprops=dict(color="yellow"),
+    )
+
+    ax.set_title(f"Absolute {Name} Error by Class")
+    ax.set_ylabel("Absolute Residue Error")
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(f"boxplot_{Name}.png", dpi=300, bbox_inches="tight")
+    plt.show()
 
 
 ###############################################################################################################
 if __name__ == "__main__":
-    main()
+    all_start_residues, errors_start, all_end_residue, errors_end, true_class = main()
+    plotter(errors_start, Name="Start", bin_width=5)
+    plotter(errors_end, Name="End", bin_width=5)
 
+    boxplotter(errors_start, true_class, Name="Start")
+    boxplotter(errors_end, true_class, Name="End")

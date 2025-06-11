@@ -1,5 +1,6 @@
 import os
 import pickle
+import glob
 
 import esm
 import optuna
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from sklearn.metrics import accuracy_score, precision_score
+from sklearn.metrics import accuracy_score, precision_score,recall_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchmetrics import Precision, Recall
@@ -22,6 +23,7 @@ torch.set_float32_matmul_precision("medium")
 CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
+CACHE_PATH = "./pickle/SwissProtTrainEmbeddings.pkl"
 
 
 TRAIN_FRAC = 0.7
@@ -33,7 +35,7 @@ BATCH_SIZE = 128
 EMB_BATCH = 4
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
-EPOCHS = 1
+EPOCHS = 50
 
 # DEVICE = "cpu"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,15 +59,15 @@ class FFNClassifier(nn.Module):
         prev_dim = input_dim
         for hdim in hidden_dims:
             layers += [
-                nn.Linear(prev_dim, hdim),  # Linear layer
-                nn.BatchNorm1d(hdim),  # Batch normalization
-                activation,  # ReLU activation
-                nn.Dropout(dropout),  # Dropout layer
+                nn.Linear(prev_dim, hdim),          # Linear layer
+                nn.BatchNorm1d(hdim),               # Batch normalization
+                activation,                         # ReLU activation
+                nn.Dropout(dropout),                # Dropout layer
             ]
             prev_dim = hdim
         layers.append(
             nn.Linear(prev_dim, num_classes)
-        )  # Final linear layer for classification
+        )                                           # Final linear layer for classification
         self.net = nn.Sequential(*layers)
 
         for m in self.net:
@@ -213,12 +215,7 @@ class SeqDataset(Dataset):
 class ESMDataset:
     def __init__(self):
         def map_label(cat):
-            if cat == 0:
-                return 1
-            elif cat == 1:
-                return 2
-            else:
-                return 0
+            return {i: i + 1 for i in range(NUM_CLASSES)}.get(cat, 0)
 
         df = pd.read_csv(CSV_PATH)
         df["label"] = df[CATEGORY_COL].apply(map_label)
@@ -302,8 +299,7 @@ class ESMDataset:
 # -------------------------
 # 5. Main
 # -------------------------
-def main(hp=False):
-    CACHE_PATH = "pickle/SwissProtTrainEmbeddings.pkl"
+def main(Final_training=False):
     os.makedirs("pickle", exist_ok=True)
 
     if os.path.exists(CACHE_PATH):
@@ -355,206 +351,225 @@ def main(hp=False):
     )
     checkpoint_callback = ModelCheckpoint(monitor="val_loss")
 
-    if hp == False:
-        lit_model = LitClassifier(
-            input_dim=esm_data.train_embeddings.size(1),
-            hidden_dims=[256, 128],
+
+
+    def objective(trial):
+        n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
+        hidden_dims = [
+            n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 10))
+        ]
+
+        drop = trial.suggest_float("dropout", 0.1, 0.5)
+        lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+        wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
+
+        optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
+        if optimizer == "adam":
+            optimizer_class = torch.optim.Adam
+        elif optimizer == "adamw":
+            optimizer_class = torch.optim.AdamW
+        else:
+            optimizer_class = torch.optim.SGD
+
+        activation = trial.suggest_categorical(
+            "activation", ["relu", "gelu", "leaky_relu"]
+        )
+        if activation == "relu":
+            activation = nn.ReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+        elif activation == "gelu":
+            activation = nn.GELU()
+            kernel_init = nn.init.xavier_normal_
+        else:
+            activation = nn.LeakyReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+
+        print(
+            f"\n,\n,\n,Trial {trial.number}: hidden_dims={len(hidden_dims)}, dropout={drop}, lr={lr}, wd={wd}, optimizer={optimizer}, activation={activation}\n,\n,\n,"
+        )
+
+        model = LitClassifier(
+            input_dim=train_embeddings.size(1),
+            hidden_dims=hidden_dims,
             num_classes=NUM_CLASSES,
-            lr=LR,
-            dropout=0.3,
-            weight_decay=WEIGHT_DECAY,
+            optimizer_class=optimizer_class,
+            activation=activation,
+            kernel_init=kernel_init,
+            lr=lr,
+            weight_decay=wd,
+            dropout=drop,
             class_weights=weights,
         )
 
-        print("Lit model created")
+        early_stop = EarlyStopping(
+            monitor="val_loss", patience=1, mode="min", verbose=True
+        )
+        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+
         trainer = pl.Trainer(
             max_epochs=EPOCHS,
-            accelerator="cpu",
-            # devices=-1,
+            accelerator="gpu",
+            devices=1,
             # strategy="ddp",
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
-            logger=TensorBoardLogger(save_dir="./logs", name="esm_2d_classifier"),
+            logger=TensorBoardLogger(
+                save_dir="./logs/optuna", name=f"optuna_trial_{trial.number}"
+            ),
+        )
+        # print(model)
+
+        trainer.fit(model, train_loader, val_loader)
+        return checkpoint_callback.best_model_score.item()
+
+    study = optuna.create_study(
+        direction="minimize",
+        storage="sqlite:///logs/optuna/optuna_study.db",
+        load_if_exists=True,
+        study_name="esm_2d_hp_search",
+    )
+    study.optimize(objective, n_trials=300)
+
+
+    print("Best trial number:", study.best_trial.number)
+    print("Best trial:", study.best_trial)
+    # print("Best trial params:", study.best_trial.params)
+
+
+    best_trial = study.best_trial
+
+
+    def load_best_model(trial):
+        p = trial.params 
+
+        n_neurons   = p["num_neurons"]
+        n_layers    = p["num_hidden_layers"]
+        hidden_dims = [n_neurons] * n_layers
+
+        opt_name = p["optimizer"]
+        if opt_name == "adam":
+            optimizer_class = torch.optim.Adam
+        elif opt_name == "adamw":
+            optimizer_class = torch.optim.AdamW
+        else:
+            optimizer_class = torch.optim.SGD
+
+        act_name = p["activation"]
+        if act_name == "relu":
+            activation_fn = nn.ReLU(inplace=True)
+            kernel_init   = nn.init.kaiming_normal_
+        elif act_name == "gelu":
+            activation_fn = nn.GELU()
+            kernel_init   = nn.init.xavier_normal_
+        else:  # "leaky_relu"
+            activation_fn = nn.LeakyReLU(inplace=True)
+            kernel_init   = nn.init.kaiming_normal_
+
+        drop = p["dropout"]
+        lr   = p["lr"]
+        wd   = p["weight_decay"]
+
+        model = LitClassifier(
+            input_dim=train_embeddings.size(1),
+            hidden_dims=hidden_dims,
+            num_classes=NUM_CLASSES,
+            optimizer_class=optimizer_class,
+            activation=activation_fn,
+            kernel_init=kernel_init,
+            lr=lr,
+            weight_decay=wd,
+            dropout=drop,
+            class_weights=weights,
+        )
+
+
+        ckpt_dir = f"./logs/optuna/optuna_trial_{trial.number}/version_0/checkpoints/"
+        print(ckpt_dir)
+        pattern  = os.path.join(ckpt_dir, "*.ckpt")
+        matches = glob.glob(pattern)
+        chosen_ckpt = matches[0]
+
+        ckpt_path = chosen_ckpt
+        print(ckpt_dir)
+        model = LitClassifier.load_from_checkpoint(ckpt_path)
+
+
+        torch.save(model,'./models/optuna_bestmodel.pt')
+        model = model.to(DEVICE).eval()
+        
+        return model
+
+
+
+    lit_model=load_best_model(best_trial)
+
+
+
+    lit_model.eval()
+    print(lit_model)
+
+    print("First 5 embeddings:\n", val_embeddings[:5])
+    print("First 5 labels:    \n", val_labels[:5].cpu().numpy())
+
+
+
+    device = lit_model.device
+    with torch.no_grad():
+        val_embeddings = val_embeddings.to(device)
+        val_logits     = lit_model(val_embeddings)
+    val_preds = val_logits.argmax(dim=1).cpu().numpy()
+    val_true  = val_labels.numpy()
+
+    print(val_preds[:30])
+    print(val_true[:30])
+
+    if getattr(lit_model, "global_rank", 0) == 0:
+        acc  = accuracy_score(val_true, val_preds)
+        prec = precision_score(val_true, val_preds, labels=[1, 2], average=None)
+        rec  = recall_score(   val_true, val_preds, labels=[1, 2], average=None)
+
+        print(f"\nFinal Validation Accuracy: {acc:.4f}")
+        print(f"Precision (class 1): {prec[0]:.4f}")
+        print(f"Precision (class 2): {prec[1]:.4f}")
+        print(f"Recall    (class 1): {rec[0]:.4f}")
+        print(f"Recall    (class 2): {rec[1]:.4f}")
+
+    sd = lit_model.state_dict()
+
+
+    # Print a single parameter (e.g. the first layer’s weights)
+    first_key = next(iter(sd.keys()))
+    print("First key:", first_key)
+    print("First-weight tensor:\n", sd[first_key])
+
+
+
+    if Final_training is True:
+
+        early_stop = EarlyStopping(
+            monitor="val_loss", patience=10, mode="min", verbose=True
+        )
+        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+
+
+        print("Lit model created")
+        trainer = pl.Trainer(
+            max_epochs=200,
+            accelerator="gpu",
+            devices=-1,
+            # strategy="ddp",
+            enable_progress_bar=True,
+            callbacks=[early_stop, checkpoint_callback],
+            logger=TensorBoardLogger(
+                save_dir="./logs/optuna", name="optuna_trial_Final"
+            ),
         )
 
         print("Trainer created")
 
         trainer.fit(lit_model, train_loader, val_loader)
 
-    else:
-
-        def objective(trial):
-            n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
-            hidden_dims = [
-                n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 10))
-            ]
-
-            drop = trial.suggest_float("dropout", 0.1, 0.5)
-            lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-            wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
-
-            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
-            if optimizer == "adam":
-                optimizer_class = torch.optim.Adam
-            elif optimizer == "adamw":
-                optimizer_class = torch.optim.AdamW
-            else:
-                optimizer_class = torch.optim.SGD
-
-            activation = trial.suggest_categorical(
-                "activation", ["relu", "gelu", "leaky_relu"]
-            )
-            if activation == "relu":
-                activation = nn.ReLU(inplace=True)
-                kernel_init = nn.init.kaiming_normal_
-            elif activation == "gelu":
-                activation = nn.GELU()
-                kernel_init = nn.init.xavier_normal_
-            else:
-                activation = nn.LeakyReLU(inplace=True)
-                kernel_init = nn.init.kaiming_normal_
-
-            print(
-                f"\n,\n,\n,Trial {trial.number}: hidden_dims={len(hidden_dims)}, dropout={drop}, lr={lr}, wd={wd}, optimizer={optimizer}, activation={activation}\n,\n,\n,"
-            )
-
-            model = LitClassifier(
-                input_dim=train_embeddings.size(1),
-                hidden_dims=hidden_dims,
-                num_classes=NUM_CLASSES,
-                optimizer_class=optimizer_class,
-                activation=activation,
-                kernel_init=kernel_init,
-                lr=lr,
-                weight_decay=wd,
-                dropout=drop,
-                class_weights=weights,
-            )
-
-            early_stop = EarlyStopping(
-                monitor="val_loss", patience=1, mode="min", verbose=True
-            )
-            checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
-
-            trainer = pl.Trainer(
-                max_epochs=EPOCHS,
-                accelerator="gpu",
-                devices=1,
-                # strategy="ddp",
-                enable_progress_bar=True,
-                callbacks=[early_stop, checkpoint_callback],
-                logger=TensorBoardLogger(
-                    save_dir="./logs/optuna", name=f"optuna_trial_{trial.number}"
-                ),
-            )
-            # print(model)
-
-            trainer.fit(model, train_loader, val_loader)
-            return checkpoint_callback.best_model_score.item()
-
-        study = optuna.create_study(
-            direction="minimize",
-            storage="sqlite:///logs/optuna/optuna_study.db",
-            load_if_exists=True,
-            study_name="esm_2d_hp_search",
-        )
-        study.optimize(objective, n_trials=1)
-
-
-        print("Best trial number:", study.best_trial.number)
-        print("Best trial:", study.best_trial)
-        # print("Best trial params:", study.best_trial.params)
-
-
-        # Load the best model from the study
-        best_trial = study.best_trial
-
-
-        def load_best_model(trial):
-            """
-            Given a FrozenTrial from Optuna (where each trial has stored
-            'best_model_path' in user_attrs), rebuild the LitClassifier with
-            the trial’s hyperparameters and load its weights.
-            """
-            p = trial.params  # now p is a dict, not trial itself
-
-            # 1) Reconstruct hidden_dims list
-            n_neurons   = p["num_neurons"]
-            n_layers    = p["num_hidden_layers"]
-            hidden_dims = [n_neurons] * n_layers
-
-            # 2) Reconstruct optimizer class
-            opt_name = p["optimizer"]
-            if opt_name == "adam":
-                optimizer_class = torch.optim.Adam
-            elif opt_name == "adamw":
-                optimizer_class = torch.optim.AdamW
-            else:
-                optimizer_class = torch.optim.SGD
-
-            # 3) Reconstruct activation + kernel_init
-            act_name = p["activation"]
-            if act_name == "relu":
-                activation_fn = nn.ReLU(inplace=True)
-                kernel_init   = nn.init.kaiming_normal_
-            elif act_name == "gelu":
-                activation_fn = nn.GELU()
-                kernel_init   = nn.init.xavier_normal_
-            else:  # "leaky_relu"
-                activation_fn = nn.LeakyReLU(inplace=True)
-                kernel_init   = nn.init.kaiming_normal_
-
-            # 4) Numeric hyperparameters
-            drop = p["dropout"]
-            lr   = p["lr"]
-            wd   = p["weight_decay"]
-
-            # 5) Instantiate the model exactly as in objective
-            model = LitClassifier(
-                input_dim=train_embeddings.size(1),
-                hidden_dims=hidden_dims,
-                num_classes=NUM_CLASSES,
-                optimizer_class=optimizer_class,
-                activation=activation_fn,
-                kernel_init=kernel_init,
-                lr=lr,
-                weight_decay=wd,
-                dropout=drop,
-                class_weights=weights,
-            )
-
-            ckpt_path = f"./logs/optuna/optuna_trial_{trial.number}/version_0/checkpoints/*.ckpt"
-            model = LitClassifier.load_from_checkpoint(ckpt_path)
-
-
-            torch.save(model,'./models/optuna_bestmodel.pt')
-            model = model.to(DEVICE).eval()
-            
-            return model
-
-
-
-        lit_model=load_best_model(best_trial)
-
-
-
-    lit_model.eval()
-    device = lit_model.device
-    with torch.no_grad():
-        val_embeddings = val_embeddings.to(device)
-        val_logits = lit_model(val_embeddings)
-    val_preds = val_logits.argmax(dim=1).cpu().numpy()
-    val_true = val_labels.numpy()
-
-    if getattr(lit_model, "global_rank", 0) == 0:  # Single values to not copy double
-        acc = accuracy_score(val_true, val_preds)
-        prec = precision_score(val_true, val_preds, labels=[1, 2], average=None)
-        print(f"\nFinal Validation Accuracy: {acc:.4f}")
-        print(f"Precision (class 1): {prec[0]:.4f}")
-        print(f"Precision (class 2): {prec[1]:.4f}")
-
-
 #############################################################################################################
 
 if __name__ == "__main__":
-    main(hp=True)  # Set to True for hyperparameter tuning, False for final training
+    main(Final_training=True)  

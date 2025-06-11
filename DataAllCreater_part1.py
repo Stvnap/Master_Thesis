@@ -20,9 +20,11 @@ tf.config.set_visible_devices(  # Disable GPU, crashes on GPU
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-from Dataset_preprocess_TRAIN_2d import dimension_positive             # change here to 2d if u want to create a ds for multi categorial classification
+#from Dataset_preprocess_TRAIN_2d import dimension_positive             # change here to 2d if u want to create a ds for multi categorial classification
 
 ###################################################################################################################################
+
+dimension_positive=148
 
 def _sequence_to_int(df):
     """
@@ -145,76 +147,55 @@ def _labler2d(padded):
     return padded_label
 
 
-
 def splitter2(padded_label):
     """
-    Splits the whole df into three sets: train, val and test set.
-    Returns these three df
+    Splits padded_label into train/val/test (60/20/20), grouping all rows with the same ID
+    in the same split *and* stratifying by label.
+    Writes each split to a parquet, and returns the three DataFrames.
     """
-    start_time = time.time()
+    t0 = time.time()
 
-    train_df, temp_df = train_test_split(
-        padded_label,
-        test_size=0.4,
-        stratify=padded_label["Labels"],
-        random_state=42,
+    # 1) Build an ID→label table (here taking the first label seen per ID)
+    ids_df = (
+        padded_label.select(["IDs", "Labels"])
+        .unique(subset="IDs")  # keep one row per ID
+        # .groupby("IDs").agg(pl.col("Labels").mode().first())  # if you want the mode instead
+        .rename({"Labels": "Label"})  # so column names don't collide
+    )
+    # Convert to Pandas for sklearn
+    ids_pd = ids_df.to_pandas()
+    id_values = ids_pd["IDs"].values
+    label_vals = ids_pd["Label"].values
+
+    # 2) Split IDs → train vs temp (60% train, 40% temp), stratified by ID-label
+    train_ids, temp_ids = train_test_split(
+        id_values, test_size=0.4, stratify=label_vals, random_state=42
     )
 
-    val_df, test_df = train_test_split(
-        temp_df, test_size=0.5, stratify=temp_df["Labels"], random_state=42
+    # 3) From temp_ids split into val vs test (each half of the 40%), again stratified
+    temp_labels = ids_pd.set_index("IDs").loc[temp_ids, "Label"].values
+    val_ids, test_ids = train_test_split(
+        temp_ids, test_size=0.5, stratify=temp_labels, random_state=42
     )
 
-    print(f"Train set shape: {train_df.shape}")
+    # 4) Filter the original padded_label into three DataFrames
+    train_df = padded_label.filter(pl.col("IDs").is_in(train_ids))
+    val_df = padded_label.filter(pl.col("IDs").is_in(val_ids))
+    test_df = padded_label.filter(pl.col("IDs").is_in(test_ids))
+
+    # 5) Report shapes
+    print(f"Train set shape:      {train_df.shape}")
     print(f"Validation set shape: {val_df.shape}")
-    print(f"Test set shape: {test_df.shape}")
+    print(f"Test set shape:       {test_df.shape}")
 
-    # train_df.write_parquet("trainsetALL.parquet")
-    # val_df.write_parquet("valsetALL.parquet")
-    # test_df.write_parquet("testsetALL.parquet")
+    # 6) Write to parquet
+    train_df.write_parquet("trainsetALL.parquet")
+    val_df.write_parquet("valsetALL.parquet")
+    test_df.write_parquet("testsetALL.parquet")
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Done splitting\nElapsed Time: {elapsed_time:.4f} seconds")
+    print(f"Done splitting in {time.time() - t0:.3f}s")
 
     return train_df, val_df, test_df
-
-def one_hot(_df):
-    """
-    Creates one hot tensors for further pipelining it into the model
-    Returns a new tensor with only the one hot encoded sequences
-    """
-    start_time = time.time()
-    with tf.device("/CPU:0"):
-        df_one_hot = [
-            tf.one_hot(int_sequence, 21) for int_sequence in _df["Sequences"]
-        ]
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Done one hot\nElapsed Time: {elapsed_time:.4f} seconds")
-        # print(len(df_one_hot))
-        # print(len(self.padded))
-        return df_one_hot
-
-def creater(df, df_onehot, name):
-    """
-    Creates a tf.Dataset with the one_hot tensor and the df column 'Labels'
-    Returned is this tf.Dataset aswell as it is saved as a directory
-    """
-    start_time = time.time()
-
-    with tf.device("/CPU:0"):
-        tensor_df = tf.data.Dataset.from_tensor_slices((df_onehot, df["Labels"]))
-
-        tensor_df.shuffle(buffer_size=1000, seed=4213122)
-
-        tensor_df.save(name)
-
-        print(f"dataset size: {len(tensor_df)}")
-
-        print(f"Creation completed in {time.time() - start_time:.2f} seconds")
-
-        return tensor_df
-
 
 
 def make_dataset(
@@ -254,10 +235,10 @@ def make_dataset(
         seq = tf.pad(
             seq, [[0, dimension_positive - tf.shape(seq)[0]]], constant_values=21
         )
-        oh = tf.one_hot(seq, depth=21, dtype=tf.uint8)
+        #oh = tf.one_hot(seq, depth=21, dtype=tf.uint8)
 
-        # laboh = tf.one_hot(lab,depth=3,dtype=tf.uint8)
-        return oh, lab, id_
+        #laboh = tf.one_hot(lab,depth=3,dtype=tf.uint8)
+        return seq, lab, id_
 
     # apply to the ds
     ds = ds.map(pad_and_one_hot, num_parallel_calls=tf.data.AUTOTUNE)
@@ -266,9 +247,10 @@ def make_dataset(
     ds = ds.shuffle(shuffle_buffer)
 
     # Save
-    if save_path:
-        ds.save(save_path)
-        print("Saved")
+    #if save_path:
+        #ds.save(save_path)
+        #print("tf saving done")
+
 
     inputs = []
     labels = []
@@ -279,27 +261,48 @@ def make_dataset(
         labels.append(y.numpy().tolist())
         ids.append(z.numpy())
 
-    # Annahme: Inputs sind flattenbar
+    ds=None
+    print("Dataframe ready")
     df = pl.DataFrame({
         'input': inputs,
         'label': labels,
         'id': ids
     })
 
-    df.write_csv('./saved_dataset2dNew.csv')
-    
+    df_flat = df.with_columns([
+        # Convert integers in the "input" column to strings, then join them with commas
+        pl.col("input").map_elements(lambda lst: ",".join(map(str, lst))).alias("input_str"),
+        # Convert the binary 'id' column to a string
+        pl.col("id").cast(pl.Utf8).alias("id_str")
+    ])
+
+    # Now drop the original nested column:
+    df_flat = df_flat.drop("input")
+    df_flat = df_flat.drop("id")
+
+    df_flat = df_flat.rename({
+        "input_str": "input",
+        "id_str": "id"
+    })
+
+
+    print(df_flat.head())
+
+    # Write the DataFrame to a CSV file
+    df_flat.write_csv("./saved_datasetNew.csv")
+
     print("Dataset built")
+    print(df)
+    print(df_flat)
+    print(df_flat.schema)
     return ds
 
 
 ##################################################################################
 
 if __name__ == "__main__":
-
-    dimension=1
-
     print("Starting data preparation...")
-    df_path = "./Dataframes/DataTrainPF00120.csv"
+    df_path = "./Dataframes/DataTrainALL.csv"
 
     # load in
     df = pl.read_csv(
@@ -308,7 +311,7 @@ if __name__ == "__main__":
             "Sequences": pl.Utf8,
             "categories": pl.Int8,
             "ID": pl.Utf8,
-        },
+        }
     ).lazy()
 
     print("Done loading")
@@ -316,29 +319,11 @@ if __name__ == "__main__":
     df = _sequence_to_int(df)
     print("Done encoding")
 
-    if dimension == 1:
-        df = df.collect()
-        df= _padder(df)
-        df = _labler(df)
-        print("Done labeling")
+    df = _labler2d(df)
+    print("Done labeling")
 
-        train_df, val_df, test_df=splitter2(df) # Split the dataset into train/val/test sets old approach used for the binary classification
-        train_df_oh=one_hot(_df=train_df)
-        val_df_oh=one_hot(_df=val_df)
-        test_df_oh=one_hot(_df=test_df)
+    df = df.collect()
 
-        creater(train_df, train_df_oh, name="./Datasets/PF00210/trainset")
-        creater(val_df, val_df_oh, name="./Datasets/PF00210/valset")
-        creater(test_df, test_df_oh, name="./Datasets/PF00210/testset")
-        
-        # this creates the ready to go datasets, so you can skip DataAllCreater_part2.py and use it directly for training
-    else:
-        df = _labler2d(df)
-        df= df.collect()
-        df = make_dataset(df, save_path="./Datasets/2dNew")
-
-
-
-
+    df = make_dataset(df, save_path="./saved_datasetNew")
 
     print("Data preparation completed.")
