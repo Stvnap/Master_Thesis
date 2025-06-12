@@ -601,7 +601,7 @@ if __name__ == "__main__":
         seqarray_clean_rnd_sprot,
         # seqarray_clean_rnd_trembl,
         150,  
-        0,
+        10,
         boundaries_all,
     )
     ##############################################################
