@@ -23,11 +23,11 @@ from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
 # 1. GLobal settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissProt2d_esm_150wsize_shuffled.csv"
+CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissProt2d_esm_150wsize.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
 MODEL_PATH = "./models/optuna_bestmodel.pt"
-CACHE_PATH = "pickle/Predicer_embeddings_test_1000_wsize150_shuffled.pkl"
+CACHE_PATH = "pickle/Predicer_embeddings_test_wsize150_shuffled.pkl"
 
 
 NUM_CLASSES = 3
@@ -58,20 +58,20 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         return f"seq{idx}", self.seqs[idx]
 
-
 class ESMDataset:
     def __init__(self, skip_df=None):
         def map_label(cat):
-            if cat == 0:
-                return 1
-            elif cat == 1:
-                return 2
+            # Adaptive mapping based on NUM_CLASSES
+            # Classes 0-9 get mapped to 1-10
+            # Classes 10 and 11 get mapped to 0
+            if cat <= NUM_CLASSES - 2:
+                return cat + 1
             else:
                 return 0
 
         if skip_df is None:
             df = pd.read_csv(
-                CSV_PATH, nrows=1000
+                CSV_PATH,
             )  # Load only the first 100 rows for testing)
             df["label"] = df[CATEGORY_COL].apply(map_label)
             # print(df["label"][0:10])
@@ -123,7 +123,7 @@ class ESMDataset:
 
         for batch_idx, (batch_labels, batch_strs, batch_tokens) in enumerate(loader):
             try:
-                if batch_idx % 10 == 0:
+                if batch_idx % 1000 == 0:
                     print(f"Processing batch {batch_idx + 1}/{len(loader)}")
 
                 torch.cuda.empty_cache()
@@ -527,6 +527,7 @@ def main():
     stopped_sequences = set()  # Track sequences that stopped predicting
 
     for j, cut in enumerate(cut_sizes):
+        print(f"Processing cut size {cut} ({j + 1}/{K})...")
         sub_loader, sub_labels = cut_inputs_embedding(
             predictions, true_labels, df, cut_size=cut, cut_front=True
         )
@@ -544,15 +545,15 @@ def main():
                 ):
                     stopped_sequences.add(row_idx)
                     seq_idx = pos_indices[row_idx]
-                    print(
-                        f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops"
-                    )
+                    # print(
+                    #     f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops"
+                    # )
             # If sequence is stopped, we don't update its logits for this cut size
             # but the raw_matrix retains the previous values (zeros for uncomputed cuts)
 
-    print(
-        f"Stopped early prediction for {len(stopped_sequences)} out of {Npos} sequences"
-    )
+    # print(
+    #     f"Stopped early prediction for {len(stopped_sequences)} out of {Npos} sequences"
+    # )
 
     all_start_residues = []
     errors_start = []
@@ -632,14 +633,14 @@ def main():
                 ):
                     stopped_sequences_end.add(row_idx)
                     seq_idx = pos_indices[row_idx]
-                    print(
-                        f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops (end prediction)"
-                    )
+                    # print(
+                    #     f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops (end prediction)"
+                    # )
             # If sequence is stopped, we don't update its logits for this cut size
 
-    print(
-        f"Stopped early prediction for {len(stopped_sequences_end)} out of {Npos} sequences (end prediction)"
-    )
+    # print(
+    #     f"Stopped early prediction for {len(stopped_sequences_end)} out of {Npos} sequences (end prediction)"
+    # )
 
     all_end_residues = []
     errors_end = []
@@ -691,9 +692,6 @@ def main():
     )
     print(f"Median absolute error: {np.median(errors_end_wo_nones):.1f} residues")
 
-    # print("ERRORS LENGHTS:", len(errors_start), len(errors_end))
-    # print("OTHER LENGHTS:", len(all_start_residues),len(all_end_residues),)
-    # print("BOUNDARIES:",len(ends_nested),len(true_class))
 
     print(
         "#####################################################################################################"
@@ -768,7 +766,7 @@ def main():
 
         return pd.DataFrame(
             concatenated_list
-        )  # Changed from pl.DataFrame to pd.DataFrame
+        ) 
 
     endlist = list_creater(
         df, pos_indices, all_start_residues, all_end_residues, predictions
@@ -850,6 +848,8 @@ def boxplotter(errors, classes, Name):
 
 
 ###############################################################################################################
+
+
 if __name__ == "__main__":
     all_start_residues, errors_start, all_end_residue, errors_end, true_class = main()
 

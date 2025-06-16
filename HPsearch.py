@@ -29,7 +29,7 @@ from sklearn.utils.class_weight import compute_class_weight
 ###################################################################################################################################
 
 
-print(tf.keras.__version__)
+print(tf.keras.__version__) # should be 3.6.0
 print(tf.__version__)
 
 STRATEGY = tf.distribute.MirroredStrategy()
