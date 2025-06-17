@@ -25,11 +25,11 @@ torch.backends.cudnn.allow_tf32 = True
 # -------------------------
 # 1. Global settings
 # -------------------------
-CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_shuffled.csv"
+CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_Thiolase_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_shuffled.pkl"
-PROJECT_NAME = "Optuna_10d"
+CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_Thiolase_shuffled_10000.pkl"
+PROJECT_NAME = "Optuna_10d_test_Thio_35M"
 
 
 NUM_CLASSES = 11
@@ -39,6 +39,7 @@ TEST_FRAC = 0.15
 
 EMB_BATCH = 64
 NUM_WORKERS_EMB = max(16, os.cpu_count())
+print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 128
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
@@ -46,7 +47,7 @@ EPOCHS = 150
 STUDY_N_TRIALS = 300
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+print(f"Using device: {DEVICE}")
 
 # -------------------------
 # 2. FFW classifier head
@@ -249,7 +250,7 @@ class ESMDataset:
                 return 0
 
         if skip_df is None:
-            df = pd.read_csv(CSV_PATH)
+            df = pd.read_csv(CSV_PATH,nrows=10000)
             df["label"] = df[CATEGORY_COL].apply(map_label)
             df.drop(columns=[CATEGORY_COL], inplace=True)
             self.df = df
@@ -317,7 +318,7 @@ class ESMDataset:
         print("Embeddings computed and split completed")
 
     def esm_loader(self):
-        model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # Changed back to bigger model
 
         # Set the model to the primary device first
         model = model.to(DEVICE).eval()
@@ -389,8 +390,8 @@ class ESMDataset:
                     avg_batch_time = sum(batch_times) / len(batch_times)
                     remaining_batches = total_batches - batch_idx
                     eta = remaining_batches * avg_batch_time
-                    print(f"Batch {batch_idx + 1}/{total_batches} | "
-                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min")
+                    print(f"\rBatch {batch_idx + 1}/{total_batches} | "
+                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end="", flush=True)
 
             chunk = sequences[start : start + batch_size]
             labels = [f"seq{i}" for i in range(len(chunk))]  # Simplified labels
@@ -411,15 +412,15 @@ class ESMDataset:
                         if hasattr(self.model, "module"):
                             out = self.model(
                                 tokens=batch_tokens,
-                                repr_layers=[33],
+                                repr_layers=[33],  # Changed back to 33
                                 return_contacts=False,
-                            )["representations"][33]
+                            )["representations"][33]  # Changed back to 33
                         else:
                             out = self.model(
                                 batch_tokens,
-                                repr_layers=[33],
+                                repr_layers=[33],  # Changed back to 33
                                 return_contacts=False,
-                            )["representations"][33]
+                            )["representations"][33]  # Changed back to 33
 
                     # Optimized pooling with vectorized operations
                     padding_mask = (batch_tokens == self.alphabet.padding_idx)
@@ -436,7 +437,7 @@ class ESMDataset:
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"OOM in batch {batch_idx}, falling back to single sequence processing")
+                    print(f"\rOOM in batch {batch_idx}, falling back to single sequence processing", end="", flush=True)
                     
                     # Process each sequence individually
                     for seq_idx, seq in enumerate(chunk):
@@ -452,15 +453,15 @@ class ESMDataset:
                                 if hasattr(self.model, "module"):
                                     single_out = self.model(
                                         tokens=single_tokens,
-                                        repr_layers=[33],
+                                        repr_layers=[33],  # Changed back to 33
                                         return_contacts=False,
-                                    )["representations"][33]
+                                    )["representations"][33]  # Changed back to 33
                                 else:
                                     single_out = self.model(
                                         single_tokens,
-                                        repr_layers=[33],
+                                        repr_layers=[33],  # Changed back to 33
                                         return_contacts=False,
-                                    )["representations"][33]
+                                    )["representations"][33]  # Changed back to 33
 
                             single_mask = (single_tokens == self.alphabet.padding_idx)
                             single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
@@ -474,7 +475,7 @@ class ESMDataset:
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
                             # Only use dummy as absolute last resort for individual sequences
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)
+                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  # Changed back to 1280
                             all_outputs.append(dummy)
                             
 
@@ -495,15 +496,15 @@ class ESMDataset:
                                 if hasattr(self.model, "module"):
                                     single_out = self.model(
                                         tokens=single_tokens,
-                                        repr_layers=[33],
+                                        repr_layers=[33],  # Changed back to 33
                                         return_contacts=False,
-                                    )["representations"][33]
+                                    )["representations"][33]  # Changed back to 33
                                 else:
                                     single_out = self.model(
                                         single_tokens,
-                                        repr_layers=[33],
+                                        repr_layers=[33],  # Changed back to 33
                                         return_contacts=False,
-                                    )["representations"][33]
+                                    )["representations"][33]  # Changed back to 33
 
                             single_mask = (single_tokens == self.alphabet.padding_idx)
                             single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
@@ -516,7 +517,7 @@ class ESMDataset:
                             
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)
+                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  # Changed back to 1280
                             all_outputs.append(dummy)
 
             # Track batch timing
@@ -529,7 +530,7 @@ class ESMDataset:
         if all_outputs:
             embeddings = torch.cat(all_outputs, dim=0).float().cpu()
         else:
-            embeddings = torch.zeros((len(seqs), 1280))
+            embeddings = torch.zeros((len(seqs), 1280))  # Changed back to 1280
 
 
         total_embed_time = time.time() - embed_start_time
@@ -583,13 +584,14 @@ def main(Final_training=False):
 
     print("Dataset building complete")
 
+
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
     print("Train loader created")
 
     val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True
+        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
     print("Val loader created")
 

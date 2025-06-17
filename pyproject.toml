@@ -7,6 +7,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "fair-esm>=2.0.0",
     "lightning>=2.5.1.post0",
+    "matplotlib>=3.10.3",
     "optuna>=4.4.0",
     "pandas>=2.3.0",
     "scikit-learn>=1.7.0",
