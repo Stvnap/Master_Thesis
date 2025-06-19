@@ -22,18 +22,18 @@ from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
 # 1. GLobal settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissProt2d_esm_150wsize.csv"
+CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissPro_esm_10d_wsize_150.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-MODEL_PATH = "./models/optuna_bestmodel.pt"
-CACHE_PATH = "pickle/Predicer_embeddings_test_wsize150.pkl"
+MODEL_PATH = "./models/Optuna_10d_bestmodel10d.pt"
+CACHE_PATH = "pickle/Predicer_embeddings_10d_wsize150.pkl"
 
 
-NUM_CLASSES = 3
-BATCH_SIZE = 16
-EMB_BATCH = 16
-NUM_WORKERS = 64
-NUM_WORKERS_EMB = 8
+NUM_CLASSES = 11
+BATCH_SIZE = 128
+EMB_BATCH = 128
+NUM_WORKERS = max(16, os.cpu_count())
+NUM_WORKERS_EMB = max(16, os.cpu_count())
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 500
@@ -71,7 +71,7 @@ class ESMDataset:
         if skip_df is None:
             df = pd.read_csv(
                 CSV_PATH,
-            )  # Load only the first 100 rows for testing)
+            ) 
             df["label"] = df[CATEGORY_COL].apply(map_label)
             # print(df["label"][0:10])
 
@@ -183,9 +183,8 @@ class ESMDataset:
                     avg_batch_time = sum(batch_times) / len(batch_times)
                     remaining_batches = total_batches - batch_idx
                     eta = remaining_batches * avg_batch_time
-                    print(f"Batch {batch_idx + 1}/{total_batches} | "
-                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min")
-
+                    print(f"\rBatch {batch_idx + 1}/{total_batches} | "
+                          f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end='\r', flush=True)
             chunk = sequences[start : start + batch_size]
             labels = [f"seq{i}" for i in range(len(chunk))]  # Simplified labels
 
@@ -222,11 +221,11 @@ class ESMDataset:
                     seq_lengths = (~padding_mask).sum(dim=1, keepdim=True).float()
                     pooled = out_masked.sum(dim=1) / seq_lengths.clamp(min=1)
 
-                    # Keep in float16 to save memory
-                    all_outputs.append(pooled.half())
+                # Move to CPU immediately and convert to float32 to save GPU memory
+                all_outputs.append(pooled.cpu().float())
 
-                    # Aggressive memory cleanup
-                    del out, out_masked, padding_mask, seq_lengths, batch_tokens
+                # Aggressive memory cleanup
+                del out, out_masked, padding_mask, seq_lengths, batch_tokens
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -261,16 +260,15 @@ class ESMDataset:
                             single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
                             single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
 
-                            all_outputs.append(single_pooled.half())
+                            all_outputs.append(single_pooled.cpu().float())
                             
                             del single_out, single_out_masked, single_mask, single_lengths, single_tokens
                             
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
-                            # Only use dummy as absolute last resort for individual sequences
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)
+                            # Use dummy as last resort
+                            dummy = torch.zeros((1, 1280), dtype=torch.float32)
                             all_outputs.append(dummy)
-                            
 
                 else:
                     print(f"Non-OOM error in batch {batch_idx}: {e}")
@@ -304,7 +302,7 @@ class ESMDataset:
                             single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
                             single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
 
-                            all_outputs.append(single_pooled.half())
+                            all_outputs.append(single_pooled.cpu().float())
                             
                             del single_out, single_out_masked, single_mask, single_lengths, single_tokens
                             
@@ -318,13 +316,12 @@ class ESMDataset:
             batch_times.append(batch_time)
 
 
-
-        # 6) Simple concatenation (no reordering needed)
+          # 6) Concatenate on CPU to avoid GPU memory issues
         if all_outputs:
-            embeddings = torch.cat(all_outputs, dim=0).float().cpu()
+            print("Concatenating embeddings on CPU...")
+            embeddings = torch.cat(all_outputs, dim=0)
         else:
             embeddings = torch.zeros((len(seqs), 1280))
-
 
         total_embed_time = time.time() - embed_start_time
         print(f"\n=== Embedding Generation Summary ===")
@@ -928,8 +925,17 @@ def boxplotter(errors, classes, Name):
     # Separate errors by class
     class1 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 1]
     class2 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 2]
+    class3 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 3]
+    class4 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 4]
+    class5 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 5]
+    class6 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 6]
+    class7 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 7]
+    class8 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 8]
+    class9 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 9]
+    class10 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 10]
 
-    data = [class1, class2]
+    data = [class1, class2, class3, class4, class5, class6, class7, class8, class9, class10]
+    data = [d for d in data if len(d) > 0]  # Remove empty classes
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.boxplot(

@@ -22,7 +22,7 @@ from Bio import SeqIO
 
 
 
-ENDFILENAME= "DataTrainSwissPro_esm_10d_Thiolase"
+ENDFILENAME= "DataTrainSwissPro_esm_10d"
 
 
 

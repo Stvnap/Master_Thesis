@@ -25,11 +25,11 @@ torch.backends.cudnn.allow_tf32 = True
 # -------------------------
 # 1. Global settings
 # -------------------------
-CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_Thiolase_shuffled.csv"
+CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_Thiolase_shuffled_10000.pkl"
-PROJECT_NAME = "Optuna_10d_test_Thio_35M"
+CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_shuffled.pkl"
+PROJECT_NAME = "Optuna_10d"
 
 
 NUM_CLASSES = 11
@@ -44,7 +44,7 @@ BATCH_SIZE = 128
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
-STUDY_N_TRIALS = 300
+STUDY_N_TRIALS = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -250,7 +250,7 @@ class ESMDataset:
                 return 0
 
         if skip_df is None:
-            df = pd.read_csv(CSV_PATH,nrows=10000)
+            df = pd.read_csv(CSV_PATH)
             df["label"] = df[CATEGORY_COL].apply(map_label)
             df.drop(columns=[CATEGORY_COL], inplace=True)
             self.df = df
@@ -384,7 +384,7 @@ class ESMDataset:
         for batch_idx, start in enumerate(range(0, len(sequences), batch_size)):
             batch_start_time = time.time()
 
-            if batch_idx % 5 == 0:  # More frequent progress updates
+            if batch_idx % 100 == 0:  # More frequent progress updates
                 elapsed = time.time() - embed_start_time
                 if batch_idx > 0:
                     avg_batch_time = sum(batch_times) / len(batch_times)
@@ -412,15 +412,15 @@ class ESMDataset:
                         if hasattr(self.model, "module"):
                             out = self.model(
                                 tokens=batch_tokens,
-                                repr_layers=[33],  # Changed back to 33
+                                repr_layers=[33],  
                                 return_contacts=False,
-                            )["representations"][33]  # Changed back to 33
+                            )["representations"][33] 
                         else:
                             out = self.model(
                                 batch_tokens,
-                                repr_layers=[33],  # Changed back to 33
+                                repr_layers=[33],  
                                 return_contacts=False,
-                            )["representations"][33]  # Changed back to 33
+                            )["representations"][33]
 
                     # Optimized pooling with vectorized operations
                     padding_mask = (batch_tokens == self.alphabet.padding_idx)
@@ -453,15 +453,15 @@ class ESMDataset:
                                 if hasattr(self.model, "module"):
                                     single_out = self.model(
                                         tokens=single_tokens,
-                                        repr_layers=[33],  # Changed back to 33
+                                        repr_layers=[33],
                                         return_contacts=False,
-                                    )["representations"][33]  # Changed back to 33
+                                    )["representations"][33]
                                 else:
                                     single_out = self.model(
                                         single_tokens,
-                                        repr_layers=[33],  # Changed back to 33
+                                        repr_layers=[33],  
                                         return_contacts=False,
-                                    )["representations"][33]  # Changed back to 33
+                                    )["representations"][33]
 
                             single_mask = (single_tokens == self.alphabet.padding_idx)
                             single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
@@ -475,7 +475,7 @@ class ESMDataset:
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
                             # Only use dummy as absolute last resort for individual sequences
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  # Changed back to 1280
+                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  
                             all_outputs.append(dummy)
                             
 
@@ -496,15 +496,15 @@ class ESMDataset:
                                 if hasattr(self.model, "module"):
                                     single_out = self.model(
                                         tokens=single_tokens,
-                                        repr_layers=[33],  # Changed back to 33
+                                        repr_layers=[33],  
                                         return_contacts=False,
-                                    )["representations"][33]  # Changed back to 33
+                                    )["representations"][33]
                                 else:
                                     single_out = self.model(
                                         single_tokens,
-                                        repr_layers=[33],  # Changed back to 33
+                                        repr_layers=[33],
                                         return_contacts=False,
-                                    )["representations"][33]  # Changed back to 33
+                                    )["representations"][33]
 
                             single_mask = (single_tokens == self.alphabet.padding_idx)
                             single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
@@ -517,7 +517,7 @@ class ESMDataset:
                             
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  # Changed back to 1280
+                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)
                             all_outputs.append(dummy)
 
             # Track batch timing
@@ -530,7 +530,7 @@ class ESMDataset:
         if all_outputs:
             embeddings = torch.cat(all_outputs, dim=0).float().cpu()
         else:
-            embeddings = torch.zeros((len(seqs), 1280))  # Changed back to 1280
+            embeddings = torch.zeros((len(seqs), 1280)) 
 
 
         total_embed_time = time.time() - embed_start_time
@@ -596,6 +596,14 @@ def main(Final_training=False):
     print("Val loader created")
 
     def objective(trial):
+        
+        
+        ngpus = torch.cuda.device_count()
+        # `trial.number` is unique per trial, so this will cycle 0,1,2,…,ngpus-1,0,1,…
+        my_gpu = trial.number % ngpus  
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(my_gpu)
+
+
         n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
         hidden_dims = [
             n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 10))
@@ -655,8 +663,8 @@ def main(Final_training=False):
         trainer = pl.Trainer(
             max_epochs=EPOCHS,
             accelerator="gpu",
-            devices=1,
-            # strategy="ddp",
+            devices=-1,  
+            strategy="auto", 
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
@@ -674,7 +682,7 @@ def main(Final_training=False):
         load_if_exists=True,
         study_name="esm_10d_hp_search",
     )
-    study.optimize(objective, n_trials=STUDY_N_TRIALS)
+    study.optimize(objective, n_trials=STUDY_N_TRIALS,n_jobs=torch.cuda.device_count())
 
     print("Best trial number:", study.best_trial.number)
     print("Best trial:", study.best_trial)
@@ -774,7 +782,7 @@ def main(Final_training=False):
             max_epochs=200,
             accelerator="gpu",
             devices=-1,
-            # strategy="ddp",
+            strategy="auto",
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
