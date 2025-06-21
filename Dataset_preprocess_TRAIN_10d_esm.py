@@ -22,7 +22,7 @@ from Bio import SeqIO
 
 
 
-ENDFILENAME= "DataTrainSwissPro_esm_10d"
+ENDFILENAME= "DataTrainSwissPro_esm_10d_150w"
 
 
 
@@ -206,13 +206,13 @@ class databaseCreater:
 
         self.seqarray_full = self._concat_double_delete()
 
-        # self.sliding = self._sliding_window(
-        #     self.seqarray_full,
-        #     self.dimension_positive,
-        #     (self.dimension_positive - self.stepsize),
-        # )
+        self.sliding = self._sliding_window(
+            self.seqarray_full,
+            self.dimension_positive,
+            (self.dimension_positive - self.stepsize),
+        )
 
-        # self.seqarray_final = self._multiplier(self.seqarray_full, self.sliding)
+        self.seqarray_final = self._multiplier(self.seqarray_full, self.sliding)
 
         self._saver()
 
@@ -382,8 +382,8 @@ class databaseCreater:
         Saves the final df in a .csv file. Name of file is hardcoded
         """
         start_time = time.time()
-        print("Final array:", self.seqarray_full)
-        self.seqarray_full.to_csv(f"./Dataframes/{ENDFILENAME}.csv", index=False)
+        print("Final array:", self.seqarray_final)
+        self.seqarray_final.to_csv(f"./Dataframes/{ENDFILENAME}.csv", index=False)
         elapsed_time = time.time() - start_time
         print(f"\tDone saving\n\tElapsed Time: {elapsed_time:.4f} seconds")
 
@@ -393,9 +393,9 @@ class databaseCreater:
 
 ########### FOR CREATING TRAINING DATASET, FOR TRAINING THE MODEL ###########
 
-# positive Domain PF00108
-print("Loading positive domain PF00108")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF00108.fa")
+# positive Domain PF00177
+print("Loading positive domain PF00177")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00177.fa")
 seqarray_clean1, seqarraylen_clean1, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
@@ -403,9 +403,9 @@ dimension_positive1 = fasta.dimension_finder(seqarraylen_clean1)
 print("targeted dimension", dimension_positive1)
 
 
-# 2nd positive Domain PF00109
-print("Loading positive domain PF00109")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF00109.fa")
+# 2nd positive Domain PF00210
+print("Loading positive domain PF00210")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00210.fa")
 seqarray_clean2, seqarraylen_clean2, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
@@ -413,27 +413,27 @@ dimension_positive2 = fasta.dimension_finder(seqarraylen_clean2)
 print("targeted dimension", dimension_positive2)
 
 
-# 3rd positive Domain PF00195
-print("Loading positive domain PF00195")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF00195.fa")
+# 3rd positive Domain PF00211
+print("Loading positive domain PF00211")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00211.fa")
 seqarray_clean3, seqarraylen_clean3, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
 dimension_positive3 = fasta.dimension_finder(seqarraylen_clean3)
 print("targeted dimension", dimension_positive3)
 
-# 4th positive Domain PF01154
-print("Loading positive domain PF01154")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF01154.fa")
+# 4th positive Domain PF00215
+print("Loading positive domain PF00215")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00215.fa")
 seqarray_clean4, seqarraylen_clean4, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
 dimension_positive4 = fasta.dimension_finder(seqarraylen_clean4)
 print("targeted dimension", dimension_positive4)
 
-# 5th positive Domain PF02797
-print("Loading positive domain PF02797")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF02797.fa")
+# 5th positive Domain PF00217
+print("Loading positive domain PF00217")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00217.fa")
 seqarray_clean5, seqarraylen_clean5, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
@@ -441,18 +441,18 @@ dimension_positive5 = fasta.dimension_finder(seqarraylen_clean5)
 print("targeted dimension", dimension_positive5)
 
 
-# 6th positive Domain PF02801
-print("Loading positive domain PF02801")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF02801.fa")
+# 6th positive Domain PF00406
+print("Loading positive domain PF00406")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00406.fa")
 seqarray_clean6, seqarraylen_clean6, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
 dimension_positive6 = fasta.dimension_finder(seqarraylen_clean6)
 print("targeted dimension", dimension_positive6)
 
-# 7th positive Domain PF02803
-print("Loading positive domain PF02803")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF02803.fa")
+# 7th positive Domain PF00303
+print("Loading positive domain PF00303")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00303.fa")
 seqarray_clean7, seqarraylen_clean7, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
@@ -460,27 +460,27 @@ dimension_positive7 = fasta.dimension_finder(seqarraylen_clean7)
 print("targeted dimension", dimension_positive7)
 
 
-# 8th positive Domain PF07451
-print("Loading positive domain PF07451")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF07451.fa")
+# 8th positive Domain PF00246
+print("Loading positive domain PF00246")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00246.fa")
 seqarray_clean8, seqarraylen_clean8, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
 dimension_positive8 = fasta.dimension_finder(seqarraylen_clean8)
 print("targeted dimension", dimension_positive8)
 
-# 9th positive Domain PF08392
-print("Loading positive domain PF08392")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF08392.fa")
+# 9th positive Domain PF00457
+print("Loading positive domain PF00457")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00457.fa")
 seqarray_clean9, seqarraylen_clean9, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )
 dimension_positive9 = fasta.dimension_finder(seqarraylen_clean9)
 print("targeted dimension", dimension_positive9)
 
-# 10th positive Domain PF08540
-print("Loading positive domain PF08540")
-fasta = DomainProcessing("/global/research/students/sapelt/Masters/Thiolase_set/domains_PF08540.fa")
+# 10th positive Domain PF00502
+print("Loading positive domain PF00502")
+fasta = DomainProcessing("/global/research/students/sapelt/Masters/domains_PF00502.fa")
 seqarray_clean10, seqarraylen_clean10, normaltest = fasta.distribution_finder(
     fasta.len_finder()
 )

@@ -16,30 +16,32 @@ from sklearn.metrics import (
     recall_score,
 )
 from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
 from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
 
 # -------------------------
 # 1. GLobal settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissPro_esm_10d_wsize_150.csv"
+CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissPro_esm_10d_uncut_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-MODEL_PATH = "./models/Optuna_10d_bestmodel10d.pt"
-CACHE_PATH = "pickle/Predicer_embeddings_10d_wsize150.pkl"
+MODEL_PATH = "./models/Optuna_10d_uncut_10000.pt"
+CACHE_PATH = "./pickle/Predicer_embeddings_10d_uncut_shuffled.pkl"
+TENSBORBOARD_LOG_DIR = "./models/10d_uncut_logs"
 
 
 NUM_CLASSES = 11
 BATCH_SIZE = 128
-EMB_BATCH = 128
+EMB_BATCH = 40
 NUM_WORKERS = max(16, os.cpu_count())
 NUM_WORKERS_EMB = max(16, os.cpu_count())
-LR = 1e-5
-WEIGHT_DECAY = 1e-2
+
 EPOCHS = 500
 
 THRESHOLD = 2  # Number of consecutive drops to trigger exclusion
 print("Treshold:", THRESHOLD)
+
 # DEVICE = "cpu"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -69,16 +71,18 @@ class ESMDataset:
                 return 0
 
         if skip_df is None:
-            df = pd.read_csv(
-                CSV_PATH,
-            ) 
+            df = pd.read_csv(CSV_PATH)
             df["label"] = df[CATEGORY_COL].apply(map_label)
-            # print(df["label"][0:10])
-
             df.drop(columns=[CATEGORY_COL], inplace=True)
 
-            self.df = df
+            # --- new: sort by sequence length to keep batches balanced ---
+            df["seq_len"] = df[SEQUENCE_COL].str.len()
+            df.sort_values("seq_len", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            df.drop(columns=["seq_len"], inplace=True)
+            # ------------------------------------------------------------
 
+            self.df = df
             print("Data loaded")
         else:
             self.df = skip_df
@@ -116,6 +120,8 @@ class ESMDataset:
         # Set the model to the primary device first
         model = model.to(DEVICE).eval()
 
+        
+
         # Enable mixed precision for faster computation
         if torch.cuda.is_available():
             model = model.half()
@@ -127,8 +133,7 @@ class ESMDataset:
             )
 
         return model, alphabet, alphabet.get_batch_converter()
-    
-
+   
     def _embed(self, seqs):
         """
         Optimized batching with multi-GPU support for embedding generation.
@@ -138,15 +143,11 @@ class ESMDataset:
         # 1) Enable multi-GPU processing with optimized batch sizing
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs for embedding generation")
-            if not hasattr(self.model, "module"):
-                self.model = torch.nn.DataParallel(self.model)
-            # Increase batch size more aggressively for multi-GPU
             effective_batch_size = EMB_BATCH * torch.cuda.device_count()
         else:
             effective_batch_size = EMB_BATCH * 2  # Increase single GPU batch size
             print("Using single GPU for embedding generation")
 
-        # 2) Use sequences in original order (no sorting)
         sequences = seqs
 
         # 3) JIT compilation for single GPU
@@ -154,7 +155,7 @@ class ESMDataset:
             compile_start = time.time()
             try:
                 if hasattr(torch, "compile") and torch.cuda.device_count() == 1:
-                    self.model = torch.compile(self.model, mode="max-autotune")
+                    self.model = torch.compile(self.model, mode="default")
                     print(f"Model compilation took: {time.time() - compile_start:.2f} seconds")
             except Exception as e:
                 print(f"Torch compile failed: {e}")
@@ -177,14 +178,15 @@ class ESMDataset:
         for batch_idx, start in enumerate(range(0, len(sequences), batch_size)):
             batch_start_time = time.time()
 
-            if batch_idx % 5 == 0:  # More frequent progress updates
+            if batch_idx % 1 == 0:  # More frequent progress updates
                 elapsed = time.time() - embed_start_time
                 if batch_idx > 0:
                     avg_batch_time = sum(batch_times) / len(batch_times)
                     remaining_batches = total_batches - batch_idx
                     eta = remaining_batches * avg_batch_time
                     print(f"\rBatch {batch_idx + 1}/{total_batches} | "
-                          f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end='\r', flush=True)
+                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end="", flush=True)
+
             chunk = sequences[start : start + batch_size]
             labels = [f"seq{i}" for i in range(len(chunk))]  # Simplified labels
 
@@ -194,23 +196,27 @@ class ESMDataset:
                     batch_labels, batch_strs, batch_tokens = self.batch_converter(
                         list(zip(labels, chunk))
                     )
+                    
+                    
+                    gpu_id = batch_idx % torch.cuda.device_count()
+                    DEVICE = torch.device(f"cuda:{gpu_id}")
+
                     batch_tokens = batch_tokens.to(DEVICE, non_blocking=True)
 
-                    with (
-                        torch.no_grad(),
-                        torch.amp.autocast("cuda", enabled=True, dtype=torch.float16),
-                    ):
+
+                    with torch.no_grad(), torch.amp.autocast(DEVICE.type, enabled=True, dtype=torch.float16):
+
                         # Model inference
                         if hasattr(self.model, "module"):
                             out = self.model(
                                 tokens=batch_tokens,
-                                repr_layers=[33],
+                                repr_layers=[33],  
                                 return_contacts=False,
-                            )["representations"][33]
+                            )["representations"][33] 
                         else:
                             out = self.model(
                                 batch_tokens,
-                                repr_layers=[33],
+                                repr_layers=[33],  
                                 return_contacts=False,
                             )["representations"][33]
 
@@ -221,15 +227,15 @@ class ESMDataset:
                     seq_lengths = (~padding_mask).sum(dim=1, keepdim=True).float()
                     pooled = out_masked.sum(dim=1) / seq_lengths.clamp(min=1)
 
-                # Move to CPU immediately and convert to float32 to save GPU memory
-                all_outputs.append(pooled.cpu().float())
+                    # Keep in float16 to save memory
+                    all_outputs.append(pooled.half())
 
-                # Aggressive memory cleanup
-                del out, out_masked, padding_mask, seq_lengths, batch_tokens
+                    # Aggressive memory cleanup
+                    del out, out_masked, padding_mask, seq_lengths, batch_tokens
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"OOM in batch {batch_idx}, falling back to single sequence processing")
+                    print(f"\rOOM in batch {batch_idx}, falling back to single sequence processing", end="", flush=True)
                     
                     # Process each sequence individually
                     for seq_idx, seq in enumerate(chunk):
@@ -251,7 +257,7 @@ class ESMDataset:
                                 else:
                                     single_out = self.model(
                                         single_tokens,
-                                        repr_layers=[33],
+                                        repr_layers=[33],  
                                         return_contacts=False,
                                     )["representations"][33]
 
@@ -260,68 +266,29 @@ class ESMDataset:
                             single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
                             single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
 
-                            all_outputs.append(single_pooled.cpu().float())
+                            all_outputs.append(single_pooled.half())
                             
                             del single_out, single_out_masked, single_mask, single_lengths, single_tokens
                             
                         except Exception as single_e:
                             print(f"Failed single sequence {seq_idx}: {single_e}")
-                            # Use dummy as last resort
-                            dummy = torch.zeros((1, 1280), dtype=torch.float32)
+                            # Only use dummy as absolute last resort for individual sequences
+                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  
                             all_outputs.append(dummy)
 
-                else:
-                    print(f"Non-OOM error in batch {batch_idx}: {e}")
-                    # For non-OOM errors, also try individual processing
-                    print("Attempting individual sequence processing...")
-                    for seq_idx, seq in enumerate(chunk):
-                        try:
-                            single_batch = self.batch_converter([(f"seq{seq_idx}", seq)])
-                            _, _, single_tokens = single_batch
-                            single_tokens = single_tokens.to(DEVICE)
-
-                            with (
-                                torch.no_grad(),
-                                torch.amp.autocast("cuda", enabled=True, dtype=torch.float16),
-                            ):
-                                if hasattr(self.model, "module"):
-                                    single_out = self.model(
-                                        tokens=single_tokens,
-                                        repr_layers=[33],
-                                        return_contacts=False,
-                                    )["representations"][33]
-                                else:
-                                    single_out = self.model(
-                                        single_tokens,
-                                        repr_layers=[33],
-                                        return_contacts=False,
-                                    )["representations"][33]
-
-                            single_mask = (single_tokens == self.alphabet.padding_idx)
-                            single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
-                            single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
-                            single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
-
-                            all_outputs.append(single_pooled.cpu().float())
-                            
-                            del single_out, single_out_masked, single_mask, single_lengths, single_tokens
-                            
-                        except Exception as single_e:
-                            print(f"Failed single sequence {seq_idx}: {single_e}")
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)
-                            all_outputs.append(dummy)
 
             # Track batch timing
             batch_time = time.time() - batch_start_time
             batch_times.append(batch_time)
 
 
-          # 6) Concatenate on CPU to avoid GPU memory issues
+
+        # 6) Simple concatenation (no reordering needed)
         if all_outputs:
-            print("Concatenating embeddings on CPU...")
-            embeddings = torch.cat(all_outputs, dim=0)
+            embeddings = torch.cat(all_outputs, dim=0).float().cpu()
         else:
-            embeddings = torch.zeros((len(seqs), 1280))
+            embeddings = torch.zeros((len(seqs), 1280)) 
+
 
         total_embed_time = time.time() - embed_start_time
         print(f"\n=== Embedding Generation Summary ===")
@@ -330,7 +297,6 @@ class ESMDataset:
         print("=====================================\n")
 
         return embeddings
-
 
 # -------------------------
 # 3. Predicter
@@ -375,6 +341,11 @@ def predict(modelpath, loader, df_labels, firstrun=False):
     # print(predictions[:30],print(len(predictions)))
 
     if firstrun is True:
+        # Initialize TensorBoard writer
+
+        os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
+        writer = SummaryWriter(TENSBORBOARD_LOG_DIR)
+        
         # Overall metrics
         accuracy = accuracy_score(true_labels, predictions)
         weighted_precision = precision_score(
@@ -382,22 +353,37 @@ def predict(modelpath, loader, df_labels, firstrun=False):
         )
         confusion = confusion_matrix(true_labels, predictions, normalize="true")
 
-        # Class‐specific precision & recall for classes 1 and 2
+        # Class‐specific precision & recall
         prec_per_class = precision_score(
-            true_labels, predictions, labels=[1, 2], average=None
+            true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
         )
         rec_per_class = recall_score(
-            true_labels, predictions, labels=[1, 2], average=None
+            true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
         )
+
+        # Log overall metrics to TensorBoard
+        writer.add_scalar('Metrics/Accuracy', accuracy, 0)
+        writer.add_scalar('Metrics/Weighted_Precision', weighted_precision, 0)
+        
+        # Log per-class metrics to TensorBoard
+        for i, (prec, rec) in enumerate(zip(prec_per_class, rec_per_class)):
+            class_id = i + 1  # Classes 1 to NUM_CLASSES-1
+            writer.add_scalar(f'Precision/Class_{class_id}', prec, 0)
+            writer.add_scalar(f'Recall/Class_{class_id}', rec, 0)
 
         # Print results
         print(f"Accuracy: {accuracy:.4f}")
         print(f"Weighted precision (all classes): {weighted_precision:.4f}")
-        print(f"Precision for class 1: {prec_per_class[0]:.4f}")
-        print(f"Recall    for class 1: {rec_per_class[0]:.4f}")
-        print(f"Precision for class 2: {prec_per_class[1]:.4f}")
-        print(f"Recall    for class 2: {rec_per_class[1]:.4f}\n")
-        print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
+
+        for i in range(1, NUM_CLASSES):
+            print(f"Precision for class {i}: {prec_per_class[i-1]:.4f}")
+            print(f"Recall    for class {i}: {rec_per_class[i-1]:.4f}")
+
+        # print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
+
+        # Close the writer
+        writer.close()
+        print(f"Metrics logged to TensorBoard in '{TENSBORBOARD_LOG_DIR}'")
 
         # print("raw", predictions_raw[:30])
         # print("maxed", predictions[:30])
@@ -419,24 +405,12 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
     for i in range(len(predictions)):
         if predictions[i] != 0:
             if cut_front is True:
-                if i == 0:
-                    print(
-                        "Len pre cut",
-                        len((df[SEQUENCE_COL][i])),
-                        "seq",
-                        df[SEQUENCE_COL][i][cut_size:],
-                    )
+
                 positive_embeddings.append((df[SEQUENCE_COL][i])[cut_size:])
                 positive_labels.append(true_labels[i].item())
 
             else:
-                if i == 0:
-                    print(
-                        "Len pre cut",
-                        len((df[SEQUENCE_COL][i])),
-                        "seq",
-                        df[SEQUENCE_COL][i][:-cut_size],
-                    )
+
                 positive_embeddings.append((df[SEQUENCE_COL][i])[:-cut_size])
                 positive_labels.append(true_labels[i].item())
 
@@ -686,17 +660,17 @@ def main():
 
         status = "stopped early" if row_idx in stopped_sequences else "completed"
         # print(f"Sequence #{seq_idx} ({status}) → domain starts at residue {start_residue}")
-        print(f"Seq#{seq_idx}: predicted={pred_start}, true={true_start}, error={err}")
+        print(f"Seq#{seq_idx}: predicted={pred_start}, true={true_start}, error={err}", end='\r', flush=True)
         all_start_residues.append(start_residue)
 
-    print("All domain‐start predictions done.")
+    print("\nAll domain‐start predictions done.")
 
     errors_start_wo_nones = [
         e for e in errors_start if e is not None
     ]  # filter out None errors
 
     print(
-        f"\nMean absolute error over {len(errors_start)} positives: {np.mean(errors_start_wo_nones):.1f} residues"
+        f"Mean absolute error over {len(errors_start)} positives: {np.mean(errors_start_wo_nones):.1f} residues"
     )
     print(f"Median absolute error: {np.median(errors_start_wo_nones):.1f} residues")
 
@@ -779,16 +753,15 @@ def main():
         all_end_residues.append(pred_end)
 
         status = "stopped early" if row_idx in stopped_sequences_end else "completed"
-        print(
-            f"Seq#{seq_idx} ({status}): true_ends={true_ends}, pred_end={pred_end}, error={err}"
-        )
 
-    print("All domain‐end predictions done.")
+        print(f"Seq#{seq_idx}: predicted={pred_end}, true={true_ends}, error={err}", end='\r', flush=True)
+    
+        print("\nAll domain‐end predictions done.")
 
     errors_end_wo_nones = [e for e in errors_end if e is not None]
 
     print(
-        f"\nMean absolute error over {len(errors_end)} positives: {np.mean(errors_end_wo_nones):.1f} residues"
+        f"Mean absolute error over {len(errors_end)} positives: {np.mean(errors_end_wo_nones):.1f} residues"
     )
     print(f"Median absolute error: {np.median(errors_end_wo_nones):.1f} residues")
 
@@ -842,21 +815,21 @@ def main():
             # Check if next rows have the same ID and concatenate them
             j = i + 1
             while j < len(endlist) and endlist[j]["ID"] == current_row["ID"]:
-                # Concatenate start_residue and end_residue lists
-                if isinstance(current_row["start_residue"], list):
-                    current_row["start_residue"].extend(endlist[j]["start_residue"])
+                # Concatenate Domain_Start and Domain_End lists
+                if isinstance(current_row["Domain_Start"], list):
+                    current_row["Domain_Start"].extend([endlist[j]["Domain_Start"]])
                 else:
-                    current_row["start_residue"] = [
-                        current_row["start_residue"],
-                        endlist[j]["start_residue"],
+                    current_row["Domain_Start"] = [
+                        current_row["Domain_Start"],
+                        endlist[j]["Domain_Start"],
                     ]
 
-                if isinstance(current_row["end_residue"], list):
-                    current_row["end_residue"].extend(endlist[j]["end_residue"])
+                if isinstance(current_row["Domain_End"], list):
+                    current_row["Domain_End"].extend([endlist[j]["Domain_End"]])
                 else:
-                    current_row["end_residue"] = [
-                        current_row["end_residue"],
-                        endlist[j]["end_residue"],
+                    current_row["Domain_End"] = [
+                        current_row["Domain_End"],
+                        endlist[j]["Domain_End"],
                     ]
 
                 j += 1
@@ -864,9 +837,7 @@ def main():
             concatenated_list.append(current_row)
             i = j
 
-        return pd.DataFrame(
-            concatenated_list
-        ) 
+        return pd.DataFrame(concatenated_list)
 
     endlist = list_creater(
         df, pos_indices, all_start_residues, all_end_residues, predictions

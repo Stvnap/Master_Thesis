@@ -1,6 +1,7 @@
 import os
 import lxml.etree as ET
 import polars as pl
+import psutil
 
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
@@ -93,9 +94,6 @@ class DatasetPreprocessor:
         start_time = time.time()
         last_update_time = start_time
         
-        # print(f"Starting to search XML file: {self.input_path_xml}")
-        # print(f"Target IDs: {self.target_ids}")
-        
         # Use iterparse for memory-efficient streaming
         context = ET.iterparse(self.input_path_xml, events=('start', 'end'))
         context = iter(context)
@@ -104,14 +102,14 @@ class DatasetPreprocessor:
 
         try:
             event, root = next(context)
-            # print(f"Root element: {root.tag}")
+            print(f"Root element: {root.tag}")  # Add this back for debugging
             
             for event, elem in context:
                 all_elements_count += 1
                 
                 if event == 'end':
                     # Look for protein elements based on your XML structure
-                    if elem.tag == 'protein':  # Updated to match your XML structure
+                    if elem.tag == 'protein':
                         
                         # Extract ID and lcn data from protein element
                         entry_data = self._extract_protein_data(elem)
@@ -122,59 +120,37 @@ class DatasetPreprocessor:
                                     'xml_content': ET.tostring(elem, encoding='unicode'),
                                     'lcn_data': entry_data['lcn_data']
                                 }
-                                # print(f"\nFound ID: {entry_data['id']}")
 
                                 if entry_data['lcn_data']:
                                     for lcn in entry_data['lcn_data']:
                                         if lcn['match_id'].startswith('PF'):
-
-                                            if processed_count % 100000 == 0:
-                                                print(f"\r LCN: start={lcn['start']}, end={lcn['end']}, match_id={lcn['match_id']}")
-                                            templist= [lcn['start'], lcn['end'],entry_data['id'], lcn['match_id']]
+                                            templist = [lcn['start'], lcn['end'], entry_data['id'], lcn['match_id']]
                                             all_lists.append(templist)
 
                         processed_count += 1
                         
-                        # Enhanced progress reporting with ETA
+                        # IMPORTANT: Clear the element to free memory
+                        elem.clear()
+                        while elem.getprevious() is not None:
+                            del elem.getparent()[0]
+                        
+                        # Enhanced progress reporting
                         if processed_count % 10000 == 0:
                             current_time = time.time()
                             elapsed_time = current_time - start_time
                             
                             if processed_count > 0:
-                                # Calculate processing rate (proteins per second)
                                 rate = processed_count / elapsed_time
-                                
-                                # Estimate remaining work based on found vs target ratio
-                                # This is an approximation since we don't know total proteins in XML
-                                if len(found_entries) > 0:
-                                    # Conservative estimate: assume we need to process more if we haven't found all targets
-                                    remaining_targets = len(self.target_ids) - len(found_entries)
-                                    if remaining_targets > 0:
-                                        # Rough estimate: if we found X targets in Y proteins, 
-                                        # we might need Z more proteins to find remaining targets
-                                        avg_proteins_per_target = processed_count / len(found_entries)
-                                        estimated_remaining_proteins = remaining_targets * avg_proteins_per_target
-                                        eta_seconds = estimated_remaining_proteins / rate if rate > 0 else 0
-                                        eta_minutes = eta_seconds / 60
-                                        
-                                        print(f"\rProcessed {processed_count} entries | "
-                                              f"Found {len(found_entries)}/{len(self.target_ids)} targets | "
-                                              f"Pfam entries: {len(all_lists)} | "
-                                              f"Rate: {rate:.1f} entries/s | "
-                                              f"ETA: {eta_minutes:.1f}min", end='', flush=True)
-                                    else:
-                                        print(f"\rProcessed {processed_count} entries | "
-                                              f"Found {len(found_entries)}/{len(self.target_ids)} targets | "
-                                              f"Pfam entries: {len(all_lists)} | "
-                                              f"Rate: {rate:.1f} entries/s | "
-                                              f"All targets found!", end='', flush=True)
-                                else:
-                                    print(f"\rProcessed {processed_count} entries | "
-                                          f"Found {len(found_entries)}/{len(self.target_ids)} targets | "
-                                          f"Pfam entries: {len(all_lists)} | "
-                                          f"Rate: {rate:.1f} entries/s | "
-                                          f"Searching...", end='', flush=True)
+                                print(f"Processed {processed_count} entries | "
+                                      f"Found {len(found_entries)}/{len(self.target_ids)} targets | "
+                                      f"Pfam entries: {len(all_lists)} | "
+                                      f"Rate: {rate:.1f} entries/s | ", end='', flush=True)
+                            
+                            process = psutil.Process(os.getpid())
+                            mem_mb = process.memory_info().rss / 1024 / 1024
+                            print(f"Memory usage: {mem_mb:.2f} MB", end='\r', flush=True)
 
+                # Check if we found all targets
                 if len(found_entries) == len(self.target_ids):
                     final_time = time.time()
                     total_elapsed = final_time - start_time
@@ -186,9 +162,17 @@ class DatasetPreprocessor:
 
         except ET.XMLSyntaxError as e:
             print(f"XML parsing error: {e}")
+            raise  # Re-raise to see the full error
+        except MemoryError as e:
+            print(f"Memory error: {e}")
+            print(f"Processed {processed_count} entries before memory error")
+            raise
         except Exception as e:
-            print(f"Error during XML processing: {e}")
-    
+            print(f"Unexpected error during XML processing: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
         # Final summary
         final_time = time.time()
         total_elapsed = final_time - start_time
@@ -198,7 +182,6 @@ class DatasetPreprocessor:
         print(f"Found {len(found_entries)} out of {len(self.target_ids)} target IDs")
         print(f"Processed {processed_count} protein entries")
         print(f"Found {len(all_lists)} Pfam domain entries")
-        print(f"Processing rate: {processed_count/total_elapsed:.1f} entries/s")
         
         return all_lists
 
@@ -229,47 +212,60 @@ class DatasetPreprocessor:
     def save_found_entries(self):
         """Save found XML entries to a csv."""
         if not self.all_list:
-            raise ValueError("No entries found to save.")
+            print("Warning: No entries found to save.")
+            return
         
-        # Create a DataFrame from the found entries
-        self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id"])
-        
+        try:
+            # # Ensure output directory exists
+            # os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+            
+            # Create a DataFrame from the found entries
+            self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id"])
+            print(f"Created DataFrame with {len(self.df)} entries")
+            
+        except Exception as e:
+            print(f"Error in save_found_entries: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
-
-
-    def extend_with_seq(self,output_path):
+    def extend_with_seq(self, output_path):
         """Extend the found entries with sequences from the CSV file."""
-        if not os.path.exists(self.input_path_csv):
-            raise FileNotFoundError(f"CSV file not found: {self.input_path_csv}")
+        try:
+            if not os.path.exists(self.input_path_csv):
+                raise FileNotFoundError(f"CSV file not found: {self.input_path_csv}")
 
-        # Ensure 'ID' column exists
-        if 'id' not in self.df.columns:
-            raise ValueError("CSV file must contain 'id' column")
+            # Ensure output directory exists
+            # os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # Create a dictionary for O(1) lookup instead of nested loops
-        sequence_dict = {}
-        for row in self.compare_frame.iter_rows():
-            entry_id = row[0]  
-            sequence = row[1]  
-            sequence_dict[entry_id] = sequence
+            # Create a dictionary for O(1) lookup
+            sequence_dict = {}
+            for row in self.compare_frame.iter_rows():
+                entry_id = row[0]  
+                sequence = row[1]  
+                sequence_dict[entry_id] = sequence
 
-        # Extend entries with sequences
-        for entry in self.all_list:
-            entry_id = entry[2]  # Assuming the ID is at index 2 in the entry list
-            if entry_id in sequence_dict:
-                entry.append(sequence_dict[entry_id])
-            else:
-                entry.append(None)  
+            # Extend entries with sequences
+            for entry in self.all_list:
+                entry_id = entry[2]
+                if entry_id in sequence_dict:
+                    entry.append(sequence_dict[entry_id])
+                else:
+                    entry.append(None)
 
-        # Convert to DataFrame
-        self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id", "Sequence"])
-        print(f"Extended entries with sequences, total entries: {len(self.df)}")
+            # Convert to DataFrame
+            self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id", "Sequence"])
+            print(f"Extended entries with sequences, total entries: {len(self.df)}")
 
-        print(self.df.head(10))  # Display first 10 rows for verification
-
-        # Save to CSV
-        self.df.write_csv(output_path)
-        print(f"Saved {len(self.all_list)} entries to {output_path}")
+            # Save to CSV
+            self.df.write_csv(output_path)
+            print(f"Successfully saved {len(self.all_list)} entries to {output_path}")
+            
+        except Exception as e:
+            print(f"Error in extend_with_seq: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 #############################################################################################
 DatasetPreprocessor(

@@ -21,7 +21,7 @@ import pandas as pd
 from Bio import SeqIO
 
 
-ENDFILENAME= "DataEvalSwissPro_esm_10d"
+ENDFILENAME= "DataEvalSwissPro_esm_10d_150w_100%"
 
 
 class DomainProcessing:
@@ -312,10 +312,15 @@ class databaseCreater:
         seq_labels_negative_domains.loc[:, "categories"] = 10
 
         seqarray_clean_rnd_all = self.seqarray_clean_rnd_all[1:]
-
         seqarray_clean_rnd_all.loc[:, "categories"] = 11
+        
+
         seq_labels_all_domains = pd.concat(
-            [seq_labels_positive1, seq_labels_positive2, seq_labels_negative_domains]
+            [seq_labels_positive1, seq_labels_positive2, 
+             seq_labels_positive3, seq_labels_positive4, seq_labels_positive5,
+             seq_labels_positive6, seq_labels_positive7, seq_labels_positive8,
+             seq_labels_positive9, seq_labels_positive10,
+             seq_labels_negative_domains]
         )
 
         seqarray_clean_rnd_without_double_domains = seqarray_clean_rnd_all.loc[
@@ -327,16 +332,7 @@ class databaseCreater:
         seqarray_full = pd.concat(
             [seqarray_clean_rnd_without_double_domains, seq_labels_all_domains]
         )
-        # ratio_positive = len(seqarray_clean1) / len(seqarray_full)
-        # print("ratio positive:", ratio_positive)
-
-        # ratio_negative_domains = (
-        #     len(seqarray_clean_PF00079)
-        #     + len(seqarray_clean_PF00080)
-        #     + len(seqarray_clean_PF00118)
-        #     + len(seqarray_clean_PF00162)
-        # ) / len(seqarray_full)
-        # print("ratio negative domains:", ratio_negative_domains, "\n")
+        
         print("SEQARRAT", seqarray_full)
         elapsed_time = time.time() - start_time
         print(
@@ -406,7 +402,7 @@ class databaseCreater:
                 current_boundary = current_row["Boundaries"]
                 # print("current boundary is list", current_boundary)
             except:
-                current_boundary = None
+                current_boundary = 0
                 pass
 
             len_nested = len(nested_list)
@@ -417,8 +413,7 @@ class databaseCreater:
                 categories.append(current_category)
                 ids.append(current_id)
                 try:
-                    if current_boundary:
-                        boundaries_all.append(current_boundary)
+                    boundaries_all.append(current_boundary)
                 except:
                     pass
             
@@ -475,11 +470,11 @@ class databaseCreater:
         print(f"\t Done multiplying\n\t Elapsed Time: {elapsed_time:.4f} seconds")
         return sliding_df
 
-    def _overlapCalculater(self, seqarray_multiplied,binary_threshold=None):
+    def _overlapCalculater(self, seqarray_multiplied, binary_threshold=None):
         """
         Calculates the maximum overlap percentage between the window and any of the boundaries.
-        Stores the overlap percentage (0.0 to 1.0) in the 'overlap' column. 
-        Returned is the same df as entered with the addition of the 'overlap' column
+        Only for positive classes (categories 0-9).
+        If overlap <= 0.7, sets categories to 11 (random).
         """
         start_time = time.time()
 
@@ -492,12 +487,11 @@ class databaseCreater:
 
             try:
                 row = seqarray_multiplied.iloc[idx]
-                # parse window
                 ws, we = map(int, row["WindowPos"].split("-"))
                 window_length = we - ws
 
-                # skip non-zero categories
-                if row["categories"] != 0 and row["categories"] != 1:
+                # Only compute overlap for positive classes (categories 0-9) and if boundaries exist
+                if row["categories"] not in range(0, 10) or pd.isna(row.get("Boundaries", None)) or not isinstance(row["Boundaries"], str):
                     overlaps.append(0.0)
                     continue
 
@@ -516,9 +510,14 @@ class databaseCreater:
                     val = round(max_overlap_pct, 4)
 
                 overlaps.append(val)
+                # Set category to 11 if overlap <= 0.7, else keep original
+                if max_overlap_pct < 1:
+                    seqarray_multiplied.iloc[idx, seqarray_multiplied.columns.get_loc("categories")] = 11
 
             except Exception:
                 overlaps.append(0.0)
+                # Optionally set to 11 on error:
+                # seqarray_multiplied.iloc[idx, seqarray_multiplied.columns.get_loc("categories")] = 11
 
         seqarray_multiplied["overlap"] = overlaps
         elapsed_time = time.time() - start_time
