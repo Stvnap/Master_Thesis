@@ -88,19 +88,22 @@ class DatasetPreprocessor:
         found_entries = {}
         processed_count = 0
         all_elements_count = 0
+        failed_entries = []
         
         # Add timing variables for ETA calculation
         import time
         start_time = time.time()
         last_update_time = start_time
         
-        # Use iterparse for memory-efficient streaming
-        context = ET.iterparse(self.input_path_xml, events=('start', 'end'))
-        context = iter(context)
-        
+        # Use iterparse for memory-efficient streaming with error recovery
+        parser = ET.XMLParser(recover=True)  # Enable recovery mode
         all_lists = []
 
         try:
+            # Use iterparse with recovery parser
+            context = ET.iterparse(self.input_path_xml, events=('start', 'end'))
+            context = iter(context)
+            
             event, root = next(context)
             print(f"Root element: {root.tag}")  # Add this back for debugging
             
@@ -110,29 +113,42 @@ class DatasetPreprocessor:
                 if event == 'end':
                     # Look for protein elements based on your XML structure
                     if elem.tag == 'protein':
-                        
-                        # Extract ID and lcn data from protein element
-                        entry_data = self._extract_protein_data(elem)
-                        
-                        if entry_data:
-                            if entry_data['id'] in self.target_ids:
-                                found_entries[entry_data['id']] = {
-                                    'xml_content': ET.tostring(elem, encoding='unicode'),
-                                    'lcn_data': entry_data['lcn_data']
-                                }
+                        try:
+                            # Extract ID and lcn data from protein element
+                            entry_data = self._extract_protein_data(elem)
+                            
+                            if entry_data:
+                                if entry_data['id'] in self.target_ids:
+                                    try:
+                                        found_entries[entry_data['id']] = {
+                                            'xml_content': ET.tostring(elem, encoding='unicode'),
+                                            'lcn_data': entry_data['lcn_data']
+                                        }
 
-                                if entry_data['lcn_data']:
-                                    for lcn in entry_data['lcn_data']:
-                                        if lcn['match_id'].startswith('PF'):
-                                            templist = [lcn['start'], lcn['end'], entry_data['id'], lcn['match_id']]
-                                            all_lists.append(templist)
+                                        if entry_data['lcn_data']:
+                                            for lcn in entry_data['lcn_data']:
+                                                if lcn['match_id'].startswith('PF'):
+                                                    templist = [lcn['start'], lcn['end'], entry_data['id'], lcn['match_id']]
+                                                    all_lists.append(templist)
+                                    except Exception as e:
+                                        print(f"\nFailed to process target entry {entry_data['id']}: {e}")
+                                        failed_entries.append(entry_data['id'])
 
-                        processed_count += 1
-                        
-                        # IMPORTANT: Clear the element to free memory
-                        elem.clear()
-                        while elem.getprevious() is not None:
-                            del elem.getparent()[0]
+                            processed_count += 1
+                            
+                        except Exception as e:
+                            # Skip individual problematic protein entries but continue processing
+                            protein_id = elem.attrib.get('id', 'UNKNOWN')
+                            print(f"\nSkipping problematic protein entry {protein_id}: {e}")
+                            failed_entries.append(protein_id)
+                            processed_count += 1
+                          # IMPORTANT: Clear the element to free memory
+                        try:
+                            elem.clear()
+                            while elem.getprevious() is not None:
+                                del elem.getparent()[0]
+                        except Exception:
+                            pass  # Ignore cleanup errors
                         
                         # Enhanced progress reporting
                         if processed_count % 10000 == 0:
@@ -144,7 +160,8 @@ class DatasetPreprocessor:
                                 print(f"Processed {processed_count} entries | "
                                       f"Found {len(found_entries)}/{len(self.target_ids)} targets | "
                                       f"Pfam entries: {len(all_lists)} | "
-                                      f"Rate: {rate:.1f} entries/s | ", end='', flush=True)
+                                      f"Failed: {len(failed_entries)} | "
+                                      f"Rate: {rate:.1f} entries/s | ", end='\r', flush=True)
                             
                             process = psutil.Process(os.getpid())
                             mem_mb = process.memory_info().rss / 1024 / 1024
@@ -161,18 +178,39 @@ class DatasetPreprocessor:
                     break
 
         except ET.XMLSyntaxError as e:
-            print(f"XML parsing error: {e}")
-            raise  # Re-raise to see the full error
+            print(f"\nXML parsing error at entry {processed_count}: {e}")
+            print(f"Failed entries so far: {failed_entries}")
+            
+            # Try to continue processing after the error
+            print("Attempting to continue processing...")
+            try:
+                # Skip to next element and continue
+                for event, elem in context:
+                    all_elements_count += 1
+                    if event == 'end' and elem.tag == 'protein':
+                        processed_count += 1
+                        if processed_count % 1000 == 0:
+                            print(f"Recovered: processed {processed_count} entries")
+                        try:
+                            elem.clear()
+                            while elem.getprevious() is not None:
+                                del elem.getparent()[0]                        
+                        except Exception:
+                            pass
+            except Exception as recovery_error:
+                print(f"Could not recover from XML error: {recovery_error}")
+                print(f"Stopping processing. Successfully processed {len(all_lists)} Pfam entries.")
+                
         except MemoryError as e:
-            print(f"Memory error: {e}")
+            print(f"\nMemory error: {e}")
             print(f"Processed {processed_count} entries before memory error")
-            raise
+            print(f"Successfully extracted {len(all_lists)} Pfam entries before error")
         except Exception as e:
-            print(f"Unexpected error during XML processing: {e}")
+            print(f"\nUnexpected error during XML processing: {e}")
             import traceback
             traceback.print_exc()
-            raise
-        
+            print(f"Successfully processed {len(all_lists)} Pfam entries before error")
+
         # Final summary
         final_time = time.time()
         total_elapsed = final_time - start_time

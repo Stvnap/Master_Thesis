@@ -18,22 +18,25 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
+from torch.nn.parallel import DistributedDataParallel as DDP
+from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
+from fairscale.nn.wrap import enable_wrap, wrap
 
 # -------------------------
 # 1. GLobal settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissPro_esm_10d_uncut_shuffled.csv"
+CSV_PATH = "./Dataframes/Evalsets/DataEvalSwissPro_esm_10d_150w_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
 MODEL_PATH = "./models/Optuna_10d_uncut_10000.pt"
-CACHE_PATH = "./pickle/Predicer_embeddings_10d_uncut_shuffled.pkl"
+CACHE_PATH = "./pickle/Predicer_embeddings_10d_150w_shuffled.pkl"
 TENSBORBOARD_LOG_DIR = "./models/10d_uncut_logs"
 
 
 NUM_CLASSES = 11
 BATCH_SIZE = 128
-EMB_BATCH = 40
+EMB_BATCH = 16
 NUM_WORKERS = max(16, os.cpu_count())
 NUM_WORKERS_EMB = max(16, os.cpu_count())
 
@@ -57,10 +60,10 @@ class SeqDataset(Dataset):
         return len(self.seqs)
 
     def __getitem__(self, idx):
-        return f"seq{idx}", self.seqs[idx]
+        return self.seqs[idx]
 
 class ESMDataset:
-    def __init__(self, skip_df=None):
+    def __init__(self, skip_df=None,FSDP_used=False):
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
             # Classes 0-9 get mapped to 1-10
@@ -71,241 +74,192 @@ class ESMDataset:
                 return 0
 
         if skip_df is None:
-            df = pd.read_csv(CSV_PATH)
+            df = pd.read_csv(CSV_PATH)  # Load only the first 10,000 rows for testing
             df["label"] = df[CATEGORY_COL].apply(map_label)
             df.drop(columns=[CATEGORY_COL], inplace=True)
-
-            # --- new: sort by sequence length to keep batches balanced ---
-            df["seq_len"] = df[SEQUENCE_COL].str.len()
-            df.sort_values("seq_len", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            df.drop(columns=["seq_len"], inplace=True)
-            # ------------------------------------------------------------
 
             self.df = df
             print("Data loaded")
         else:
             self.df = skip_df
+            
+        self.FSDP_used = FSDP_used
 
-        self.model, self.alphabet, self.batch_converter = self.esm_loader()
         sequences = self.df[SEQUENCE_COL].tolist()
 
-        print(f"Starting embedding generation for {len(sequences)} sequences...")
+        # Model initialization
+        self.model, self.batch_converter = self.esm_loader()
+
+
         start_time = time.time()
-
-        self.embeddings = self._embed(sequences).cpu()
-
+        self.embeddings = self._embed(sequences)
         end_time = time.time()
         embedding_time = end_time - start_time
+        self.labels = torch.tensor(self.df["label"].values, dtype=torch.long)
 
         # Print timing information
+        print("--------------------------")
         print("Embedding generation completed!")
         print(
             f"Total time: {embedding_time:.2f} seconds ({embedding_time / 60:.2f} minutes)"
         )
         print(
-            f"Time per sequence: {embedding_time / len(sequences):.4f} seconds"
+            f"Time per sequence: {embedding_time / len(sequences):.4f} seconds | Sequences per second: {len(sequences) / embedding_time:.2f}"
         )
-        print(f"Sequences per second: {len(sequences) / embedding_time:.2f}")
+        print("--------------------------")
 
-
-        self.labels = torch.tensor(self.df["label"].values, dtype=torch.long)
-
-        print("Embeddings computed")
 
 
     def esm_loader(self):
-        model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        # init the distributed world with world_size 1
+        if not torch.distributed.is_initialized():        
+            url = "tcp://localhost:23457"
+            torch.distributed.init_process_group(backend="nccl", init_method=url, world_size=1, rank=0)
 
-        # Set the model to the primary device first
-        model = model.to(DEVICE).eval()
+        # download model data from the hub
+        model_name = "esm2_t33_650M_UR50D"
+        model_data, regression_data = esm.pretrained._download_model_and_regression_data(model_name)
 
-        
 
-        # Enable mixed precision for faster computation
-        if torch.cuda.is_available():
-            model = model.half()
-
-        print(f"ESM model loaded on device: {DEVICE}")
-        if torch.cuda.device_count() > 1:
-            print(
-                f"Model will be wrapped with DataParallel for {torch.cuda.device_count()} GPUs"
+        if self.FSDP_used is True:
+            print("Using FSDP for model wrapping")
+            # initialize the model with FSDP wrapper
+            fsdp_params = dict(
+                mixed_precision=True,
+                flatten_parameters=True,
+                state_dict_device=torch.device("cpu"),  # reduce GPU mem usage
+                cpu_offload=True,  # enable cpu offloading
             )
+            with enable_wrap(wrapper_cls=FSDP, **fsdp_params):
+                model, vocab = esm.pretrained.load_model_and_alphabet_core(
+                    model_name, model_data, regression_data
+                )
+                batch_converter = vocab.get_batch_converter()
+                model.eval()
 
-        return model, alphabet, alphabet.get_batch_converter()
+                # Wrap each layer in FSDP separately
+                for name, child in model.named_children():
+                    if name == "layers":
+                        for layer_name, layer in child.named_children():
+                            wrapped_layer = wrap(layer)
+                            setattr(child, layer_name, wrapped_layer)
+                model = wrap(model)
+
+
+        else:
+            model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            batch_converter = alphabet.get_batch_converter()
+            model.eval()  # disables dropout for deterministic results
+            model=model.cuda()  # Move model to GPU if available
+            model=model.half()
+
+
+        return model, batch_converter
    
+
     def _embed(self, seqs):
         """
-        Optimized batching with multi-GPU support for embedding generation.
+        Generate embeddings for a list of sequences using ESM model.
         """
-        embed_start_time = time.time()
+        all_embeddings = []
+        seqs = list(seqs)  # Ensure it's a list
 
-        # 1) Enable multi-GPU processing with optimized batch sizing
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for embedding generation")
-            effective_batch_size = EMB_BATCH * torch.cuda.device_count()
-        else:
-            effective_batch_size = EMB_BATCH * 2  # Increase single GPU batch size
-            print("Using single GPU for embedding generation")
+        total_batches = math.ceil(len(seqs) / EMB_BATCH)
+        start_time = time.time()
+        print(f"Starting embedding generation for {len(seqs)} sequences in {total_batches} batches...")
 
-        sequences = seqs
-
-        # 3) JIT compilation for single GPU
-        if not hasattr(self, "_jit_compiled"):
-            compile_start = time.time()
+        for batch_idx, batch_indices in enumerate(DataLoader(
+            range(len(seqs)),
+            batch_size=EMB_BATCH,
+            shuffle=False,
+            num_workers=NUM_WORKERS_EMB, 
+            pin_memory=False,  
+        )):
+            
             try:
-                if hasattr(torch, "compile") and torch.cuda.device_count() == 1:
-                    self.model = torch.compile(self.model, mode="default")
-                    print(f"Model compilation took: {time.time() - compile_start:.2f} seconds")
+                batch = [(f"seq{i}", seqs[i]) for i in batch_indices]
+                batch_labels, batch_strs, batch_tokens = self.batch_converter(batch)
+                batch_tokens = batch_tokens.cuda()
+                
+                with torch.no_grad():
+                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=True)
+                    embeddings = results["representations"][33].float()
+
+                    # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
+                    mask = (batch_tokens != 1)  # 1 is usually the padding index for ESM
+                    mask = mask[:, 1:-1]  # Remove BOS/EOS if present
+                    embeddings = embeddings[:, 1:-1, :]  # Remove BOS/EOS if present
+
+                    lengths = mask.sum(dim=1, keepdim=True)
+                    pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
+                    pooled = pooled.cpu()  # Move to CPU
+
+                    all_embeddings.append(pooled)
+
+                # Calculate and print ETA every 5 batches or at the end
+                if (batch_idx + 1) % 1 == 0 or batch_idx + 1 == total_batches:
+                    elapsed_time = time.time() - start_time
+                    avg_time_per_batch = elapsed_time / (batch_idx + 1)
+                    remaining_batches = total_batches - (batch_idx + 1)
+                    eta_seconds = remaining_batches * avg_time_per_batch
+                    
+                    # Format ETA
+                    eta_hours = int(eta_seconds // 3600)                    
+                    eta_minutes = int((eta_seconds % 3600) // 60)
+                    eta_seconds_remainder = int(eta_seconds % 60)
+                    
+                    print(f"Batch {batch_idx + 1}/{total_batches} | "
+                        f"Processed {(batch_idx + 1) * EMB_BATCH}/{len(seqs)} sequences | "
+                        f"ETA: {eta_hours}h {eta_minutes}m {eta_seconds_remainder}s",end='\r', flush=True)
+                    
+
+
             except Exception as e:
-                print(f"Torch compile failed: {e}")
-            self._jit_compiled = True
+                print(f"\nError processing batch {batch_idx + 1}: {e},processing current batch sequences individually.")
+                for i in batch_indices:
+                    try:
+                        single_seq = [(f"seq{i}", seqs[i])]
+                        single_labels, single_strs, single_tokens = self.batch_converter(single_seq)
+                        single_tokens = single_tokens.cuda()
 
-        batch_size = effective_batch_size
-        all_outputs = []
-        total_batches = (len(sequences) + batch_size - 1) // batch_size
-
-        print(f"Processing {len(sequences)} sequences with batch size {batch_size}")
-        print(f"Total batches to process: {total_batches}")
-
-        # 4) Pre-allocate CUDA streams for better GPU utilization
-        if torch.cuda.is_available():
-            stream = torch.cuda.Stream()
-        
-        batch_times = []
-
-        # 5) Optimized batching in original order
-        for batch_idx, start in enumerate(range(0, len(sequences), batch_size)):
-            batch_start_time = time.time()
-
-            if batch_idx % 1 == 0:  # More frequent progress updates
-                elapsed = time.time() - embed_start_time
-                if batch_idx > 0:
-                    avg_batch_time = sum(batch_times) / len(batch_times)
-                    remaining_batches = total_batches - batch_idx
-                    eta = remaining_batches * avg_batch_time
-                    print(f"\rBatch {batch_idx + 1}/{total_batches} | "
-                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end="", flush=True)
-
-            chunk = sequences[start : start + batch_size]
-            labels = [f"seq{i}" for i in range(len(chunk))]  # Simplified labels
-
-            try:
-                with torch.cuda.stream(stream) if torch.cuda.is_available() else torch.no_grad():
-                    # Batch conversion
-                    batch_labels, batch_strs, batch_tokens = self.batch_converter(
-                        list(zip(labels, chunk))
-                    )
-                    
-                    
-                    gpu_id = batch_idx % torch.cuda.device_count()
-                    DEVICE = torch.device(f"cuda:{gpu_id}")
-
-                    batch_tokens = batch_tokens.to(DEVICE, non_blocking=True)
-
-
-                    with torch.no_grad(), torch.amp.autocast(DEVICE.type, enabled=True, dtype=torch.float16):
-
-                        # Model inference
-                        if hasattr(self.model, "module"):
-                            out = self.model(
-                                tokens=batch_tokens,
-                                repr_layers=[33],  
-                                return_contacts=False,
-                            )["representations"][33] 
-                        else:
-                            out = self.model(
-                                batch_tokens,
-                                repr_layers=[33],  
-                                return_contacts=False,
-                            )["representations"][33]
-
-                    # Optimized pooling with vectorized operations
-                    padding_mask = (batch_tokens == self.alphabet.padding_idx)
-                    # Use efficient masking
-                    out_masked = out.masked_fill(padding_mask.unsqueeze(-1), 0.0)
-                    seq_lengths = (~padding_mask).sum(dim=1, keepdim=True).float()
-                    pooled = out_masked.sum(dim=1) / seq_lengths.clamp(min=1)
-
-                    # Keep in float16 to save memory
-                    all_outputs.append(pooled.half())
-
-                    # Aggressive memory cleanup
-                    del out, out_masked, padding_mask, seq_lengths, batch_tokens
-
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"\rOOM in batch {batch_idx}, falling back to single sequence processing", end="", flush=True)
-                    
-                    # Process each sequence individually
-                    for seq_idx, seq in enumerate(chunk):
-                        try:
-                            single_batch = self.batch_converter([(f"seq{seq_idx}", seq)])
-                            _, _, single_tokens = single_batch
-                            single_tokens = single_tokens.to(DEVICE)
-
-                            with (
-                                torch.no_grad(),
-                                torch.amp.autocast("cuda", enabled=True, dtype=torch.float16),
-                            ):
-                                if hasattr(self.model, "module"):
-                                    single_out = self.model(
-                                        tokens=single_tokens,
-                                        repr_layers=[33],
-                                        return_contacts=False,
-                                    )["representations"][33]
-                                else:
-                                    single_out = self.model(
-                                        single_tokens,
-                                        repr_layers=[33],  
-                                        return_contacts=False,
-                                    )["representations"][33]
-
-                            single_mask = (single_tokens == self.alphabet.padding_idx)
-                            single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
-                            single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
-                            single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
-
-                            all_outputs.append(single_pooled.half())
+                        with torch.no_grad():
+                            results = self.model(single_tokens, repr_layers=[33], return_contacts=True)
+                            embedding = results["representations"][33].float()
                             
-                            del single_out, single_out_masked, single_mask, single_lengths, single_tokens
-                            
-                        except Exception as single_e:
-                            print(f"Failed single sequence {seq_idx}: {single_e}")
-                            # Only use dummy as absolute last resort for individual sequences
-                            dummy = torch.zeros((1, 1280), device=DEVICE, dtype=torch.float16)  
-                            all_outputs.append(dummy)
+                            # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
+                            mask = (single_tokens != 1)  # 1 is usually the padding index for ESM
+                            mask = mask[:, 1:-1]  # Remove BOS/EOS if present
+                            embedding = embedding[:, 1:-1, :]  # Remove BOS/EOS if present
+
+                            length = mask.sum(dim=1, keepdim=True)
+                            pooled = (embedding * mask.unsqueeze(-1)).sum(dim=1) / length
+                            pooled = pooled.cpu()  # Move to CPU
+
+                            all_embeddings.append(pooled)
+
+                    except Exception as single_e:
+                        print(f"Error processing sequence {i}: {single_e}")
+                        # Add a zero embedding as placeholder to maintain tensor dimensions
+                        zero_embedding = torch.zeros(1, 1280)  # ESM2-650M embedding dimension
+                        all_embeddings.append(zero_embedding)
+                        print(f"Added zero embedding for failed sequence {i}")
 
 
-            # Track batch timing
-            batch_time = time.time() - batch_start_time
-            batch_times.append(batch_time)
+
+        return torch.cat(all_embeddings, dim=0)
 
 
-
-        # 6) Simple concatenation (no reordering needed)
-        if all_outputs:
-            embeddings = torch.cat(all_outputs, dim=0).float().cpu()
-        else:
-            embeddings = torch.zeros((len(seqs), 1280)) 
-
-
-        total_embed_time = time.time() - embed_start_time
-        print(f"\n=== Embedding Generation Summary ===")
-        print(f"Total time: {total_embed_time:.2f}s ({total_embed_time / 60:.2f}min)")
-        print(f"Sequences per second: {len(seqs) / total_embed_time:.2f}")
-        print("=====================================\n")
-
-        return embeddings
 
 # -------------------------
 # 3. Predicter
 # -------------------------
 
-
 def predict(modelpath, loader, df_labels, firstrun=False):
     model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
     model = model.to(DEVICE)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"Using {torch.cuda.device_count()} GPUs for prediction")
+    #     model = nn.DataParallel(model)
     model.eval()
 
     # print(model)
@@ -322,6 +276,7 @@ def predict(modelpath, loader, df_labels, firstrun=False):
     with torch.no_grad():
         for batch in loader:
             inputs, _ = batch
+            # print("\nTENSORS IN PREDICT():",inputs[0:10])
             inputs = inputs.to(DEVICE)
             output = model(inputs)
             # print("OUTPUT:",output)
@@ -337,8 +292,8 @@ def predict(modelpath, loader, df_labels, firstrun=False):
 
     true_labels = df_labels
 
-    # print(true_labels[:30],print(len(true_labels)))
-    # print(predictions[:30],print(len(predictions)))
+    # print("TRUE:",true_labels[:30],print(len(true_labels)))
+    # print("PRED:",predictions[:30],print(len(predictions)))
 
     if firstrun is True:
         # Initialize TensorBoard writer
@@ -373,17 +328,23 @@ def predict(modelpath, loader, df_labels, firstrun=False):
 
         # Print results
         print(f"Accuracy: {accuracy:.4f}")
-        print(f"Weighted precision (all classes): {weighted_precision:.4f}")
+        # print(f"Weighted precision (all classes): {weighted_precision:.4f}")
 
+
+        print("\nPrecision Metrics:")
         for i in range(1, NUM_CLASSES):
             print(f"Precision for class {i}: {prec_per_class[i-1]:.4f}")
+            
+        print('\nRecall Metrics:')
+        for i in range(1, NUM_CLASSES):
+
             print(f"Recall    for class {i}: {rec_per_class[i-1]:.4f}")
 
         # print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
 
         # Close the writer
         writer.close()
-        print(f"Metrics logged to TensorBoard in '{TENSBORBOARD_LOG_DIR}'")
+        # print(f"Metrics logged to TensorBoard in '{TENSBORBOARD_LOG_DIR}'")
 
         # print("raw", predictions_raw[:30])
         # print("maxed", predictions[:30])
@@ -397,7 +358,6 @@ def predict(modelpath, loader, df_labels, firstrun=False):
 # 5. Cutter / Re-embedder
 # -------------------------
 
-
 def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True):
     positive_embeddings = []
     positive_labels = []
@@ -405,13 +365,20 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
     for i in range(len(predictions)):
         if predictions[i] != 0:
             if cut_front is True:
+                
+                temp_seq= df[SEQUENCE_COL][i][cut_size:]
+                # if i < 100:
+                    # print(temp_seq)
 
-                positive_embeddings.append((df[SEQUENCE_COL][i])[cut_size:])
+
+                positive_embeddings.append(temp_seq)
                 positive_labels.append(true_labels[i].item())
 
             else:
+                temp_seq=df[SEQUENCE_COL][i][:-cut_size]
 
-                positive_embeddings.append((df[SEQUENCE_COL][i])[:-cut_size])
+
+                positive_embeddings.append(temp_seq)
                 positive_labels.append(true_labels[i].item())
 
     # print("Len first seq", len(positive_embeddings[0]))
@@ -440,59 +407,49 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        pin_memory=True,
+        pin_memory=False,
+        # drop_last=False,
     )
 
     return df_embeddings, df_labels
 
 
 # -------------------------
-# 6. Main
+# 6. Drop checker
 # -------------------------
 
+def check_dropping_logits_across_cuts(logits_so_far, threshold=2):
+    """
+    Check if logits are dropping consecutively across different cut sizes.
+
+    Args:
+        logits_so_far: List of logit values collected so far for a sequence
+        threshold: Number of consecutive drops to trigger exclusion (default: 2)
+
+    Returns:
+        bool: True if sequence should be dropped (has consecutive drops >= threshold)
+    """
+    if len(logits_so_far) < threshold + 1:
+        return False
+
+    consecutive_drops = 0
+
+    for i in range(1, len(logits_so_far)):
+        if logits_so_far[i] < logits_so_far[i-1]:
+            consecutive_drops += 1
+            if consecutive_drops >= threshold:
+                return True
+        else:
+            consecutive_drops = 0
+
+    return False
+
+
+# -------------------------
+# 7. Main
+# -------------------------
 
 def main():
-    def check_dropping_logits_across_cuts(logits_so_far, threshold=2):
-        """
-        Check if logits are dropping consecutively across different cut sizes.
-
-        Args:
-            logits_so_far: List of logit values collected so far for a sequence
-            threshold: Number of consecutive drops to trigger exclusion (default: 2)
-
-        Returns:
-            bool: True if sequence should be dropped (has consecutive drops >= threshold)
-        """
-        if len(logits_so_far) < threshold + 1:
-            return False
-
-        if len(logits_so_far) >= 4:
-            window_size = max(2, len(logits_so_far) // 3)  # Dynamic window size
-            recent_avg = np.mean(logits_so_far[-window_size:])
-            early_avg = np.mean(logits_so_far[:window_size])
-
-            # Stop if recent average is significantly lower than early average
-            decline_threshold = 0.1  # Adjust this value based on your data
-            if recent_avg < early_avg - decline_threshold:
-                return True
-
-        # Alternative: Linear regression slope approach
-        if len(logits_so_far) >= 4:
-            x = np.arange(len(logits_so_far))
-            y = np.array(logits_so_far)
-
-            # Calculate slope using least squares
-            n = len(logits_so_far)
-            slope = (n * np.sum(x * y) - np.sum(x) * np.sum(y)) / (
-                n * np.sum(x**2) - np.sum(x) ** 2
-            )
-
-            # Stop if slope is significantly negative
-            slope_threshold = -0.05  # Adjust based on your data scale
-            if slope < slope_threshold:
-                return True
-
-        return False
 
     os.makedirs("pickle", exist_ok=True)
 
@@ -509,16 +466,13 @@ def main():
 
         df_embeddings = TensorDataset(df_embeddings, df_labels)
 
-        print("Dataset building complete")
-
         df_embeddings = DataLoader(
             df_embeddings,
             batch_size=BATCH_SIZE,
             shuffle=False,
-            num_workers=NUM_WORKERS,
-            pin_memory=True,
+            num_workers=0,
+            pin_memory=False, 
         )
-        print("Data loader created")
 
         with open(CACHE_PATH, "wb") as f:
             pickle.dump(
@@ -589,16 +543,24 @@ def main():
     seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
     max_len = max(seq_lengths)
     mean_len = np.mean(seq_lengths)
+    min_len = min(seq_lengths)
     cut_sizes = [0] + list(range(5, min(int(mean_len * 0.8), max_len // 4), 5))
-
+    cut_sizes = [0] + list(
+        range(5, min(int(mean_len * 0.8), max_len // 4), 5) 
+        if max(cut_sizes) < min_len 
+        else range(5, max_len, 5)
+    )
+    
     print(f"Max cut size: {max(cut_sizes)} residues\n")
 
     Npos, K = len(pos_indices), len(cut_sizes)
 
     # cut front
     raw_matrix = np.zeros((Npos, K), dtype=float)
-    sequence_logits = [[] for _ in range(Npos)]  # Track logits for each sequence
-    stopped_sequences = set()  # Track sequences that stopped predicting
+    max_domains = 10  # Maximum number of domains to track
+    sequence_logits = [[[] for _ in range(max_domains)] for _ in range(Npos)]  # [sequence][domain][logits]
+    sequence_domain_status = [0 for _ in range(Npos)]  # Track which domain each sequence is currently on
+    stopped_sequences_start=set()
 
     for j, cut in enumerate(cut_sizes):
         print(f"Processing cut size {cut} ({j + 1}/{K})...")
@@ -609,16 +571,33 @@ def main():
 
         # Update logits and check for stopping sequences
         for row_idx in range(Npos):
-            if row_idx not in stopped_sequences:
+            if row_idx not in stopped_sequences_start:
+                # print(len(raw_matrix),len(raw_scores))
+                # print(row_idx)
+                current_domain=sequence_domain_status[row_idx]
                 raw_matrix[row_idx, j] = raw_scores[row_idx]
-                sequence_logits[row_idx].append(raw_scores[row_idx])
+                sequence_logits[row_idx][current_domain].append(raw_scores[row_idx])
+
 
                 # Check if this sequence should stop further prediction
                 if check_dropping_logits_across_cuts(
-                    sequence_logits[row_idx], threshold=THRESHOLD
+                    sequence_logits[row_idx][current_domain], threshold=THRESHOLD
                 ):
-                    stopped_sequences.add(row_idx)
-                    seq_idx = pos_indices[row_idx]
+                    current_domain += 1
+                    sequence_domain_status[row_idx] = current_domain
+
+                    if current_domain < max_domains:
+                        sequence_logits[row_idx][current_domain].append(raw_scores[row_idx])
+
+                    else:
+                        stopped_sequences_start.add(row_idx)
+
+        if j < 100:
+            print(sequence_logits[0]) 
+
+
+
+
                     # print(
                     #     f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops"
                     # )
@@ -629,41 +608,55 @@ def main():
     #     f"Stopped early prediction for {len(stopped_sequences)} out of {Npos} sequences"
     # )
 
+
+
+
     all_start_residues = []
     errors_start = []
     for row_idx in range(Npos):  # Use all sequences, not just valid ones
         seq_idx = pos_indices[row_idx]
         curve = raw_matrix[row_idx]
-
+        all_j = []
+        start_residues=[]
         # Find the best cut among the cuts that were actually computed for this sequence
-        if row_idx in stopped_sequences:
-            # For stopped sequences, only consider cuts up to where they were stopped
-            non_zero_indices = np.nonzero(curve)[0]
-            if len(non_zero_indices) > 0:
-                best_j = non_zero_indices[np.argmax(curve[non_zero_indices])]
-            else:
-                best_j = 0  # Fallback to first cut
-        else:
-            # For sequences that completed all cuts
-            best_j = int(np.argmax(curve))
+        for domain_idx in range(max_domains):
+            if sequence_logits[row_idx][domain_idx]:  # If this domain has logits
+                # For stopped sequences, only consider cuts up to where they were stopped
+                if row_idx in stopped_sequences_start:
+                    non_zero_indices = np.nonzero(curve)[0]
+                    if len(non_zero_indices) > 0:
+                        best_j = non_zero_indices[np.argmax(curve[non_zero_indices])]
+                    else:
+                        best_j = 0  # Fallback to first cut
+                else:
+                    # For sequences that completed all cuts
+                    best_j = int(np.argmax(curve))
+                all_j.append(best_j)
 
-        start_residue = cut_sizes[best_j]
-        pred_start = cut_sizes[best_j]
+
+        for j in all_j:
+            start_residues.append(cut_sizes[j])
+
+        pred_start = start_residues
         true_start = pos_true_start[row_idx]
 
         if not true_start:
             err = None
         else:
-            err = min(abs(pred_start - ts) for ts in true_start)
+            all_errors = []
+            for predicted_domain in pred_start:
+                domain_error = min(abs(predicted_domain - ts) for ts in true_start)
+                all_errors.append(domain_error)
+            err = min(all_errors)
 
         errors_start.append(err)
 
-        status = "stopped early" if row_idx in stopped_sequences else "completed"
+        status = "stopped early" if row_idx in stopped_sequences_start else "completed"
         # print(f"Sequence #{seq_idx} ({status}) → domain starts at residue {start_residue}")
-        print(f"Seq#{seq_idx}: predicted={pred_start}, true={true_start}, error={err}", end='\r', flush=True)
-        all_start_residues.append(start_residue)
+        # print(f"Seq#{seq_idx}: predicted={pred_start}, true={true_start}, error={err}", end='\r', flush=True)
+        all_start_residues.append(start_residues)
 
-    print("\nAll domain‐start predictions done.")
+    # print("\nAll domain‐start predictions done.")
 
     errors_start_wo_nones = [
         e for e in errors_start if e is not None
@@ -684,79 +677,93 @@ def main():
         "#####################################################################################################"
     )
 
-    # cut behind
     raw_matrix = np.zeros((Npos, K), dtype=float)
-    sequence_logits_end = [[] for _ in range(Npos)]  # Track logits for each sequence
-    stopped_sequences_end = set()  # Track sequences that stopped predicting
+    max_domains = 10  # Maximum number of domains to track
+    sequence_logits = [[[] for _ in range(max_domains)] for _ in range(Npos)]  # [sequence][domain][logits]
+    sequence_domain_status = [0 for _ in range(Npos)]  # Track which domain each sequence is currently on
+    stopped_sequences_end=set()
 
     for j, cut in enumerate(cut_sizes):
+        print(f"Processing cut size {cut} ({j + 1}/{K})...")
         sub_loader, sub_labels = cut_inputs_embedding(
-            predictions, true_labels, df, cut_size=cut, cut_front=False
+            predictions, true_labels, df, cut_size=cut, cut_front=True
         )
-        _, _, raw_scores = predict(MODEL_PATH, sub_loader, sub_labels)
+        _, _, raw_scores = predict(MODEL_PATH, sub_loader, sub_labels, firstrun=False)
 
         # Update logits and check for stopping sequences
         for row_idx in range(Npos):
             if row_idx not in stopped_sequences_end:
+                # print(len(raw_matrix),len(raw_scores))
+                # print(row_idx)
+                current_domain=sequence_domain_status[row_idx]
                 raw_matrix[row_idx, j] = raw_scores[row_idx]
-                sequence_logits_end[row_idx].append(raw_scores[row_idx])
+                sequence_logits[row_idx][current_domain].append(raw_scores[row_idx])
+
 
                 # Check if this sequence should stop further prediction
                 if check_dropping_logits_across_cuts(
-                    sequence_logits_end[row_idx], threshold=THRESHOLD
+                    sequence_logits[row_idx][current_domain], threshold=THRESHOLD
                 ):
-                    stopped_sequences_end.add(row_idx)
-                    seq_idx = pos_indices[row_idx]
-                    # print(
-                    #     f"Stopping further prediction for sequence {seq_idx} after cut {j} due to {THRESHOLD} consecutive logit drops (end prediction)"
-                    # )
-            # If sequence is stopped, we don't update its logits for this cut size
+                    current_domain += 1
+                    sequence_domain_status[row_idx] = current_domain
 
-    # print(
-    #     f"Stopped early prediction for {len(stopped_sequences_end)} out of {Npos} sequences (end prediction)"
-    # )
+                    if current_domain < max_domains:
+                        sequence_logits[row_idx][current_domain].append(raw_scores[row_idx])
+
+                    else:
+                        stopped_sequences_end.add(row_idx)
+
+        if j < 100:
+            print(sequence_logits[0]) 
 
     all_end_residues = []
     errors_end = []
-
-    for row_idx, seq_idx in enumerate(pos_indices):
+    for row_idx in range(Npos):  # Use all sequences, not just valid ones
+        seq_idx = pos_indices[row_idx]
         curve = raw_matrix[row_idx]
-
+        all_j = []
+        end_residues=[]
         # Find the best cut among the cuts that were actually computed for this sequence
-        if row_idx in stopped_sequences_end:
-            # For stopped sequences, only consider cuts up to where they were stopped
-            non_zero_indices = np.nonzero(curve)[0]
-            if len(non_zero_indices) > 0:
-                best_j = non_zero_indices[np.argmax(curve[non_zero_indices])]
-            else:
-                best_j = 0  # Fallback to first cut
-        else:
-            # For sequences that completed all cuts
-            best_j = int(np.argmax(curve))
+        for domain_idx in range(max_domains):
+            if sequence_logits[row_idx][domain_idx]:  # If this domain has logits
+                # For stopped sequences, only consider cuts up to where they were stopped
+                if row_idx in stopped_sequences_end:
+                    non_zero_indices = np.nonzero(curve)[0]
+                    if len(non_zero_indices) > 0:
+                        best_j = non_zero_indices[np.argmax(curve[non_zero_indices])]
+                    else:
+                        best_j = 0  # Fallback to first cut
+                else:
+                    # For sequences that completed all cuts
+                    best_j = int(np.argmax(curve))
+                all_j.append(best_j)
 
-        sequence_length = len(df[SEQUENCE_COL][seq_idx])
-        pred_end = sequence_length - cut_sizes[best_j]
 
-        if seq_idx == 300:
-            print(
-                f"DEBUG: Seq#{seq_idx} → domain ends at residue {pred_end} (cut size {cut_sizes[best_j]})"
-            )
-            print(f"DEBUG: {df[SEQUENCE_COL][seq_idx]},{pred_end}")
+        for j in all_j:
+            end_residues.append(cut_sizes[j])
 
-        true_ends = pos_true_end[row_idx]
-        if not true_ends:
+        pred_end = end_residues
+        true_end = pos_true_end[row_idx]
+
+        if not true_end:
             err = None
         else:
-            err = min(abs(pred_end - te) for te in true_ends)
+            all_errors = []
+            for predicted_domain in pred_end:
+                domain_error = min(abs(predicted_domain - ts) for ts in true_end)
+                all_errors.append(domain_error)
+            err = min(all_errors)
 
         errors_end.append(err)
-        all_end_residues.append(pred_end)
 
         status = "stopped early" if row_idx in stopped_sequences_end else "completed"
+        # print(f"Sequence #{seq_idx} ({status}) → domain ends at residue {end_residue}")
+        # print(f"Seq#{seq_idx}: predicted={pred_end}, true={true_end}, error={err}", end='\r', flush=True)
+        all_end_residues.append(end_residues)
 
-        print(f"Seq#{seq_idx}: predicted={pred_end}, true={true_ends}, error={err}", end='\r', flush=True)
+        # print(f"Seq#{seq_idx}: predicted={pred_end}, true={true_ends}, error={err}", end='\r', flush=True)
     
-        print("\nAll domain‐end predictions done.")
+        # print("\nAll domain‐end predictions done.")
 
     errors_end_wo_nones = [e for e in errors_end if e is not None]
 
@@ -875,6 +882,7 @@ def plotter(
     plt.hist(errors, bins=bins, density=True, edgecolor="k", alpha=0.7)
     plt.xticks(bins, fontsize=11)
     plt.yticks(fontsize=11)
+    plt.xlim(0, 100)
     plt.title(f"Normalized Distribution of {Name} Boundary Absolute Errors")
     plt.xlabel(f"Absolute Error (residues), bins of {bin_width}")
     plt.ylabel("Probability Density")
@@ -893,25 +901,20 @@ def boxplotter(errors, classes, Name):
         zip(*filtered_data) if filtered_data else ([], [])
     )
 
-    # Separate errors by class
-    class1 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 1]
-    class2 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 2]
-    class3 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 3]
-    class4 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 4]
-    class5 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 5]
-    class6 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 6]
-    class7 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 7]
-    class8 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 8]
-    class9 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 9]
-    class10 = [e for e, c in zip(filtered_errors, filtered_classes) if c == 10]
+    # Dynamically group errors by class
+    class_dict = {}
+    for err, cls in zip(filtered_errors, filtered_classes):
+        class_dict.setdefault(cls, []).append(err)
 
-    data = [class1, class2, class3, class4, class5, class6, class7, class8, class9, class10]
-    data = [d for d in data if len(d) > 0]  # Remove empty classes
+    # Sort classes and build data+labels
+    keys = sorted(class_dict)
+    data = [class_dict[k] for k in keys]
+    labels = [f"Class {k}" for k in keys]
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.boxplot(
         data,
-        labels=["Class 1", "Class 2"],
+        labels=labels,
         patch_artist=True,
         boxprops=dict(facecolor="C0", edgecolor="k"),
         medianprops=dict(color="yellow"),
@@ -920,7 +923,7 @@ def boxplotter(errors, classes, Name):
     ax.set_title(f"Absolute {Name} Error by Class")
     ax.set_ylabel("Absolute Residue Error")
     ax.grid(axis="y", linestyle="--", alpha=0.5)
-    ax.set_ylim(bottom=0)
+    ax.set_ylim(bottom=0,top=100)  # Set y-axis limits
 
     plt.tight_layout()
     plt.savefig(f"./Evalresults/ESM/boxplot_{Name}.png", dpi=300, bbox_inches="tight")

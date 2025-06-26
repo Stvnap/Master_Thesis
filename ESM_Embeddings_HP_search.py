@@ -7,6 +7,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import math
 import esm
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -14,7 +15,8 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchmetrics import Precision, Recall
-
+from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
+from fairscale.nn.wrap import enable_wrap, wrap
 torch.set_float32_matmul_precision("medium")
 torch.backends.cudnn.benchmark = True 
 torch.backends.cuda.matmul.allow_tf32 = (
@@ -25,11 +27,11 @@ torch.backends.cudnn.allow_tf32 = True
 # -------------------------
 # 1. Global settings
 # -------------------------
-CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_150w_shuffled.csv"
+CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_uncut_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_150w_shuffled_10000.pkl"
-PROJECT_NAME = "Optuna_10d_150w_10000"
+CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_uncut_shuffled.pkl"
+PROJECT_NAME = "Optuna_10d_uncut"
 
 
 NUM_CLASSES = 11
@@ -37,14 +39,14 @@ TRAIN_FRAC = 0.7
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 
-EMB_BATCH = 64
+EMB_BATCH = 3
 NUM_WORKERS_EMB = max(16, os.cpu_count())
 print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 128
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
-STUDY_N_TRIALS = 0
+STUDY_N_TRIALS = 30
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -236,10 +238,10 @@ class SeqDataset(Dataset):
         return len(self.seqs)
 
     def __getitem__(self, idx):
-        return f"seq{idx}", self.seqs[idx]
+        return self.seqs[idx]
 
 class ESMDataset:
-    def __init__(self, skip_df=None):
+    def __init__(self, skip_df=None,FSDP_used=False):
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
             # Classes 0-9 get mapped to 1-10
@@ -250,7 +252,7 @@ class ESMDataset:
                 return 0
 
         if skip_df is None:
-            df = pd.read_csv(CSV_PATH,nrows=10000)
+            df = pd.read_csv(CSV_PATH)
             df["label"] = df[CATEGORY_COL].apply(map_label)
             df.drop(columns=[CATEGORY_COL], inplace=True)
             self.df = df
@@ -258,12 +260,13 @@ class ESMDataset:
         else:
             self.df = skip_df
 
-        self.model, self.alphabet, self.batch_converter = self.esm_loader()
+        self.FSDP_used = FSDP_used
+
+        self.model, self.batch_converter = self.esm_loader()
 
         # Use sequences in original order
         sequences = self.df[SEQUENCE_COL].tolist()
 
-        print(f"Starting embedding generation for {len(sequences)} sequences...")
         start_time = time.time()
 
         self.embeddings = self._embed(sequences).cpu()
@@ -317,168 +320,146 @@ class ESMDataset:
         print(f"Test set: {len(self.test_embeddings)} samples")
         print("Embeddings computed and split completed")
 
+
+ 
     def esm_loader(self):
-        model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()  # Changed back to bigger model
+        # init the distributed world with world_size 1
+        if not torch.distributed.is_initialized():        
+            url = "tcp://localhost:62432"
+            torch.distributed.init_process_group(backend="nccl", init_method=url, world_size=1, rank=0)
 
-        # Set the model to the primary device first
-        model = model.to(DEVICE).eval()
+        # download model data from the hub
+        model_name = "esm2_t33_650M_UR50D"
+        model_data, regression_data = esm.pretrained._download_model_and_regression_data(model_name)
 
-        # Enable mixed precision for faster computation
-        if torch.cuda.is_available():
-            model = model.half()
 
-        print(f"ESM model loaded on device: {DEVICE}")
-        if torch.cuda.device_count() > 1:
-            print(
-                f"Model will be wrapped with DataParallel for {torch.cuda.device_count()} GPUs"
+        if self.FSDP_used is True:
+            print("Using FSDP for model wrapping")
+            # initialize the model with FSDP wrapper
+            fsdp_params = dict(
+                mixed_precision=True,
+                flatten_parameters=True,
+                state_dict_device=torch.device("cpu"),  # reduce GPU mem usage
+                cpu_offload=True,  # enable cpu offloading
             )
+            with enable_wrap(wrapper_cls=FSDP, **fsdp_params):
+                model, vocab = esm.pretrained.load_model_and_alphabet_core(
+                    model_name, model_data, regression_data
+                )
+                batch_converter = vocab.get_batch_converter()
+                model.eval()
 
-        return model, alphabet, alphabet.get_batch_converter()
-    
+                # Wrap each layer in FSDP separately
+                for name, child in model.named_children():
+                    if name == "layers":
+                        for layer_name, layer in child.named_children():
+                            wrapped_layer = wrap(layer)
+                            setattr(child, layer_name, wrapped_layer)
+                model = wrap(model)
+
+
+        else:
+            model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            batch_converter = alphabet.get_batch_converter()
+            model.eval()  # disables dropout for deterministic results
+            model=model.cuda()  # Move model to GPU if available
+            model=model.half()
+
+
+        return model, batch_converter
+   
+
     def _embed(self, seqs):
         """
-        Optimized batching with multi-GPU support for embedding generation.
+        Generate embeddings for a list of sequences using ESM model.
         """
-        import time
-        embed_start_time = time.time()
+        all_embeddings = []
+        seqs = list(seqs)  # Ensure it's a list
 
-        # 1) Enable multi-GPU processing with optimized batch sizing
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for embedding generation")
-            if not hasattr(self.model, "module"):
-                self.model = torch.nn.DataParallel(self.model)
-            effective_batch_size = EMB_BATCH * torch.cuda.device_count()
-        else:
-            effective_batch_size = EMB_BATCH * 2
-            print("Using single GPU for embedding generation")
+        total_batches = math.ceil(len(seqs) / EMB_BATCH)
+        start_time = time.time()
+        print(f"Starting embedding generation for {len(seqs)} sequences in {total_batches} batches...")
 
-        sequences = seqs
-        batch_size = effective_batch_size
-        all_outputs = []
-        total_batches = (len(sequences) + batch_size - 1) // batch_size
-
-        print(f"Processing {len(sequences)} sequences with batch size {batch_size}")
-        print(f"Total batches to process: {total_batches}")
-
-        batch_times = []
-
-        for batch_idx, start in enumerate(range(0, len(sequences), batch_size)):
-            batch_start_time = time.time()
-
-            if batch_idx % 5 == 0:
-                elapsed = time.time() - embed_start_time
-                if batch_idx > 0:
-                    avg_batch_time = sum(batch_times) / len(batch_times)
-                    remaining_batches = total_batches - batch_idx
-                    eta = remaining_batches * avg_batch_time
-                    print(f"\rBatch {batch_idx + 1}/{total_batches} | "
-                        f"Elapsed: {elapsed:.1f}s | ETA: {eta / 60:.1f}min", end='\r', flush=True)
-
-            chunk = sequences[start: start + batch_size]
-            labels = [f"seq{i}" for i in range(len(chunk))]
-
+        for batch_idx, batch_indices in enumerate(DataLoader(
+            range(len(seqs)),
+            batch_size=EMB_BATCH,
+            shuffle=False,
+            num_workers=NUM_WORKERS_EMB, 
+            pin_memory=False,  
+        )):
+            
             try:
-                # safer version — always includes no_grad
+                batch = [(f"seq{i}", seqs[i]) for i in batch_indices]
+                batch_labels, batch_strs, batch_tokens = self.batch_converter(batch)
+                batch_tokens = batch_tokens.cuda()
+                
                 with torch.no_grad():
-                    batch_labels, batch_strs, batch_tokens = self.batch_converter(
-                        list(zip(labels, chunk))
-                    )
-                    batch_tokens = batch_tokens.to(DEVICE, non_blocking=True)
+                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=True)
+                    embeddings = results["representations"][33].float()
 
-                    # Disable autocast for now; enable if confident your model supports float16
-                    with torch.amp.autocast("cuda", enabled=False):
-                        if hasattr(self.model, "module"):
-                            out = self.model(
-                                tokens=batch_tokens,
-                                repr_layers=[33],
-                                return_contacts=False,
-                            )["representations"][33]
-                        else:
-                            out = self.model(
-                                tokens=batch_tokens,
-                                repr_layers=[33],
-                                return_contacts=False,
-                            )["representations"][33]
+                    # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
+                    mask = (batch_tokens != 1)  # 1 is usually the padding index for ESM
+                    mask = mask[:, 1:-1]  # Remove BOS/EOS if present
+                    embeddings = embeddings[:, 1:-1, :]  # Remove BOS/EOS if present
 
-                    padding_mask = (batch_tokens == self.alphabet.padding_idx)
-                    out_masked = out.masked_fill(padding_mask.unsqueeze(-1), 0.0)
-                    seq_lengths = (~padding_mask).sum(dim=1, keepdim=True).float()
-                    pooled = out_masked.sum(dim=1) / seq_lengths.clamp(min=1)
+                    lengths = mask.sum(dim=1, keepdim=True)
+                    pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
+                    pooled = pooled.cpu()  # Move to CPU
 
-                all_outputs.append(pooled.cpu().float())
+                    all_embeddings.append(pooled)
 
-                del out, out_masked, padding_mask, seq_lengths, batch_tokens
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Calculate and print ETA every 5 batches or at the end
+                if (batch_idx + 1) % 1 == 0 or batch_idx + 1 == total_batches:
+                    elapsed_time = time.time() - start_time
+                    avg_time_per_batch = elapsed_time / (batch_idx + 1)
+                    remaining_batches = total_batches - (batch_idx + 1)
+                    eta_seconds = remaining_batches * avg_time_per_batch
+                    
+                    # Format ETA
+                    eta_hours = int(eta_seconds // 3600)                    
+                    eta_minutes = int((eta_seconds % 3600) // 60)
+                    eta_seconds_remainder = int(eta_seconds % 60)
+                    
+                    print(f"Batch {batch_idx + 1}/{total_batches} | "
+                        f"Processed {(batch_idx + 1) * EMB_BATCH}/{len(seqs)} sequences | "
+                        f"ETA: {eta_hours}h {eta_minutes}m {eta_seconds_remainder}s",end='\r', flush=True)
+                    
 
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"OOM in batch {batch_idx}, processing individually...", end='\r', flush=True)
-                    torch.cuda.empty_cache()
 
-                    individual_outputs = []
-                    for seq_idx, seq in enumerate(chunk):
-                        try:
-                            with torch.no_grad():
-                                single_batch = self.batch_converter([(f"seq{seq_idx}", seq)])
-                                _, _, single_tokens = single_batch
-                                single_tokens = single_tokens.to(DEVICE)
+            except Exception as e:
+                print(f"\nError processing batch {batch_idx + 1}: {e},processing current batch sequences individually.")
+                for i in batch_indices:
+                    try:
+                        single_seq = [(f"seq{i}", seqs[i])]
+                        single_labels, single_strs, single_tokens = self.batch_converter(single_seq)
+                        single_tokens = single_tokens.cuda()
 
-                                with torch.amp.autocast("cuda", enabled=False):
-                                    if hasattr(self.model, "module"):
-                                        single_out = self.model(
-                                            tokens=single_tokens,
-                                            repr_layers=[33],
-                                            return_contacts=False,
-                                        )["representations"][33]
-                                    else:
-                                        single_out = self.model(
-                                            tokens=single_tokens,
-                                            repr_layers=[33],
-                                            return_contacts=False,
-                                        )["representations"][33]
+                        with torch.no_grad():
+                            results = self.model(single_tokens, repr_layers=[33], return_contacts=True)
+                            embedding = results["representations"][33].float()
+                            
+                            # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
+                            mask = (single_tokens != 1)  # 1 is usually the padding index for ESM
+                            mask = mask[:, 1:-1]  # Remove BOS/EOS if present
+                            embedding = embedding[:, 1:-1, :]  # Remove BOS/EOS if present
 
-                                single_mask = (single_tokens == self.alphabet.padding_idx)
-                                single_out_masked = single_out.masked_fill(single_mask.unsqueeze(-1), 0.0)
-                                single_lengths = (~single_mask).sum(dim=1, keepdim=True).float()
-                                single_pooled = single_out_masked.sum(dim=1) / single_lengths.clamp(min=1)
+                            length = mask.sum(dim=1, keepdim=True)
+                            pooled = (embedding * mask.unsqueeze(-1)).sum(dim=1) / length
+                            pooled = pooled.cpu()  # Move to CPU
 
-                                individual_outputs.append(single_pooled.cpu().float())
+                            all_embeddings.append(pooled)
 
-                                del single_out, single_out_masked, single_mask, single_lengths, single_tokens
-                                torch.cuda.empty_cache()
+                    except Exception as single_e:
+                        print(f"Error processing sequence {i}: {single_e}")
+                        # Add a zero embedding as placeholder to maintain tensor dimensions
+                        zero_embedding = torch.zeros(1, 1280)  # ESM2-650M embedding dimension
+                        all_embeddings.append(zero_embedding)
+                        print(f"Added zero embedding for failed sequence {i}")
 
-                        except Exception as single_e:
-                            print(f"Failed single sequence {seq_idx}: {single_e}")
-                            dummy = torch.zeros((1, 1280), dtype=torch.float32)
-                            individual_outputs.append(dummy)
 
-                    if individual_outputs:
-                        batch_tensor = torch.cat(individual_outputs, dim=0)
-                        all_outputs.append(batch_tensor)
 
-                else:
-                    print(f"Non-OOM error in batch {batch_idx}: {e}")
-                    print("Hint: Set environment variable `CUDA_LAUNCH_BLOCKING=1` for detailed error trace.")
-                    dummy_batch = torch.zeros((len(chunk), 1280), dtype=torch.float32)
-                    all_outputs.append(dummy_batch)
+        return torch.cat(all_embeddings, dim=0)
 
-            batch_time = time.time() - batch_start_time
-            batch_times.append(batch_time)
-
-        if all_outputs:
-            print("\nConcatenating embeddings on CPU...")
-            embeddings = torch.cat(all_outputs, dim=0)
-        else:
-            embeddings = torch.zeros((len(seqs), 1280), dtype=torch.float32)
-
-        total_embed_time = time.time() - embed_start_time
-        print(f"\n=== Embedding Generation Summary ===")
-        print(f"Total time: {total_embed_time:.2f}s ({total_embed_time / 60:.2f}min)")
-        print(f"Sequences per second: {len(seqs) / total_embed_time:.2f}")
-        print("=====================================\n")
-
-        return embeddings
 
     
 
@@ -499,7 +480,7 @@ def main(Final_training=False):
         val_ds = TensorDataset(val_embeddings, val_labels)
 
     else:
-        esm_data = ESMDataset()
+        esm_data = ESMDataset(FSDP_used=False)
 
         train_embeddings = esm_data.train_embeddings
         train_labels = esm_data.train_labels
@@ -546,7 +527,7 @@ def main(Final_training=False):
 
         n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
         hidden_dims = [
-            n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 10))
+            n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 4))
         ]
 
         drop = trial.suggest_float("dropout", 0.1, 0.5)
@@ -603,8 +584,8 @@ def main(Final_training=False):
         trainer = pl.Trainer(
             max_epochs=150,
             accelerator="gpu",
-            devices=1,  
-            # strategy="auto", 
+            devices=-1,  
+            strategy="auto", 
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
