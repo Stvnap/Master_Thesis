@@ -17,7 +17,13 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchmetrics import Precision, Recall
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
-torch.set_float32_matmul_precision("medium")
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True 
 torch.backends.cuda.matmul.allow_tf32 = (
     True 
@@ -30,8 +36,10 @@ torch.backends.cudnn.allow_tf32 = True
 CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_uncut_shuffled.csv"
 CATEGORY_COL = "categories"
 SEQUENCE_COL = "Sequences"
-CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_uncut_shuffled.pkl"
-PROJECT_NAME = "Optuna_10d_uncut"
+CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_uncut_shuffled_8M.pkl"
+PROJECT_NAME = "Optuna_10d_uncut_t6"
+
+ESM_MODEL = "esm2_t6_8M_UR50D"
 
 
 NUM_CLASSES = 11
@@ -39,14 +47,14 @@ TRAIN_FRAC = 0.7
 VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 
-EMB_BATCH = 3
-NUM_WORKERS_EMB = max(16, os.cpu_count())
+EMB_BATCH = 6
+NUM_WORKERS_EMB = 0 #max(16, os.cpu_count())
 print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 128
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
-STUDY_N_TRIALS = 30
+STUDY_N_TRIALS = 1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -324,12 +332,19 @@ class ESMDataset:
  
     def esm_loader(self):
         # init the distributed world with world_size 1
-        if not torch.distributed.is_initialized():        
-            url = "tcp://localhost:62432"
-            torch.distributed.init_process_group(backend="nccl", init_method=url, world_size=1, rank=0)
 
-        # download model data from the hub
-        model_name = "esm2_t33_650M_UR50D"
+
+
+        #download model data from the hub
+        model_name = ESM_MODEL
+
+        self.model_layers = int(model_name.split("_")[1][1:])
+        print(f"Loading ESM model: {model_name} with {self.model_layers} layers")
+
+
+
+
+
         model_data, regression_data = esm.pretrained._download_model_and_regression_data(model_name)
 
 
@@ -359,11 +374,25 @@ class ESMDataset:
 
 
         else:
-            model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    
+
+
+            model, alphabet = getattr(esm.pretrained, model_name)()
             batch_converter = alphabet.get_batch_converter()
             model.eval()  # disables dropout for deterministic results
-            model=model.cuda()  # Move model to GPU if available
-            model=model.half()
+
+
+            #torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+            #dist.init_process_group("nccl")
+            #rank = dist.get_rank()
+            #print(f"Start running basic DDP example on rank {rank}.")
+            # create model and move it to GPU with id rank
+            #device_id = rank % torch.cuda.device_count()
+            model = model.cuda()
+
+            #model = DDP(model, device_ids=[device_id])
+
+            model = model.half()
 
 
         return model, batch_converter
@@ -373,6 +402,10 @@ class ESMDataset:
         """
         Generate embeddings for a list of sequences using ESM model.
         """
+
+
+
+
         all_embeddings = []
         seqs = list(seqs)  # Ensure it's a list
 
@@ -394,8 +427,8 @@ class ESMDataset:
                 batch_tokens = batch_tokens.cuda()
                 
                 with torch.no_grad():
-                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=True)
-                    embeddings = results["representations"][33].float()
+                    results = self.model(batch_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                    embeddings = results["representations"][self.model_layers].float()
 
                     # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
                     mask = (batch_tokens != 1)  # 1 is usually the padding index for ESM
@@ -427,7 +460,7 @@ class ESMDataset:
 
 
             except Exception as e:
-                print(f"\nError processing batch {batch_idx + 1}: {e},processing current batch sequences individually.")
+                print(f"\nError processing batch {batch_idx + 1}: {e},\nprocessing current batch sequences individually.")
                 for i in batch_indices:
                     try:
                         single_seq = [(f"seq{i}", seqs[i])]
@@ -435,8 +468,8 @@ class ESMDataset:
                         single_tokens = single_tokens.cuda()
 
                         with torch.no_grad():
-                            results = self.model(single_tokens, repr_layers=[33], return_contacts=True)
-                            embedding = results["representations"][33].float()
+                            results = self.model(single_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                            embedding = results["representations"][self.model_layers].float()
                             
                             # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
                             mask = (single_tokens != 1)  # 1 is usually the padding index for ESM

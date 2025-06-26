@@ -21,7 +21,7 @@ from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
 from torch.nn.parallel import DistributedDataParallel as DDP
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
-
+torch.set_float32_matmul_precision('high')
 # -------------------------
 # 1. GLobal settings
 # -------------------------
@@ -33,10 +33,12 @@ MODEL_PATH = "./models/Optuna_10d_uncut_10000.pt"
 CACHE_PATH = "./pickle/Predicer_embeddings_10d_150w_shuffled.pkl"
 TENSBORBOARD_LOG_DIR = "./models/10d_uncut_logs"
 
+ESM_MODEL= "esm2_t6_8M_UR50D"
+
 
 NUM_CLASSES = 11
 BATCH_SIZE = 128
-EMB_BATCH = 16
+EMB_BATCH = 300
 NUM_WORKERS = max(16, os.cpu_count())
 NUM_WORKERS_EMB = max(16, os.cpu_count())
 
@@ -117,7 +119,16 @@ class ESMDataset:
             torch.distributed.init_process_group(backend="nccl", init_method=url, world_size=1, rank=0)
 
         # download model data from the hub
-        model_name = "esm2_t33_650M_UR50D"
+        model_name = ESM_MODEL
+
+        self.model_layers = int(model_name.split("_")[1][1:])
+        print(f"Loading ESM model: {model_name} with {self.model_layers} layers")
+
+
+
+
+
+
         model_data, regression_data = esm.pretrained._download_model_and_regression_data(model_name)
 
 
@@ -147,11 +158,12 @@ class ESMDataset:
 
 
         else:
-            model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            model, alphabet = getattr(esm.pretrained, model_name)()
             batch_converter = alphabet.get_batch_converter()
             model.eval()  # disables dropout for deterministic results
             model=model.cuda()  # Move model to GPU if available
             model=model.half()
+            #model=torch.compile(model)
 
 
         return model, batch_converter
@@ -182,8 +194,8 @@ class ESMDataset:
                 batch_tokens = batch_tokens.cuda()
                 
                 with torch.no_grad():
-                    results = self.model(batch_tokens, repr_layers=[33], return_contacts=True)
-                    embeddings = results["representations"][33].float()
+                    results = self.model(batch_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                    embeddings = results["representations"][self.model_layers].float()
 
                     # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
                     mask = (batch_tokens != 1)  # 1 is usually the padding index for ESM
@@ -223,8 +235,8 @@ class ESMDataset:
                         single_tokens = single_tokens.cuda()
 
                         with torch.no_grad():
-                            results = self.model(single_tokens, repr_layers=[33], return_contacts=True)
-                            embedding = results["representations"][33].float()
+                            results = self.model(single_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                            embedding = results["representations"][self.model_layers].float()
                             
                             # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
                             mask = (single_tokens != 1)  # 1 is usually the padding index for ESM
