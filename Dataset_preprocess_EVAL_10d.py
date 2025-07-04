@@ -21,7 +21,7 @@ import pandas as pd
 from Bio import SeqIO
 
 
-ENDFILENAME= "DataEvalSwissPro_esm_10d_150w_100%"
+ENDFILENAME= "DataEvalSwissPro_esm_10d_150w"
 
 
 class DomainProcessing:
@@ -441,7 +441,7 @@ class databaseCreater:
 
             if category_index % 10000 == 0:
                 print(
-                    "Multiplication iteration:", category_index, "/", len(seqarray_full)
+                    "Multiplication iteration:", category_index, "/", len(seqarray_full), end="\r", flush=True
                 )
 
         # Convert once to DataFrame at the end
@@ -483,7 +483,7 @@ class databaseCreater:
 
         for idx in range(n):
             if idx % 100000 == 0 and idx > 0:
-                print(f"Overlap check iteration: {idx}/{n}")
+                print(f"OverlapCalculater iteration: {idx}/{n}", end="\r", flush=True)
 
             try:
                 row = seqarray_multiplied.iloc[idx]
@@ -510,9 +510,12 @@ class databaseCreater:
                     val = round(max_overlap_pct, 4)
 
                 overlaps.append(val)
+
+
+
                 # Set category to 11 if overlap <= 0.7, else keep original
-                if max_overlap_pct < 1:
-                    seqarray_multiplied.iloc[idx, seqarray_multiplied.columns.get_loc("categories")] = 11
+                # if max_overlap_pct < 1:
+                #     seqarray_multiplied.iloc[idx, seqarray_multiplied.columns.get_loc("categories")] = 11
 
             except Exception:
                 overlaps.append(0.0)

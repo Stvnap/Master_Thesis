@@ -305,6 +305,6 @@ class Starter:
 if __name__ == "__main__":
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
 
-    run = Starter(dimension=2)
+    run = Starter(dimension=1)
 
     run.tuner("HPsearch2d_Home")

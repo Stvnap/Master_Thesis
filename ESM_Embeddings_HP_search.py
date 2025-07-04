@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+os.environ["NCCL_P2P_DISABLE"] = "1"
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True 
@@ -48,13 +49,13 @@ VAL_FRAC = 0.15
 TEST_FRAC = 0.15
 
 EMB_BATCH = 6
-NUM_WORKERS_EMB = 0 #max(16, os.cpu_count())
+NUM_WORKERS_EMB = max(16, os.cpu_count())
 print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
-STUDY_N_TRIALS = 1
+STUDY_N_TRIALS = 0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -376,23 +377,23 @@ class ESMDataset:
         else:
     
 
-
             model, alphabet = getattr(esm.pretrained, model_name)()
             batch_converter = alphabet.get_batch_converter()
             model.eval()  # disables dropout for deterministic results
 
 
-            #torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-            #dist.init_process_group("nccl")
-            #rank = dist.get_rank()
-            #print(f"Start running basic DDP example on rank {rank}.")
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+            dist.init_process_group("nccl")
+            rank = dist.get_rank()
+            print(f"Start running basic DDP example on rank {rank}.")
             # create model and move it to GPU with id rank
-            #device_id = rank % torch.cuda.device_count()
+            device_id = rank % torch.cuda.device_count()
+
             model = model.cuda()
 
-            #model = DDP(model, device_ids=[device_id])
-
             model = model.half()
+
+            model = DDP(model, device_ids=[device_id])
 
 
         return model, batch_converter
@@ -404,7 +405,17 @@ class ESMDataset:
         """
 
 
-
+        # Determine the correct embedding dimension from the model
+        # For ESM2 models: t6=320, t12=480, t30=640, t33=1280, t36=2560, t48=5120
+        model_dims = {
+            "esm2_t6_8M_UR50D": 320,
+            "esm2_t12_35M_UR50D": 480,
+            "esm2_t30_150M_UR50D": 640,
+            "esm2_t33_650M_UR50D": 1280,
+            "esm2_t36_3B_UR50D": 2560,
+            "esm2_t48_15B_UR50D": 5120,
+        }
+        expected_dim = model_dims.get(ESM_MODEL, None) 
 
         all_embeddings = []
         seqs = list(seqs)  # Ensure it's a list
@@ -412,6 +423,7 @@ class ESMDataset:
         total_batches = math.ceil(len(seqs) / EMB_BATCH)
         start_time = time.time()
         print(f"Starting embedding generation for {len(seqs)} sequences in {total_batches} batches...")
+        print(f"Expected embedding dimension: {expected_dim}")
 
         for batch_idx, batch_indices in enumerate(DataLoader(
             range(len(seqs)),
@@ -485,9 +497,9 @@ class ESMDataset:
                     except Exception as single_e:
                         print(f"Error processing sequence {i}: {single_e}")
                         # Add a zero embedding as placeholder to maintain tensor dimensions
-                        zero_embedding = torch.zeros(1, 1280)  # ESM2-650M embedding dimension
+                        zero_embedding = torch.zeros(1, expected_dim)  # ESM2-650M embedding dimension
                         all_embeddings.append(zero_embedding)
-                        print(f"Added zero embedding for failed sequence {i}")
+                        print(f"Added zero embedding with dimension {expected_dim} for failed sequence {i}")
 
 
 
