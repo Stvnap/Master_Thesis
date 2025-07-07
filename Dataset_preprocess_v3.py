@@ -6,8 +6,8 @@ import time
 import gc
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
-CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_sprot.csv"
-OUTPUT_PATH = "./FoundEntries.csv"
+CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_trembl.csv"
+OUTPUT_PATH = "./Dataframes/v3/FoundEntriesTrembl.csv"
 
 
 
@@ -269,9 +269,6 @@ class DatasetPreprocessor:
             if not os.path.exists(self.input_path_csv):
                 raise FileNotFoundError(f"CSV file not found: {self.input_path_csv}")
 
-            # Ensure output directory exists
-            # os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
             # Create a dictionary for O(1) lookup
             sequence_dict = {}
             for row in self.compare_frame.iter_rows():
@@ -279,22 +276,33 @@ class DatasetPreprocessor:
                 sequence = row[1]  
                 sequence_dict[entry_id] = sequence
 
-            # Extend entries with sequences
+            # Flatten the nested structure and extend with sequences
+            flattened_entries = []
             for entry in self.all_list:
-                entry_id = entry[2]
-                if entry_id in sequence_dict:
-                    entry.append(sequence_dict[entry_id])
-                else:
-                    entry.append(None)
+                entry_id = entry['id']  # Use dictionary key instead of index
+                sequence = sequence_dict.get(entry_id, None)
+                
+                # Create rows for each lcn_data entry
+                for lcn in entry['lcn_data']:
+                    flattened_entries.append([
+                        lcn['start'],
+                        lcn['end'], 
+                        entry_id,
+                        lcn['match_id'],
+                        sequence
+                    ])
 
             # Convert to DataFrame
-            self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id", "Sequence"])
-            print(f"Extended entries with sequences, total entries: {len(self.df)}")
+            if flattened_entries:
+                self.df = pl.DataFrame(flattened_entries, schema=["start", "end", "id", "Pfam_id", "Sequence"])
+                print(f"Extended entries with sequences, total entries: {len(self.df)}")
 
-            # Save to CSV
-            self.df.write_csv(output_path)
-            print(f"Successfully saved {len(self.all_list)} entries to {output_path}")
-            
+                # Save to CSV
+                self.df.write_csv(output_path)
+                print(f"Successfully saved {len(flattened_entries)} entries to {output_path}")
+            else:
+                print("No entries to save after flattening.")
+                
         except Exception as e:
             print(f"Error in extend_with_seq: {e}")
             import traceback

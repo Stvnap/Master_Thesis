@@ -31,31 +31,36 @@ torch.backends.cuda.matmul.allow_tf32 = (
 )
 torch.backends.cudnn.allow_tf32 = True
 
+
+pd.set_option('display.max_rows', None)
+# pd.set_option('display.max_columns', None)
+# pd.set_option('display.width', None)
+# pd.set_option('display.max_colwidth', None)
 # -------------------------
 # 1. Global settings
 # -------------------------
-CSV_PATH = "./Dataframes/DataTrainSwissPro_esm_10d_uncut_shuffled.csv"
-CATEGORY_COL = "categories"
-SEQUENCE_COL = "Sequences"
-CACHE_PATH = "./pickle/DataTrainSwissPro_esm_10d_uncut_shuffled_8M.pkl"
-PROJECT_NAME = "Optuna_10d_uncut_t6"
+CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
+CATEGORY_COL = "Pfam_id"
+SEQUENCE_COL = "Sequence"
+CACHE_PATH = "./pickle/FoundEntriesSwissProteins_100d.pkl"
+PROJECT_NAME = "Optuna_100d_uncut_t33"
 
-ESM_MODEL = "esm2_t6_8M_UR50D"
+ESM_MODEL = "esm2_t33_650M_UR50D"
 
 
-NUM_CLASSES = 11
-TRAIN_FRAC = 0.7
-VAL_FRAC = 0.15
-TEST_FRAC = 0.15
+NUM_CLASSES = 101  # 100 Pfam classes + 1 for "other" category
+TRAIN_FRAC = 0.6
+VAL_FRAC = 0.2
+TEST_FRAC = 0.2
 
-EMB_BATCH = 6
+EMB_BATCH = 1
 NUM_WORKERS_EMB = max(16, os.cpu_count())
 print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 64
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
-STUDY_N_TRIALS = 0
+STUDY_N_TRIALS = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -250,31 +255,130 @@ class SeqDataset(Dataset):
         return self.seqs[idx]
 
 class ESMDataset:
-    def __init__(self, skip_df=None,FSDP_used=False):
+    def __init__(self, skip_df=None,FSDP_used=False,domain_boundary_detection=False,num_classes=NUM_CLASSES,esm_model=ESM_MODEL, csv_path=CSV_PATH, category_col=CATEGORY_COL, sequence_col=SEQUENCE_COL):
+        self.esm_model=esm_model
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
             # Classes 0-9 get mapped to 1-10
             # Classes 10 and 11 get mapped to 0
-            if cat <= NUM_CLASSES - 2:
+            if cat <= num_classes - 2:
                 return cat + 1
             else:
                 return 0
 
+
+        def minicutter(row):
+            # reads in start, end values to cut the sequence
+                sequence = row[sequence_col]
+                start = int(row["start"])
+                end = int(row["end"])
+                return sequence[start:end]
+
+
         if skip_df is None:
-            df = pd.read_csv(CSV_PATH)
-            df["label"] = df[CATEGORY_COL].apply(map_label)
-            df.drop(columns=[CATEGORY_COL], inplace=True)
+            df = pd.read_csv(csv_path)
+            if "start" in df.columns and "end" in df.columns and domain_boundary_detection is False:
+                print("Cutting sequences based on start and end positions")
+                df[sequence_col] = df.apply(minicutter, axis=1)
+            if category_col != "Pfam_id":
+                df["label"] = df[category_col].apply(map_label)
+            elif domain_boundary_detection is False:
+
+                # Create mapping once outside the apply function
+                unique_pfam_ids = df[category_col].unique()
+
+                # Define the specific 10 Pfam IDs you want to use first
+                priority_pfam_ids = [
+                    "PF00177", "PF00210", "PF00211", "PF00215", "PF00217",
+                    "PF00406", "PF00303", "PF00246", "PF00457", "PF00502"
+                ]
+
+                # Filter priority IDs that actually exist in the dataset
+                available_priority_ids = [pid for pid in priority_pfam_ids if pid in unique_pfam_ids]
+
+                # Get remaining IDs (excluding the priority ones)
+                remaining_ids = [pid for pid in unique_pfam_ids if pid not in priority_pfam_ids]
+
+                # Sort remaining IDs for deterministic behavior
+                remaining_ids = sorted(remaining_ids)
+
+                # Take up to 90 additional IDs to reach NUM_CLASSES-1 total
+                max_additional_ids = num_classes - 1 - len(available_priority_ids)
+                selected_remaining_ids = remaining_ids[:max_additional_ids]
+
+                # Combine priority IDs with selected remaining IDs
+                selected_ids = available_priority_ids + selected_remaining_ids
+
+                pfam_to_label = {}
+                # Map the selected IDs to labels 1 through len(selected_ids)
+                for i, pfam_id in enumerate(selected_ids):
+                    pfam_to_label[pfam_id] = i + 1
+
+                # Map all other IDs to label 0
+                for pfam_id in unique_pfam_ids:
+                    if pfam_id not in pfam_to_label:
+                        pfam_to_label[pfam_id] = 0
+
+                # Use map instead of apply for better performance
+                df["label"] = df[category_col].map(pfam_to_label).fillna(0)
+
+                print(f"Priority Pfam IDs found in dataset: {len(available_priority_ids)}")
+                print(f"Additional Pfam IDs selected: {len(selected_remaining_ids)}")
+                print(f"Total IDs with non-zero labels: {len(selected_ids)}")
+                # Additional verification: Show mapping for all priority IDs found
+                print("\nPriority Pfam ID mappings:")
+                for i, pfam_id in enumerate(available_priority_ids):
+                    label = pfam_to_label[pfam_id]
+                    count = len(df[df[category_col] == pfam_id])
+                    print(f"{pfam_id}: label {label}, {count} sequences")
+
+            if category_col != "Pfam_id":
+                df.drop(columns=[category_col], inplace=True)
+            else:
+                if domain_boundary_detection is False:
+                    df.drop(columns=["start", "end","id","Pfam_id"], inplace=True)
+                else:   
+                    df.drop(columns=["id","Pfam_id"], inplace=True)
             self.df = df
             print("Data loaded")
         else:
             self.df = skip_df
+        
+                
+
+        print(self.df.head(150))
 
         self.FSDP_used = FSDP_used
 
         self.model, self.batch_converter = self.esm_loader()
 
         # Use sequences in original order
-        sequences = self.df[SEQUENCE_COL].tolist()
+        sequences = self.df[sequence_col].tolist()
+
+
+        if domain_boundary_detection is False:
+
+            self.labels = torch.tensor(self.df["label"].values, dtype=torch.long)
+
+
+        else:
+            #Switching labels for domain boundary detection
+            print("Switching labels for domain boundary detection")
+            labels_list = []
+            for index, row in self.df.iterrows():
+                seq_len = len(row[sequence_col])
+                label = [0] * seq_len
+                start = int(row["start"])
+                end = int(row["end"])
+                if start < seq_len:
+                    label[start] = 1
+                if end < seq_len:
+                    label[end] = 1
+                labels_list.append(torch.tensor(label, dtype=torch.long))
+            
+            self.labels = labels_list  # Store as list of tensors
+            print(self.labels[:5])  # Print first 5 labels for verification
+
 
         start_time = time.time()
 
@@ -291,10 +395,8 @@ class ESMDataset:
         print(
             f"Time per sequence: {embedding_time / len(sequences):.4f} seconds"
         )
-        print(f"Sequences per second: {len(sequences) / embedding_time:.2f}")
+        print(f"Sequences per second: {len(sequences) / embedding_time:.2f}")          
 
-        # No need to restore order since we didn't sort
-        self.labels = torch.tensor(self.df["label"].values, dtype=torch.long)
 
         # Add stratified train/val split using scikit-learn
         print("Creating stratified train/val split...")
@@ -337,7 +439,7 @@ class ESMDataset:
 
 
         #download model data from the hub
-        model_name = ESM_MODEL
+        model_name = self.esm_model
 
         self.model_layers = int(model_name.split("_")[1][1:])
         print(f"Loading ESM model: {model_name} with {self.model_layers} layers")
@@ -377,13 +479,16 @@ class ESMDataset:
         else:
     
 
+
             model, alphabet = getattr(esm.pretrained, model_name)()
             batch_converter = alphabet.get_batch_converter()
             model.eval()  # disables dropout for deterministic results
 
 
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-            dist.init_process_group("nccl")
+            if not dist.is_initialized():
+                print("Initializing process group for DDP")
+                dist.init_process_group("nccl")
             rank = dist.get_rank()
             print(f"Start running basic DDP example on rank {rank}.")
             # create model and move it to GPU with id rank
@@ -394,7 +499,6 @@ class ESMDataset:
             model = model.half()
 
             model = DDP(model, device_ids=[device_id])
-
 
         return model, batch_converter
    
@@ -415,7 +519,7 @@ class ESMDataset:
             "esm2_t36_3B_UR50D": 2560,
             "esm2_t48_15B_UR50D": 5120,
         }
-        expected_dim = model_dims.get(ESM_MODEL, None) 
+        expected_dim = model_dims.get(self.esm_model, None) 
 
         all_embeddings = []
         seqs = list(seqs)  # Ensure it's a list
@@ -439,7 +543,7 @@ class ESMDataset:
                 batch_tokens = batch_tokens.cuda()
                 
                 with torch.no_grad():
-                    results = self.model(batch_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                    results = self.model(batch_tokens, repr_layers=[self.model_layers], return_contacts=False)
                     embeddings = results["representations"][self.model_layers].float()
 
                     # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
@@ -480,7 +584,7 @@ class ESMDataset:
                         single_tokens = single_tokens.cuda()
 
                         with torch.no_grad():
-                            results = self.model(single_tokens, repr_layers=[self.model_layers], return_contacts=True)
+                            results = self.model(single_tokens, repr_layers=[self.model_layers], return_contacts=False)
                             embedding = results["representations"][self.model_layers].float()
                             
                             # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
@@ -513,8 +617,8 @@ class ESMDataset:
 # -------------------------
 def main(Final_training=False):
     os.makedirs("pickle", exist_ok=True)
-    os.makedirs(f"logs/{PROJECT_NAME}", exist_ok=True)  # Add this line
-    os.makedirs("models", exist_ok=True)  # Add this line for model saving
+    os.makedirs(f"logs/{PROJECT_NAME}", exist_ok=True)  
+    os.makedirs("models", exist_ok=True)  
 
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "rb") as f:
@@ -565,7 +669,6 @@ def main(Final_training=False):
         
         
         ngpus = torch.cuda.device_count()
-        # `trial.number` is unique per trial, so this will cycle 0,1,2,…,ngpus-1,0,1,…
         my_gpu = trial.number % ngpus  
         os.environ["CUDA_VISIBLE_DEVICES"] = str(my_gpu)
 
