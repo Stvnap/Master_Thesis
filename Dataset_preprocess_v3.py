@@ -7,7 +7,7 @@ import gc
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
 CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_trembl.csv"
-OUTPUT_PATH = "./Dataframes/v3/FoundEntriesTrembl.csv"
+OUTPUT_PATH = "./Dataframes/v3/FoundEntriesTremblProteins.csv"
 
 
 
@@ -15,6 +15,10 @@ class DatasetPreprocessor:
     def __init__(self, input_path_xml, input_path_csv):
         self.input_path_xml = input_path_xml
         self.input_path_csv = input_path_csv
+
+        if os.path.exists(OUTPUT_PATH):
+            print(f"Output path {OUTPUT_PATH} already exists. Please remove it before running the script.")
+            return
 
         list_ids, list_seq = self._load_in_csv()
         

@@ -1,9 +1,17 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import os
+import math
 import pickle
-from ESM_Embeddings_HP_search import ESMDataset
+import optuna
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from sklearn.metrics import accuracy_score
+from ESM_Embeddings_HP_search import ESMDataset, LitClassifier
+from ESM_Embeddings_HP_search import objective,load_best_model
 
 
 # -------------------------
@@ -18,8 +26,11 @@ PROJECT_NAME = "Optuna_100d_uncut_t33"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
+NUM_LAYERS = 6
+NUM_HEADS = 8
 
-NUM_CLASSES = 101  # 100 Pfam classes + 1 for "other" category
+
+NUM_CLASSES = 2
 TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
@@ -38,7 +49,113 @@ print(f"Using device: {DEVICE}")
 
 
 # -------------------------
-# 2. MAIN
+# 2. Transformer MODEL
+# -------------------------
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dims,
+        num_classes,
+        num_heads,
+        dropout,
+        activation,
+        kernel_init,
+    ):
+        super(Transformer, self).__init__()
+        self.num_classes = num_classes
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.activation = activation
+        self.kernel_init = kernel_init
+
+        model_dims = {
+            "esm2_t6_8M_UR50D": 320,
+            "esm2_t12_35M_UR50D": 480,
+            "esm2_t30_150M_UR50D": 640,
+            "esm2_t33_650M_UR50D": 1280,
+            "esm2_t36_3B_UR50D": 2560,
+            "esm2_t48_15B_UR50D": 5120,
+        }
+        expected_dim = model_dims.get(ESM_MODEL, None) 
+        self.input_dim = expected_dim
+        self.hidden_dims = expected_dim
+
+        assert hidden_dims % num_heads == 0, "Hidden dim must be divisible by num heads"
+        
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dims),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dims, num_classes)
+        )
+
+
+        self.encoder = nn.TransformerEncoder(
+            self.encoder_layer(input_dim, hidden_dims, num_heads, dropout, activation),
+            num_layers=NUM_LAYERS)
+        
+        
+        self.positional_encoding(input_dim, hidden_dims)
+
+    # ATTENTION MASKING & PADDING:
+    # not learn from future tokens,  ie squae masker
+    def square_mask(self,size):
+        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
+        return mask
+
+    # padding tokens are ignored
+    def padding_mask(self,seq, pad_token=0):
+        mask = (seq != pad_token).unsqueeze(1).unsqueeze(2)
+        return mask
+
+    # POSITIONAL ENCODING:
+    # add a order so the model knows how to read it
+    def positional_encoding(self,seq_len, d_model):
+        # self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(seq_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(seq_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+
+
+    # ENCODER:
+    # the part that encodes the input sequence into a fixed-size representation
+    def encoder_layer(self,input_dim, hidden_dims, num_heads, dropout, activation):
+        return nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dims,
+            dropout=dropout,
+            activation=activation,
+        )
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]          # positional encoding
+        mask = (x.abs().sum(dim=-1) != 0)       # create mask for padding tokens  
+        src_key_padding_mask = ~mask            # padding mask for encoder
+
+        x = x.transpose(0, 1)  # (seq_len, batch_size, input_dim) -> (batch_size, seq_len, input_dim)
+        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # actual padding mask
+        x = x.transpose(0, 1)  # (batch_size, seq_len, input_dim) -> (seq_len, batch_size, input_dim) \back
+
+        logits = self.classifier(x) 
+
+        return logits,mask
+
+
+# -------------------------
+# 3. TRAINER
+# -------------------------
+
+# -------------------------
+# 4. MAIN
 # -------------------------
 
 def main(Final_training=False):
@@ -55,7 +172,7 @@ def main(Final_training=False):
         val_ds = TensorDataset(val_embeddings, val_labels)
 
     else:
-        esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=True,num_classes=NUM_CLASSES,esm_model=ESM_MODEL, csv_path=CSV_PATH, category_col=CATEGORY_COL, sequence_col=SEQUENCE_COL)
+        esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=True)
 
         train_embeddings = esm_data.train_embeddings
         train_labels = esm_data.train_labels
@@ -91,6 +208,68 @@ def main(Final_training=False):
     )
     print("Val loader created")
 
+    study = optuna.create_study(
+        direction="minimize",
+        storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+        load_if_exists=True,
+        study_name=PROJECT_NAME,
+    )
+
+    def objective_wrapper(trial):
+        return objective(trial, train_embeddings, train_loader, val_loader, weights,domain_task=True)
+    study.optimize(objective_wrapper, n_trials=STUDY_N_TRIALS,)
+
+    print("Best trial number:", study.best_trial.number)
+    print("Best trial:", study.best_trial)
+    # print("Best trial params:", study.best_trial.params)
+
+    best_trial = study.best_trial
+
+
+    lit_model = load_best_model(best_trial, train_embeddings, weights)
+
+    lit_model.eval()
+    print("Best model loaded and set to eval mode")
+
+    # Evaluate on validation set
+    device = lit_model.device
+    with torch.no_grad():
+        val_embeddings_gpu = val_embeddings.to(device)  # Use different variable name
+        val_logits = lit_model(val_embeddings_gpu)
+    val_preds = val_logits.argmax(dim=1).cpu().numpy()
+    val_true = val_labels.numpy()
+
+    acc = accuracy_score(val_true, val_preds)
+    print(f"Validation Accuracy: {acc:.4f}")
+
+    if Final_training is True:
+        early_stop = EarlyStopping(
+            monitor="val_loss", patience=10, mode="min", verbose=True
+        )
+        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+
+        print("Lit model created")
+        trainer = pl.Trainer(
+            max_epochs=50,
+            accelerator="gpu",
+            devices=1,
+            # strategy="ddp",
+            enable_progress_bar=True,
+            callbacks=[early_stop, checkpoint_callback],
+            logger=TensorBoardLogger(
+                save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
+            ),
+        )
+
+        print("Trainer created")
+
+        trainer.fit(lit_model, train_loader, val_loader)
+
+        # save the final model
+        final_model_path = f"./models/{PROJECT_NAME}.pt"
+        torch.save(lit_model, final_model_path)
+
+#############################################################################################################
 
 if __name__ == "__main__":
     main(Final_training=False)
