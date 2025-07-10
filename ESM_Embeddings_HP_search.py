@@ -65,7 +65,7 @@ TEST_FRAC = 0.2
 EMB_BATCH = 1
 NUM_WORKERS_EMB = max(16, os.cpu_count())
 
-BATCH_SIZE = 512
+BATCH_SIZE = 64
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 150
@@ -134,7 +134,9 @@ class LitClassifier(pl.LightningModule):
         dropout=0.3,
         class_weights=None,
         domain_task=False,
-    ):
+        num_heads=8, 
+        ):
+        
         super().__init__()
         self.save_hyperparameters()
 
@@ -143,21 +145,35 @@ class LitClassifier(pl.LightningModule):
         self.weight_decay = weight_decay
 
         # base model
-        self.model = FFNClassifier(
-            input_dim=input_dim,
-            hidden_dims=hidden_dims,
-            num_classes=num_classes,
-            dropout=dropout,
-            activation=activation,
-            kernel_init=kernel_init,
-        )
         if domain_task is False:
+            self.model = FFNClassifier(
+                input_dim=input_dim,
+                hidden_dims=hidden_dims,
+                num_classes=num_classes,
+                dropout=dropout,
+                activation=activation,
+                kernel_init=kernel_init,
+            )
             if class_weights is not None:
                 self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
             else:
                 self.loss_fn = nn.CrossEntropyLoss()
+
         else:
+            from DomainFinder import Transformer
+            self.model = Transformer(
+                self,
+                input_dim,
+                hidden_dims,
+                num_classes,
+                num_heads,
+                dropout,
+                activation,
+                kernel_init,
+            )
+        
             self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")           # for domain boundary detection
+
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -272,14 +288,15 @@ class LitClassifier(pl.LightningModule):
 # 4. Dataset & embedding
 # -------------------------
 class SeqDataset(Dataset):
-    def __init__(self, seqs):
+    def __init__(self, seqs,labels):
         self.seqs = seqs
+        self.labels = labels
 
     def __len__(self):
         return len(self.seqs)
 
     def __getitem__(self, idx):
-        return self.seqs[idx]
+        return self.seqs[idx], self.labels[idx]
 
 
 class ESMDataset:
@@ -467,11 +484,16 @@ class ESMDataset:
                 labels_list.append(torch.tensor(label, dtype=torch.long))
 
             self.labels = labels_list  # Store as list of tensors
-            print(self.labels[:5])  # Print first 5 labels for verification
+            # print(self.labels[:5])  # Print first 5 labels for verification
+
+        
 
         start_time = time.time()
 
-        self.embeddings = self._embed(sequences).cpu()
+        self.embeddings, self.labels = self._embed(sequences)
+
+        self.embeddings = self.embeddings.cpu()
+        self.labels = self.labels.cpu()
 
         end_time = time.time()
         embedding_time = end_time - start_time
@@ -483,6 +505,21 @@ class ESMDataset:
         )
         print(f"Time per sequence: {embedding_time / len(sequences):.4f} seconds")
         print(f"Sequences per second: {len(sequences) / embedding_time:.2f}")
+
+        if len(self.embeddings) != len(self.labels):
+            if RANK == 0:
+                print(f"WARNING: Number of embeddings does not match number of labels! {len(self.embeddings)} != {len(self.labels)}")
+            if len(self.embeddings) > len(self.labels):
+                self.embeddings = self.embeddings[: len(self.labels)]                       # Discarding last embedding, due to being a duplicate
+                print(f"After fix length: {len(self.embeddings)} == {len(self.labels)}")
+            else:
+                raise ValueError(f"Number of embeddings is less than number of labels! {len(self.embeddings)} < {len(self.labels)}, check your data!")
+
+
+        
+        print(f"{RANK}: embedding 1, label 1: {self.embeddings[0].shape}, {self.labels[0]}")
+        
+
 
         # Add stratified train/val split using scikit-learn
         print("Creating stratified train/val split...")
@@ -585,13 +622,13 @@ class ESMDataset:
         expected_dim = model_dims.get(self.esm_model, None)
 
         all_embeddings = []
+        all_labels = [] 
         seqs = list(seqs)
         
         start_time = time.time()
 
-
-
-        seq_dataset = SeqDataset(seqs)
+        # Use the new dataset that includes labels
+        seq_dataset = SeqDataset(seqs,self.labels)
         sampler = DistributedSampler(
             seq_dataset, 
             num_replicas=dist.get_world_size(), 
@@ -611,11 +648,11 @@ class ESMDataset:
         if RANK == 0:
             print(f"Expected embedding dimension: {expected_dim}")
             print(f"Total sequences to process: {len(seqs)} with batch size {EMB_BATCH}")
-        print(f"Rank:{RANK} will process sequences {sampler.num_samples} out of {len(seqs)} total")
+        print(f"Each Rank will process sequences {sampler.num_samples}")
 
-        for batch_num, batch_seqs in enumerate(dataloader):    
+        for batch_num, (batch_seqs, batch_labels) in enumerate(dataloader):    
             try:
-                # batch_seqs is already a list of sequences from the DataLoader
+                # batch_seqs and batch_labels are now properly paired
                 batch = [(f"seq{i}", seq) for i, seq in enumerate(batch_seqs)]
                 _, _, batch_tokens = self.batch_converter(batch)
                 batch_tokens = batch_tokens.cuda(non_blocking=True)
@@ -635,11 +672,12 @@ class ESMDataset:
 
                     lengths = mask.sum(dim=1, keepdim=True)
                     pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
-                    pooled = pooled.cpu()
+                    pooled = pooled.cpu()  # Move to CPU immediately
 
                     all_embeddings.append(pooled)
+                    all_labels.append(batch_labels)  # Store the corresponding labels
 
-            # Progress reporting (only from rank 0)
+            # Progress reporting
                 if (batch_num % 1 == 0 or batch_num == len(dataloader) - 1):
                     elapsed_time = time.time() - start_time
                     if batch_num > 0:
@@ -651,7 +689,7 @@ class ESMDataset:
                         eta_minutes = int((eta_seconds % 3600) // 60)
                         eta_seconds_remainder = int(eta_seconds % 60)
                         
-                        print(f"Batch {batch_num + 1}/{len(dataloader)} | "
+                        print(f"Rank {RANK}: Batch {batch_num + 1}/{len(dataloader)} | "
                             f"ETA: {eta_hours}h {eta_minutes}m {eta_seconds_remainder}s", 
                             end='\r', flush=True)
 
@@ -660,7 +698,7 @@ class ESMDataset:
             except Exception as e:
                 print(f"\nRank {RANK}: Error processing batch {batch_num + 1}: {e}")
                 # Handle individual sequences...
-                for seq in batch_seqs:
+                for seq, label in zip(batch_seqs, batch_labels):
                     try:
                         single_seq = [(f"seq0", seq)]
                         single_labels, single_strs, single_tokens = self.batch_converter(single_seq)
@@ -683,61 +721,124 @@ class ESMDataset:
                             pooled = pooled.cpu()
 
                             all_embeddings.append(pooled)
+                            all_labels.append(label.unsqueeze(0))  # Keep label paired
 
                     except Exception as single_e:
                         print(f"Rank {RANK}: Error processing individual sequence: {single_e}")
                         zero_embedding = torch.zeros(1, expected_dim)
                         all_embeddings.append(zero_embedding)
+                        all_labels.append(label.unsqueeze(0))  # Still keep the label
 
-        # Concatenate local embeddings
+        # Concatenate local embeddings and labels
         local_embeddings = torch.cat(all_embeddings, dim=0) if all_embeddings else torch.empty(0, expected_dim)
-        print(f"Rank {RANK}: Generated {local_embeddings.size(0)} local embeddings")
+        local_labels = torch.cat(all_labels, dim=0) if all_labels else torch.empty(0, dtype=torch.long)
+        
+        print(f"Rank {RANK}: Generated {local_embeddings.size(0)} local embeddings with {local_labels.size(0)} labels")
 
         # Synchronize all processes
         dist.barrier()
 
-        # Gather embeddings from all processes
+        # Gather both embeddings and labels from all processes
         if dist.get_world_size() > 1:
-            # Get the size of embeddings from each rank
+            # Similar gathering logic but for both embeddings and labels
             local_size = torch.tensor([local_embeddings.size(0)], dtype=torch.int64, device='cuda')
             all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
             dist.all_gather(all_sizes, local_size)
             
-            # Move local embeddings to GPU for gathering
-            local_embeddings_gpu = local_embeddings.cuda()
+            total_size = sum(size.item() for size in all_sizes)
             
-            # Prepare tensors for gathering (pad to max size)
-            max_size = max(size.item() for size in all_sizes)
-            if local_embeddings_gpu.size(0) < max_size:
-                padding = torch.zeros(max_size - local_embeddings_gpu.size(0), expected_dim, 
-                                    device=local_embeddings_gpu.device, dtype=local_embeddings_gpu.dtype)
-                local_embeddings_gpu = torch.cat([local_embeddings_gpu, padding], dim=0)
-            
-            # Gather all embeddings
-            gathered_embeddings = [torch.zeros_like(local_embeddings_gpu) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered_embeddings, local_embeddings_gpu)
-            
-            # Concatenate only the valid portions and move to CPU
             if RANK == 0:
-                final_embeddings_list = []
-                for i, (emb_tensor, size_tensor) in enumerate(zip(gathered_embeddings, all_sizes)):
-                    valid_size = size_tensor.item()
-                    if valid_size > 0:
-                        final_embeddings_list.append(emb_tensor[:valid_size].cpu())
+                final_embeddings = torch.empty(total_size, expected_dim, dtype=torch.float32)
+                final_labels = torch.empty(total_size, dtype=torch.long)
+                current_idx = 0
                 
-                final_embeddings = torch.cat(final_embeddings_list, dim=0) if final_embeddings_list else torch.empty(0, expected_dim)
-                print(f"\nRank 0: Gathered {final_embeddings.size(0)} total embeddings from all ranks")
+                for rank in range(dist.get_world_size()):
+                    rank_size = all_sizes[rank].item()
+                    if rank_size > 0:
+                        if rank == 0:
+                            final_embeddings[current_idx:current_idx + rank_size] = local_embeddings
+                            final_labels[current_idx:current_idx + rank_size] = local_labels
+                        else:
+                            # Receive embeddings
+                            rank_embeddings = torch.empty(rank_size, expected_dim, dtype=torch.float32, device='cuda')
+                            dist.recv(rank_embeddings, src=rank)
+                            final_embeddings[current_idx:current_idx + rank_size] = rank_embeddings.cpu()
+                            
+                            # Receive labels
+                            rank_labels = torch.empty(rank_size, dtype=torch.long, device='cuda')
+                            dist.recv(rank_labels, src=rank)
+                            final_labels[current_idx:current_idx + rank_size] = rank_labels.cpu()
+                            
+                            del rank_embeddings, rank_labels
+                            torch.cuda.empty_cache()
+                        current_idx += rank_size
             else:
+                if local_embeddings.size(0) > 0:
+                    # Send embeddings
+                    local_embeddings_gpu = local_embeddings.cuda()
+                    dist.send(local_embeddings_gpu, dst=0)
+                    del local_embeddings_gpu
+                    
+                    # Send labels
+                    local_labels_gpu = local_labels.cuda()
+                    dist.send(local_labels_gpu, dst=0)
+                    del local_labels_gpu
+                    
+                    torch.cuda.empty_cache()
                 final_embeddings = torch.empty(0, expected_dim)
+                final_labels = torch.empty(0, dtype=torch.long)
             
-            # Clean up GPU memory
-            del local_embeddings_gpu, gathered_embeddings
-            torch.cuda.empty_cache()
+            # Broadcast final data from rank 0 to all ranks
+            if RANK == 0:
+                size_tensor = torch.tensor([final_embeddings.size(0)], device='cuda')
+            else:
+                size_tensor = torch.tensor([0], device='cuda')
+                
+            dist.broadcast(size_tensor, 0)
+            
+            chunk_size = 10000
+            total_size = size_tensor.item()
+            
+            if RANK != 0:
+                final_embeddings = torch.empty(total_size, expected_dim, dtype=torch.float32)
+                final_labels = torch.empty(total_size, dtype=torch.long)
+                
+            for start_idx in range(0, total_size, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_size)
+                chunk_len = end_idx - start_idx
+                
+                # Broadcast embeddings chunk
+                if RANK == 0:
+                    chunk_gpu = final_embeddings[start_idx:end_idx].cuda()
+                else:
+                    chunk_gpu = torch.empty(chunk_len, expected_dim, dtype=torch.float32, device='cuda')
+                    
+                dist.broadcast(chunk_gpu, 0)
+                
+                if RANK != 0:
+                    final_embeddings[start_idx:end_idx] = chunk_gpu.cpu()
+                    
+                del chunk_gpu
+                
+                # Broadcast labels chunk
+                if RANK == 0:
+                    labels_chunk_gpu = final_labels[start_idx:end_idx].cuda()
+                else:
+                    labels_chunk_gpu = torch.empty(chunk_len, dtype=torch.long, device='cuda')
+                    
+                dist.broadcast(labels_chunk_gpu, 0)
+                
+                if RANK != 0:
+                    final_labels[start_idx:end_idx] = labels_chunk_gpu.cpu()
+                    
+                del labels_chunk_gpu
+                torch.cuda.empty_cache()
         else:
             final_embeddings = local_embeddings
+            final_labels = local_labels
 
-        return final_embeddings
-    
+        return final_embeddings, final_labels
+        
 # -------------------------
 # 5. Optuna objective func, load best model func
 # -------------------------
@@ -745,56 +846,157 @@ class ESMDataset:
 def objective(
     trial, train_embeddings, train_loader, val_loader, weights, domain_task=False
 ):
+    if domain_task is False:
+        if RANK == 0:
+            n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
+            hidden_dims = [
+                n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 4))
+            ]
 
-    n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
-    hidden_dims = [
-        n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 4))
-    ]
+            drop = trial.suggest_float("dropout", 0.1, 0.5)
+            lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)  # was 1e-2
+            wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)  # was 1e-2
 
-    drop = trial.suggest_float("dropout", 0.1, 0.5)
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)  # was 1e-2
-    wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)  # was 1e-2
+            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
+            if optimizer == "adam":
+                optimizer_class = torch.optim.Adam
+            elif optimizer == "adamw":
+                optimizer_class = torch.optim.AdamW
+            else:
+                optimizer_class = torch.optim.SGD
 
-    optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
-    if optimizer == "adam":
-        optimizer_class = torch.optim.Adam
-    elif optimizer == "adamw":
-        optimizer_class = torch.optim.AdamW
+            activation = trial.suggest_categorical("activation", ["relu", "gelu", "leaky_relu"])
+            if activation == "relu":
+                activation = nn.ReLU(inplace=True)
+                kernel_init = nn.init.kaiming_normal_
+            elif activation == "gelu":
+                activation = nn.GELU()
+                kernel_init = nn.init.xavier_normal_
+            else:
+                activation = nn.LeakyReLU(inplace=True)
+                kernel_init = nn.init.kaiming_normal_
+
+            print(
+                f"\n=== Trial {trial.number} ===\n"
+                f"Hidden layers: {len(hidden_dims)}, Neurons: {n_neurons}\n"
+                f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
+                f"Optimizer: {optimizer}, Activation: {activation.__class__.__name__}\n"
+                f"========================\n"
+            )
+
+
+
+            params = {
+                "hidden_dims":hidden_dims,
+                "dropout": drop,
+                "lr": lr,
+                "weight_decay": wd,
+                "optimizer_class": optimizer_class,
+                "activation": activation,
+                "kernel_init": kernel_init,
+                "drop": drop,
+                "weights": weights,
+            }
+
+
+        else:
+            params= None
+        
+        params_list = [params]
+        dist.broadcast_object_list(params_list, src=0)
+        params = params_list[0]
+
+
+        model = LitClassifier(
+            input_dim=train_embeddings.size(1),
+            hidden_dims=params["hidden_dims"],
+            num_classes=NUM_CLASSES,
+            optimizer_class=params["optimizer_class"],
+            activation=params["activation"],
+            kernel_init=params["kernel_init"],
+            lr=params["lr"],
+            weight_decay=params["weight_decay"],
+            dropout=params["drop"],
+            class_weights=params["weights"],
+            domain_task=False,  # Set to True if using domain boundary detection
+        )
+
+        # print(model)
+
     else:
-        optimizer_class = torch.optim.SGD
+        # Domain boundary detection task, HPs for Transformer model
+        if RANK == 0:
+            d_model = trial.suggest_categorical(
+                "d_model", [64, 128, 256, 512, 1024, 2048]
+            )
+            n_heads = trial.suggest_categorical("n_heads", [8,12,16,24,32])
+            n_layers = trial.suggest_int("num_hidden_layers", 6, 12,24)
+            d_ff = 4*d_model
+            max_seq_len = trial.suggest_int("max_seq_len", 100, 1000, step=100)
+            
+            drop = trial.suggest_float("dropout", 0.1, 0.5)
+            drop_attn = trial.suggest_float("dropout_attn", 0.1, 0.5)
+            lr = trial.suggest_float("lr", 1e-5, 1e2, log=True)
+            wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
+            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
+            if optimizer == "adam":
+                optimizer_class = torch.optim.Adam
+            elif optimizer == "adamw":
+                optimizer_class = torch.optim.AdamW
+            else:
+                optimizer_class = torch.optim.SGD
 
-    activation = trial.suggest_categorical("activation", ["relu", "gelu", "leaky_relu"])
-    if activation == "relu":
-        activation = nn.ReLU(inplace=True)
-        kernel_init = nn.init.kaiming_normal_
-    elif activation == "gelu":
-        activation = nn.GELU()
-        kernel_init = nn.init.xavier_normal_
-    else:
-        activation = nn.LeakyReLU(inplace=True)
-        kernel_init = nn.init.kaiming_normal_
+            activation = trial.suggest_categorical("activation", ["relu", "gelu", "leaky_relu"])
+            if activation == "relu":
+                activation = nn.ReLU(inplace=True)
+                kernel_init = nn.init.kaiming_normal_
+            elif activation == "gelu":
+                activation = nn.GELU()
+                kernel_init = nn.init.xavier_normal_
+            else:
+                activation = nn.LeakyReLU(inplace=True)
+                kernel_init = nn.init.kaiming_normal_
 
-    print(
-        f"\n=== Trial {trial.number} ===\n"
-        f"Hidden layers: {len(hidden_dims)}, Neurons: {n_neurons}\n"
-        f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
-        f"Optimizer: {optimizer}, Activation: {activation.__class__.__name__}\n"
-        f"========================\n"
-    )
 
-    model = LitClassifier(
-        input_dim=train_embeddings.size(1),
-        hidden_dims=hidden_dims,
-        num_classes=NUM_CLASSES,
-        optimizer_class=optimizer_class,
-        activation=activation,
-        kernel_init=kernel_init,
-        lr=lr,
-        weight_decay=wd,
-        dropout=drop,
-        class_weights=weights,
-        domain_task=False,  # Set to True if using domain boundary detection
-    )
+            params = {
+                "d_model": d_model,
+                "n_heads": n_heads,
+                "n_layers": n_layers,
+                "d_ff": d_ff,
+                "max_seq_len": max_seq_len,
+                "drop": drop,
+                "drop_attn": drop_attn,
+                "lr": lr,
+                "weight_decay": wd,
+                "optimizer_class": optimizer_class,
+                "activation": activation,
+                "kernel_init": kernel_init,
+            }
+
+
+        else:
+            params= None
+        
+        params_list = [params]
+        dist.broadcast_object_list(params_list, src=0)
+        params = params_list[0]
+
+
+        model = LitClassifier(
+            input_dim=train_embeddings.size(1),
+            hidden_dims=params["hidden_dims"],
+            num_classes=NUM_CLASSES,
+            optimizer_class=params["optimizer_class"],
+            activation=params["activation"],
+            kernel_init=params["kernel_init"],
+            lr=params["lr"],
+            weight_decay=params["weight_decay"],
+            dropout=params["drop"],
+            class_weights=weights,
+            domain_task=True,  # Set to True if using domain boundary detection
+            num_heads= params["n_heads"],
+        )
+
 
     early_stop = EarlyStopping(
         monitor="val_loss", patience=10, mode="min", verbose=True
@@ -804,18 +1006,14 @@ def objective(
     trainer = pl.Trainer(
         max_epochs=150,
         accelerator="gpu",
-        devices=1,
-        # strategy="ddp",
+        devices=-1,
+        strategy="ddp",
         enable_progress_bar=True,
         callbacks=[early_stop, checkpoint_callback],
         logger=TensorBoardLogger(
             save_dir=f"./logs/{PROJECT_NAME}", name=f"optuna_trial_{trial.number}"
-        ),
-        gradient_clip_val=1.0,  # Add gradient clipping
-        detect_anomaly=True,  # Enable anomaly detection for debugging
+        )
     )
-
-    # print(model)
 
     trainer.fit(model, train_loader, val_loader)
     # Ensure logger is flushed
@@ -908,7 +1106,7 @@ def main(Final_training=False):
         val_ds = TensorDataset(val_embeddings, val_labels)
 
     else:
-        esm_data = ESMDataset(FSDP_used=False)
+        esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=False)
 
         train_embeddings = esm_data.train_embeddings
         train_labels = esm_data.train_labels
@@ -924,6 +1122,9 @@ def main(Final_training=False):
                 f,
             )
         print("Computed embeddings & labels, then wrote them to cache.")
+
+
+    # dist.destroy_process_group()                # temporary fix to move on on one GPU for training
 
     counts = torch.bincount(train_labels, minlength=NUM_CLASSES).float()
     total = train_labels.size(0)
@@ -951,12 +1152,27 @@ def main(Final_training=False):
     )
     print("Val loader created")
 
-    study = optuna.create_study(
-        direction="minimize",
-        storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
-        load_if_exists=True,
-        study_name=PROJECT_NAME,
-    )
+
+    print("Starting Optuna hyperparameter search...")
+
+    if RANK == 0:
+        study = optuna.create_study(
+            direction="minimize",
+            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            load_if_exists=True,
+            study_name=PROJECT_NAME,
+        )
+
+    dist.barrier()  # Ensure all ranks are synchronized before starting the study
+
+    if RANK != 0:
+        study = optuna.create_study(
+            direction="minimize",
+            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            load_if_exists=True,
+            study_name=PROJECT_NAME,
+        )
+
 
     def objective_wrapper(trial):
         return objective(trial, train_embeddings, train_loader, val_loader, weights)
@@ -998,8 +1214,8 @@ def main(Final_training=False):
         trainer = pl.Trainer(
             max_epochs=50,
             accelerator="gpu",
-            devices=1,
-            # strategy="ddp",
+            devices=-1,
+            strategy="ddp",
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(

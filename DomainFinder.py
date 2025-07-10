@@ -1,17 +1,28 @@
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
-import os
 import math
 import pickle
 import optuna
 import pytorch_lightning as pl
+import torch.distributed as dist
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import accuracy_score
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier
 from ESM_Embeddings_HP_search import objective,load_best_model
+
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+if not dist.is_initialized():
+    dist.init_process_group("nccl")
+    if dist.get_rank() == 0:
+        print("Initializing process group for DDP")
+RANK = dist.get_rank()
+print(f"Start running basic DDP example on rank {RANK}.")
+# create model and move it to GPU with id rank
+DEVICE_ID = RANK % torch.cuda.device_count()
 
 
 # -------------------------
@@ -21,8 +32,8 @@ from ESM_Embeddings_HP_search import objective,load_best_model
 CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_100d.pkl"
-PROJECT_NAME = "Optuna_100d_uncut_t33"
+CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"
+PROJECT_NAME = "Optuna_100d_uncut_t33_domains"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
@@ -49,7 +60,7 @@ print(f"Using device: {DEVICE}")
 
 
 # -------------------------
-# 2. Transformer MODEL
+# 2. Transformer Model
 # -------------------------
 class Transformer(nn.Module):
     def __init__(
@@ -99,6 +110,7 @@ class Transformer(nn.Module):
         
         
         self.positional_encoding(input_dim, hidden_dims)
+        
 
     # ATTENTION MASKING & PADDING:
     # not learn from future tokens,  ie squae masker
@@ -166,7 +178,8 @@ def main(Final_training=False):
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "rb") as f:
             train_embeddings, train_labels, val_embeddings, val_labels = pickle.load(f)
-        print("Loaded cached embeddings & labels from disk.")
+        if RANK == 0:
+            print("Loaded cached embeddings & labels from disk.")
 
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
@@ -187,26 +200,25 @@ def main(Final_training=False):
                 (train_embeddings, train_labels, val_embeddings, val_labels),
                 f,
             )
-        print("Computed embeddings & labels, then wrote them to cache.")
+        if RANK == 0:
+            print("Computed embeddings & labels, then wrote them to cache.")
 
     counts = torch.bincount(train_labels, minlength=NUM_CLASSES).float()
     total = train_labels.size(0)
     weights = total / (NUM_CLASSES * counts)
     weights = weights * (NUM_CLASSES / weights.sum())
     weights = weights.to(DEVICE)
-
-    print("Dataset building complete")
+    if RANK == 0:
+        print("Dataset building complete")
 
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
-    print("Train loader created")
 
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
-    print("Val loader created")
 
     study = optuna.create_study(
         direction="minimize",
@@ -219,9 +231,10 @@ def main(Final_training=False):
         return objective(trial, train_embeddings, train_loader, val_loader, weights,domain_task=True)
     study.optimize(objective_wrapper, n_trials=STUDY_N_TRIALS,)
 
-    print("Best trial number:", study.best_trial.number)
-    print("Best trial:", study.best_trial)
-    # print("Best trial params:", study.best_trial.params)
+    if RANK == 0:
+        print("Best trial number:", study.best_trial.number)
+        print("Best trial:", study.best_trial)
+        # print("Best trial params:", study.best_trial.params)
 
     best_trial = study.best_trial
 
@@ -229,7 +242,8 @@ def main(Final_training=False):
     lit_model = load_best_model(best_trial, train_embeddings, weights)
 
     lit_model.eval()
-    print("Best model loaded and set to eval mode")
+    if RANK == 0:
+        print("Best model loaded and set to eval mode")
 
     # Evaluate on validation set
     device = lit_model.device
@@ -240,7 +254,8 @@ def main(Final_training=False):
     val_true = val_labels.numpy()
 
     acc = accuracy_score(val_true, val_preds)
-    print(f"Validation Accuracy: {acc:.4f}")
+    if RANK == 0:
+        print(f"Validation Accuracy: {acc:.4f}")
 
     if Final_training is True:
         early_stop = EarlyStopping(
@@ -248,20 +263,19 @@ def main(Final_training=False):
         )
         checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
-        print("Lit model created")
+        if RANK == 0:
+            print("Lit model created")
         trainer = pl.Trainer(
             max_epochs=50,
             accelerator="gpu",
-            devices=1,
-            # strategy="ddp",
+            devices=-1,
+            strategy="ddp",
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
                 save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
             ),
         )
-
-        print("Trainer created")
 
         trainer.fit(lit_model, train_loader, val_loader)
 
