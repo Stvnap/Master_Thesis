@@ -113,7 +113,7 @@ class Transformer(nn.Module):
         
 
     # ATTENTION MASKING & PADDING:
-    # not learn from future tokens,  ie squae masker
+    # not learn from future tokens,  ie square masker
     def square_mask(self,size):
         mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
         return mask

@@ -6,7 +6,7 @@ import time
 import gc
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
-CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_trembl.csv"
+CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_full.csv"
 OUTPUT_PATH = "./Dataframes/v3/FoundEntriesTremblProteins.csv"
 
 
