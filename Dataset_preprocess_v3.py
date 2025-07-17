@@ -16,6 +16,8 @@ class DatasetPreprocessor:
         self.input_path_xml = input_path_xml
         self.input_path_csv = input_path_csv
 
+        print("Starting dataset preprocessing...")
+
         if os.path.exists(OUTPUT_PATH):
             print(f"Output path {OUTPUT_PATH} already exists. Please remove it before running the script.")
             return

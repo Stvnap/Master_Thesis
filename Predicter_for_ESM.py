@@ -1,4 +1,3 @@
-import math
 import os
 import pickle
 import tqdm
@@ -9,19 +8,18 @@ import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
-    confusion_matrix,
+    # confusion_matrix,
     precision_score,
     recall_score,
 )
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier 
+from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
 import torch.distributed as dist    
 torch.set_float32_matmul_precision("high")
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
-
 # -------------------------
 # 1. Global settings
 # -------------------------
@@ -31,20 +29,21 @@ GLOBAL_RUN = 0  # keep 0
 CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins_Eval.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-MODEL_PATH = "./models/Optuna_100d_uncut_t33.pt"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_100d_predicter.pkl"
-TENSBORBOARD_LOG_DIR = "./models/100d_uncut_logs"
+MODEL_PATH = "./models/Optuna_1000d_uncut_t33.pt"
+CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d_predicter.pkl"
+TENSBORBOARD_LOG_DIR = "./models/1000d_uncut_logs"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 
-NUM_CLASSES = 101
+NUM_CLASSES = 1001
 BATCH_SIZE = 128
 EMB_BATCH = 1
 NUM_WORKERS = 0
-NUM_WORKERS_EMB = 0
+NUM_WORKERS_EMB = -0.1
 
 THRESHOLD = 5  # Number of consecutive drops to trigger exclusion
+THRESHOLD_K = 0.0  # Threshold for topk probabilities to be considered close and therefore multiclass prediction
 print("Treshold:", THRESHOLD)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,31 +64,38 @@ def opener():
     if os.path.exists(CACHE_PATH):
         # Get file size for progress tracking
         file_size = os.path.getsize(CACHE_PATH)
-        print(f"Loading pickle file ({file_size / (1024**3):.2f} GB)...")
+        if dist.get_rank() == 0:
+            print(f"Loading pickle file ({file_size / (1024**3):.2f} GB)...")
         
         with open(CACHE_PATH, "rb") as f:
             # Wrap the file object with tqdm for progress
-            with tqdm.tqdm(total=file_size, unit='B', unit_scale=True, desc="Loading pickle") as pbar:
-                class ProgressFile:
-                    def __init__(self, file_obj, progress_bar):
-                        self.file_obj = file_obj
-                        self.progress_bar = progress_bar
-                        self.bytes_read = 0
+
+            if dist.get_rank() == 0:
+                print("Loaded cached embeddings & labels from disk.")
+                with tqdm.tqdm(total=file_size, unit='B', unit_scale=True, desc="Loading pickle") as pbar:
+                    class ProgressFile:
+                        def __init__(self, file_obj, progress_bar):
+                            self.file_obj = file_obj
+                            self.progress_bar = progress_bar
+                            self.bytes_read = 0
+                        
+                        def read(self, size=-1):
+                            data = self.file_obj.read(size)
+                            if data:
+                                self.bytes_read += len(data)
+                                self.progress_bar.update(len(data))
+                            return data
+                        
+                        def __getattr__(self, name):
+                            return getattr(self.file_obj, name)
                     
-                    def read(self, size=-1):
-                        data = self.file_obj.read(size)
-                        if data:
-                            self.bytes_read += len(data)
-                            self.progress_bar.update(len(data))
-                        return data
-                    
-                    def __getattr__(self, name):
-                        return getattr(self.file_obj, name)
-                
-                progress_file = ProgressFile(f, pbar)
-                df_embeddings, df_labels = pickle.load(progress_file)
+                    progress_file = ProgressFile(f, pbar)
+                    df_embeddings, df_labels= pickle.load(progress_file)
+
         
-        print("Loaded cached embeddings & labels from disk.")
+            else:
+                df_embeddings, df_labels= pickle.load(f)
+
         return df_embeddings, df_labels, None, None, None
 
     else:
@@ -109,8 +115,8 @@ def opener():
         df_ends = esm_data.ends
         df = esm_data.df
 
-        print(df_embeddings[0][0].shape)
-        print(df_labels[0])
+        # print(df_embeddings[0][0].shape)
+        # print(df_labels[0])
 
 
         df_embeddings = TensorDataset(df_embeddings, df_labels)
@@ -186,6 +192,7 @@ def predict(modelpath, loader, df_labels, firstrun=False):
             predictions.extend(preds.cpu().numpy())
             predictions_raw.extend(preds_raw.cpu().numpy())
 
+
     true_labels = df_labels
 
     # print("TRUE:",true_labels[:30],print(len(true_labels)))
@@ -203,7 +210,7 @@ def predict(modelpath, loader, df_labels, firstrun=False):
         weighted_precision = precision_score(
             true_labels, predictions, average="weighted"
         )
-        confusion = confusion_matrix(true_labels, predictions, normalize="true")
+        # confusion = confusion_matrix(true_labels, predictions, normalize="true")
 
         # Class‐specific precision & recall
         prec_per_class = precision_score(
@@ -216,13 +223,19 @@ def predict(modelpath, loader, df_labels, firstrun=False):
         # Log overall metrics to TensorBoard
         writer.add_scalar("Metrics/Accuracy", accuracy, 0)
         writer.add_scalar("Metrics/Weighted_Precision", weighted_precision, 0)
+        writer.add_scalar("Metrics/AvgPrecision", prec_per_class.mean(), 0)
+        writer.add_scalar("Metrics/AvgRecall", rec_per_class.mean(), 0)
 
-        # Log per-class metrics to TensorBoard
-        for i, (prec, rec) in enumerate(zip(prec_per_class, rec_per_class)):
-            class_id = i + 1  # Classes 1 to NUM_CLASSES-1
-            writer.add_scalar(f"Precision/Class_{class_id}", prec, 0)
-            writer.add_scalar(f"Recall/Class_{class_id}", rec, 0)
 
+        prec_tensor = torch.tensor(prec_per_class)
+        writer.add_histogram("Precision Distribution", prec_tensor, 0, bins=100)
+
+        rec_tensor = torch.tensor(rec_per_class)
+        writer.add_histogram("Recall Distribution", rec_tensor, 0, bins=100)
+
+        for i in range(1, NUM_CLASSES):
+            writer.add_scalar(f"Precision/Class_{i}", prec_per_class[i - 1], 0)
+            writer.add_scalar(f"Recall/Class_{i}", rec_per_class[i - 1], 0)
 
         if dist.get_rank() == 0:
             # Print results
@@ -373,13 +386,13 @@ def boundary_gatherer(predictions, df, df_starts, df_ends):
     Returns:
         pos_indices, pos_true_start, pos_true_end, true_class
     """
-    # Debug prints to understand the data structure
-    print(f"Debug info:")
-    print(f"predictions length: {len(predictions)}")
-    print(f"df length: {len(df)}")
-    print(f"df_starts length: {len(df_starts)}")
-    print(f"df_ends length: {len(df_ends)}")
-    print(df.head())
+    # # Debug prints to understand the data structure
+    # print(f"Debug info:")
+    # print(f"predictions length: {len(predictions)}")
+    # print(f"df length: {len(df)}")
+    # print(f"df_starts length: {len(df_starts)}")
+    # print(f"df_ends length: {len(df_ends)}")
+    # print(df.head())
     
     pos_indices = [i for i, p in enumerate(predictions) if p != 0]
     if not pos_indices:
@@ -413,10 +426,10 @@ def boundary_gatherer(predictions, df, df_starts, df_ends):
     all_true_classes = df["label"].to_list()
     true_class = [all_true_classes[i] for i in pos_indices]
 
-    print(f"\nLengths:")
-    print(f"pos_true_start: {len(pos_true_start)}")
-    print(f"pos_true_end: {len(pos_true_end)}")
-    print(f"true_class: {len(true_class)}")
+    # print("\nLengths:")
+    # print(f"pos_true_start: {len(pos_true_start)}")
+    # print(f"pos_true_end: {len(pos_true_end)}")
+    # print(f"true_class: {len(true_class)}")
     
     return pos_indices, pos_true_start, pos_true_end, true_class
 # -------------------------
@@ -539,7 +552,6 @@ def cutter_loop(
     all_residues = []
     errors = []
     for row_idx in range(Npos):
-        seq_idx = pos_indices[row_idx]
         curve = raw_matrix[row_idx]
         all_j = []
         residues = []
@@ -741,10 +753,10 @@ def boxplotter(errors, classes, Name):
 def main():
     ### Load embeddings, labels abd predicting ###
     df_embeddings, df_labels, df_starts, df_ends, df = opener()
-
-    if dist.get_rank() == 0:
-        first_batch = next(iter(df_embeddings))
-        print(f"First batch shape: {first_batch[0].shape}, First label: {df_labels[0]}, DataFrame head:")
+    print('\n')
+    # if dist.get_rank() == 0:
+    #     first_batch = next(iter(df_embeddings))
+        # print(f"First batch shape: {first_batch[0].shape}, First label: {df_labels[0]}, DataFrame head:")
         # print(df.head())
         # print(len(df_labels),len(df_starts),len(df_ends))
 
@@ -754,6 +766,16 @@ def main():
     predictions, true_labels, raw_scores_nocut = predict(
         MODEL_PATH, df_embeddings, df_labels, firstrun=True
     )
+
+    # temp quit
+    dist.barrier()  # Ensure all processes reach this point before quitting
+    if dist.get_rank() == 0:
+        print("Exiting after first run for debugging purposes.")
+    dist.destroy_process_group()  # Clean up the process group
+    quit()
+    
+    
+
 
     pos_indices, pos_true_start, pos_true_end, true_class = boundary_gatherer(
         predictions, df, df_starts, df_ends

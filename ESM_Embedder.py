@@ -164,18 +164,18 @@ class ESMDataset:
                             else "other"
                         )
                         print(
-                            f"Class {i} with ID {pfam_id}: {final_counts[i]} from samples"
+                            f"Class {i} with ID {pfam_id}: {final_counts[i]} from samples | avg length {df[df['label'] == i][sequence_col].str.len().mean():.2f}"
                         )
+                        
                         all_pfam.append(pfam_id)
-                if self.training is False:
-                    print(f"All Pfam IDs: {all_pfam}")
+
                 if self.training is True:
                     os.makedirs("./temp", exist_ok=True)
                     all_pfam=all_pfam[1:]  # Exclude "other" category
-                    open("./temp/selected_pfam_ids.txt", "w").write(
+                    open(f"./temp/selected_pfam_ids_{num_classes}.txt", "w").write(
                         "\n".join(all_pfam)
                     )
-
+            print("\n")
             return df
 
 
@@ -194,9 +194,7 @@ class ESMDataset:
 
                 # Filter out sequences that are too short to ensure no NaN values
                 initial_count = len(df)
-                df = df[
-                    df[sequence_col].str.len() >= 10
-                ]  # 10 for biological reasonings
+
                 final_count = len(df)
                 if initial_count != final_count:
                     if RANK == 0:
@@ -239,8 +237,9 @@ class ESMDataset:
                     self.training is False
                 ):  
                # to ensure same ids used during evaluation on prediction quality
-                    print("Using fixed priority Pfam IDs for evaluation")
-                    with open("./temp/selected_pfam_ids.txt", "r") as f:
+                    if RANK == 0:
+                        print("Using fixed priority Pfam IDs for evaluation")
+                    with open(f"./temp/selected_pfam_ids_{num_classes}.txt", "r") as f:
                         priority_pfam_ids = [line.strip() for line in f.readlines()]
 
                 # Filter priority IDs that actually exist in the dataset AND have >100 occurrences
@@ -275,7 +274,6 @@ class ESMDataset:
             if self.training is False:
                 self.all_starts = df["start"].tolist()
                 self.all_ends = df["end"].tolist()
-                print(self.all_starts[0], self.all_ends[0])
 
             if category_col != "Pfam_id":
                 df.drop(columns=[category_col], inplace=True)
@@ -284,6 +282,11 @@ class ESMDataset:
                     df.drop(columns=["start", "end", "id", "Pfam_id"], inplace=True)
                 else:
                     df.drop(columns=["id", "Pfam_id"], inplace=True)
+            
+
+            df = df[
+                df[sequence_col].str.len() >= 10
+            ]                                           # 10 for biological reasonings
             self.df = df
             if RANK == 0:
                 print("Data loaded")
@@ -458,6 +461,107 @@ class ESMDataset:
         """
         Generate embeddings for a list of sequences using ESM model.
         """
+        def windower(stepsize=1000,dimension=1000):
+            # cut sequences longer than 1000 characters into sliding windows, because of ESM2 limitations
+            new_seqs = []
+            new_labels = []
+            count = 0
+            if self.training is True:
+                for seq, label in zip(seq_dataset.seqs, seq_dataset.labels):
+                    if len(seq) > 1000:
+                        if RANK == 0:
+                            count += 1
+                        slices = [
+                            seq[i : i + dimension]
+                            for i in range(0, len(seq) - dimension + 1, stepsize)
+                        ]
+                        if len(seq) % dimension != 0:
+                            slices.append(seq[-dimension:])
+                        new_seqs.extend(slices)
+                        new_labels.extend([label] * len(slices))
+                    else:
+                        new_seqs.append(seq)
+                        new_labels.append(label)
+                self.end_window = [len(seq) for seq in new_seqs]
+                print(
+                    f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
+                )
+
+            if self.training is False:
+                new_starts = []
+                new_ends = []
+                for seq, label, start, end in zip(
+                    seq_dataset.seqs,
+                    seq_dataset.labels,
+                    seq_dataset.starts,
+                    seq_dataset.ends,
+                ):
+                    if len(seq) > 1000:
+                        if RANK == 0:
+                            count += 1
+                        slices = []
+                        slice_positions = []
+                        for i in range(0, len(seq) - dimension + 1, stepsize):
+                            slices.append(seq[i : i + dimension])
+                            slice_positions.append((i, i + dimension))
+                        
+                        if len(seq) % dimension != 0:
+                            slices.append(seq[-dimension:])
+                            slice_positions.append((len(seq) - dimension, len(seq)))
+                        
+                        
+                        new_seqs.extend(slices)
+
+                        for (slice_start, slice_end) in slice_positions:
+                            if start >= slice_start and start < slice_end:
+                                new_labels.append(label)
+                            else:
+                                new_labels.append(torch.tensor(0, dtype=torch.long))
+
+                        
+
+                        new_starts.extend([start] * len(slices))
+                        new_ends.extend([end] * len(slices))
+
+                        
+
+                    else:
+                        new_seqs.append(seq)
+                        new_labels.append(label)
+                        new_starts.append(start)
+                        new_ends.append(end)
+                self.end_window = [len(seq) for seq in new_seqs]
+                print(
+                    f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
+                )
+
+                # Update the dataframe with the new sequences and labels
+                if len(new_seqs) != len(seq_dataset.seqs):
+                    # Create new dataframe with updated sequences
+                    new_df_data = []
+                    for i, (seq, label) in enumerate(zip(new_seqs, new_labels)):
+                        new_df_data.append({self.sequence_col: seq, "label": label})
+
+                    # If we have starts and ends, add them too
+                    if self.training is False:
+                        for i, (start, end) in enumerate(zip(new_starts, new_ends)):
+                            new_df_data[i]["start"] = start
+                            new_df_data[i]["end"] = end
+
+                    # Update the dataframe
+                    self.df = pd.DataFrame(new_df_data)
+
+                    if RANK == 0:
+                        print(
+                            f"Updated dataframe from {len(seq_dataset.seqs)} to {len(new_seqs)} sequences due to sliding window"
+                        )
+
+
+            if self.training is True:
+                return new_seqs, new_labels
+            else:
+                return new_seqs, new_labels, new_starts, new_ends
+        
 
         # Determine the correct embedding dimension from the model
         model_dims = {
@@ -488,103 +592,12 @@ class ESMDataset:
                 seqs, self.labels, self.all_starts, self.all_ends
             )
 
-        # cut sequences longer than 1000 characters into sliding windows, because of ESM2 limitations
-        new_seqs = []
-        new_labels = []
-        count = 0
         if self.training is True:
-            for seq, label in zip(seq_dataset.seqs, seq_dataset.labels):
-                if len(seq) > 1000:
-                    if RANK == 0:
-                        count += 1
-                    dimension = 1000
-                    stepsize = 1000
-                    slices = [
-                        seq[i : i + dimension]
-                        for i in range(0, len(seq) - dimension + 1, stepsize)
-                    ]
-                    if len(seq) % dimension != 0:
-                        slices.append(seq[-dimension:])
-                    new_seqs.extend(slices)
-                    new_labels.extend([label] * len(slices))
-                else:
-                    new_seqs.append(seq)
-                    new_labels.append(label)
-            self.end_window = [len(seq) for seq in new_seqs]
-            print(
-                f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
+            new_seqs, new_labels = windower(stepsize=500, dimension=1000)
+        else:
+            new_seqs, new_labels, new_starts, new_ends = windower(
+                stepsize=500, dimension=1000
             )
-
-        if self.training is False:
-            new_starts = []
-            new_ends = []
-            for seq, label, start, end in zip(
-                seq_dataset.seqs,
-                seq_dataset.labels,
-                seq_dataset.starts,
-                seq_dataset.ends,
-            ):
-                if len(seq) > 1000:
-                    if RANK == 0:
-                        count += 1
-                    dimension = 1000
-                    stepsize = 1000
-                    slices = []
-                    slice_positions = []
-                    for i in range(0, len(seq) - dimension + 1, stepsize):
-                        slices.append(seq[i : i + dimension])
-                        slice_positions.append((i, i + dimension))
-                    
-                    if len(seq) % dimension != 0:
-                        slices.append(seq[-dimension:])
-                        slice_positions.append((len(seq) - dimension, len(seq)))
-                    
-                    
-                    new_seqs.extend(slices)
-
-                    for (slice_start, slice_end) in slice_positions:
-                        if start >= slice_start and start < slice_end:
-                            new_labels.append(label)
-                        else:
-                            new_labels.append(torch.tensor(0, dtype=torch.long))
-
-                    
-
-                    new_starts.extend([start] * len(slices))
-                    new_ends.extend([end] * len(slices))
-
-                    
-
-                else:
-                    new_seqs.append(seq)
-                    new_labels.append(label)
-                    new_starts.append(start)
-                    new_ends.append(end)
-            self.end_window = [len(seq) for seq in new_seqs]
-            print(
-                f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
-            )
-
-            # Update the dataframe with the new sequences and labels
-            if len(new_seqs) != len(seq_dataset.seqs):
-                # Create new dataframe with updated sequences
-                new_df_data = []
-                for i, (seq, label) in enumerate(zip(new_seqs, new_labels)):
-                    new_df_data.append({self.sequence_col: seq, "label": label})
-
-                # If we have starts and ends, add them too
-                if self.training is False:
-                    for i, (start, end) in enumerate(zip(new_starts, new_ends)):
-                        new_df_data[i]["start"] = start
-                        new_df_data[i]["end"] = end
-
-                # Update the dataframe
-                self.df = pd.DataFrame(new_df_data)
-
-                if RANK == 0:
-                    print(
-                        f"Updated dataframe from {len(seq_dataset.seqs)} to {len(new_seqs)} sequences due to sliding window"
-                    )
 
         seq_dataset.seqs = new_seqs
         seq_dataset.labels = new_labels
@@ -654,7 +667,7 @@ class ESMDataset:
                         all_ends.append(batch_end)
 
                 # Progress reporting
-                if batch_num % 1 == 0 or batch_num == len(dataloader) - 1:
+                if batch_num % 10 == 0 or batch_num == len(dataloader) - 1 and RANK == 0:   # for clearer output
                     elapsed_time = time.time() - start_time
                     if batch_num > 0:
                         avg_time_per_batch = elapsed_time / (batch_num + 1)
@@ -974,3 +987,10 @@ class ESMDataset:
             return final_embeddings, final_labels, final_starts, final_ends
         else:
             return final_embeddings, final_labels
+
+
+if __name__ == "__main__":
+    # Run the main function if this script is executed directly
+    raise NotImplementedError(
+        "This script is not intended to be run directly"
+    )

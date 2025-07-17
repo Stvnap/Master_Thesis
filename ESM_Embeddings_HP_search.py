@@ -2,32 +2,23 @@
 # 1. Imports & basic setup
 # -------------------------
 import glob
-import math
 import os
 import pickle
-import time
 
-import esm
 import optuna
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
-from torch.utils.data.distributed import DistributedSampler
-from fairscale.nn.wrap import enable_wrap, wrap
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import Precision, Recall
 
-from ESM_Embedder import ESMDataset, SeqDataset, SeqDatasetForEval
+from ESM_Embedder import DEVICE, RANK, ESMDataset
 
-from ESM_Embedder import RANK, DEVICE
 os.environ["NCCL_P2P_DISABLE"] = "1"
 
 torch.set_float32_matmul_precision("high")  # More stable than "high"
@@ -47,16 +38,17 @@ pd.set_option("display.max_rows", None)
 CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d.pkl"
+CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d_.pkl"
 PROJECT_NAME = "Optuna_1000d_uncut_t33"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 NUM_CLASSES = 1001  # classes + 1 for "other" class
-EPOCHS = 200
-STUDY_N_TRIALS = 10
+EPOCHS = 1
+STUDY_N_TRIALS = 0
 BATCH_SIZE = 64
 NUM_WORKERS_EMB = max(16, os.cpu_count())
+
 
 # -------------------------
 # 2. FFW classifier head
@@ -116,9 +108,8 @@ class LitClassifier(pl.LightningModule):
         dropout=0.3,
         class_weights=None,
         domain_task=False,
-        num_heads=8, 
-        ):
-        
+        num_heads=8,
+    ):
         super().__init__()
         self.save_hyperparameters()
 
@@ -143,6 +134,7 @@ class LitClassifier(pl.LightningModule):
 
         else:
             from DomainFinder import Transformer
+
             self.model = Transformer(
                 self,
                 input_dim,
@@ -153,9 +145,10 @@ class LitClassifier(pl.LightningModule):
                 activation,
                 kernel_init,
             )
-        
-            self.loss_fn = nn.BCEWithLogitsLoss(reduction="none")           # for domain boundary detection
 
+            self.loss_fn = nn.BCEWithLogitsLoss(
+                reduction="none"
+            )  # for domain boundary detection
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -170,7 +163,7 @@ class LitClassifier(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         x = x.to(self.device, non_blocking=True)
-        y = y.to(self.device, non_blocking=True)   
+        y = y.to(self.device, non_blocking=True)
 
         # Addition to check for NaN values
         assert not torch.isnan(x).any(), "Input contains NaN values"
@@ -270,6 +263,7 @@ class LitClassifier(pl.LightningModule):
 # 5. Optuna objective func, load best model func
 # -------------------------
 
+
 def objective(
     trial, train_embeddings, train_loader, val_loader, weights, domain_task=False
 ):
@@ -292,7 +286,9 @@ def objective(
             else:
                 optimizer_class = torch.optim.SGD
 
-            activation = trial.suggest_categorical("activation", ["relu", "gelu", "leaky_relu"])
+            activation = trial.suggest_categorical(
+                "activation", ["relu", "gelu", "leaky_relu"]
+            )
             if activation == "relu":
                 activation = nn.ReLU(inplace=True)
                 kernel_init = nn.init.kaiming_normal_
@@ -311,10 +307,8 @@ def objective(
                 f"========================\n"
             )
 
-
-
             params = {
-                "hidden_dims":hidden_dims,
+                "hidden_dims": hidden_dims,
                 "dropout": drop,
                 "lr": lr,
                 "weight_decay": wd,
@@ -325,14 +319,12 @@ def objective(
                 "weights": weights,
             }
 
-
         else:
-            params= None
-        
+            params = None
+
         params_list = [params]
         dist.broadcast_object_list(params_list, src=0)
         params = params_list[0]
-
 
         model = LitClassifier(
             input_dim=train_embeddings.size(1),
@@ -356,11 +348,11 @@ def objective(
             d_model = trial.suggest_categorical(
                 "d_model", [64, 128, 256, 512, 1024, 2048]
             )
-            n_heads = trial.suggest_categorical("n_heads", [8,12,16,24,32])
-            n_layers = trial.suggest_int("num_hidden_layers", 6, 12,24)
-            d_ff = 4*d_model
+            n_heads = trial.suggest_categorical("n_heads", [8, 12, 16, 24, 32])
+            n_layers = trial.suggest_int("num_hidden_layers", 6, 12, 24)
+            d_ff = 4 * d_model
             max_seq_len = trial.suggest_int("max_seq_len", 100, 1000, step=100)
-            
+
             drop = trial.suggest_float("dropout", 0.1, 0.5)
             drop_attn = trial.suggest_float("dropout_attn", 0.1, 0.5)
             lr = trial.suggest_float("lr", 1e-5, 1e2, log=True)
@@ -373,7 +365,9 @@ def objective(
             else:
                 optimizer_class = torch.optim.SGD
 
-            activation = trial.suggest_categorical("activation", ["relu", "gelu", "leaky_relu"])
+            activation = trial.suggest_categorical(
+                "activation", ["relu", "gelu", "leaky_relu"]
+            )
             if activation == "relu":
                 activation = nn.ReLU(inplace=True)
                 kernel_init = nn.init.kaiming_normal_
@@ -383,7 +377,6 @@ def objective(
             else:
                 activation = nn.LeakyReLU(inplace=True)
                 kernel_init = nn.init.kaiming_normal_
-
 
             params = {
                 "d_model": d_model,
@@ -400,14 +393,12 @@ def objective(
                 "kernel_init": kernel_init,
             }
 
-
         else:
-            params= None
-        
+            params = None
+
         params_list = [params]
         dist.broadcast_object_list(params_list, src=0)
         params = params_list[0]
-
 
         model = LitClassifier(
             input_dim=train_embeddings.size(1),
@@ -421,9 +412,8 @@ def objective(
             dropout=params["drop"],
             class_weights=weights,
             domain_task=True,  # Set to True if using domain boundary detection
-            num_heads= params["n_heads"],
+            num_heads=params["n_heads"],
         )
-
 
     early_stop = EarlyStopping(
         monitor="val_loss", patience=10, mode="min", verbose=True
@@ -439,7 +429,7 @@ def objective(
         callbacks=[early_stop, checkpoint_callback],
         logger=TensorBoardLogger(
             save_dir=f"./logs/{PROJECT_NAME}", name=f"optuna_trial_{trial.number}"
-        )
+        ),
     )
 
     trainer.fit(model, train_loader, val_loader)
@@ -515,9 +505,11 @@ def load_best_model(trial, train_embeddings, weights):
 
     return model
 
+
 # -------------------------
 # 6. Main
 # -------------------------
+
 
 def main(Final_training=False):
     os.makedirs("pickle", exist_ok=True)
@@ -533,8 +525,16 @@ def main(Final_training=False):
         val_ds = TensorDataset(val_embeddings, val_labels)
 
     else:
-        esm_data = ESMDataset(esm_model=ESM_MODEL,FSDP_used=False,domain_boundary_detection=False,training=True,num_classes=NUM_CLASSES, csv_path=CSV_PATH, category_col=CATEGORY_COL, sequence_col=SEQUENCE_COL)
-
+        esm_data = ESMDataset(
+            esm_model=ESM_MODEL,
+            FSDP_used=False,
+            domain_boundary_detection=False,
+            training=True,
+            num_classes=NUM_CLASSES,
+            csv_path=CSV_PATH,
+            category_col=CATEGORY_COL,
+            sequence_col=SEQUENCE_COL,
+        )
 
         train_embeddings = esm_data.train_embeddings
         train_labels = esm_data.train_labels
@@ -550,7 +550,6 @@ def main(Final_training=False):
                 f,
             )
         print("Computed embeddings & labels, then wrote them to cache.")
-
 
     # dist.destroy_process_group()                # temporary fix to move on on one GPU for training
 
@@ -580,7 +579,6 @@ def main(Final_training=False):
     )
     print("Val loader created")
 
-
     print("Starting Optuna hyperparameter search...")
 
     if RANK == 0:
@@ -600,7 +598,6 @@ def main(Final_training=False):
             load_if_exists=True,
             study_name=PROJECT_NAME,
         )
-
 
     def objective_wrapper(trial):
         return objective(trial, train_embeddings, train_loader, val_loader, weights)
@@ -655,9 +652,20 @@ def main(Final_training=False):
 
         trainer.fit(lit_model, train_loader, val_loader)
 
+        if RANK == 0:
+            print("\nTraining complete, saving final model...\n")
+
         # save the final model
         final_model_path = f"./models/{PROJECT_NAME}.pt"
         torch.save(lit_model, final_model_path)
+
+    if dist.is_initialized():
+        # Ensure all processes are synchronized before exiting
+        dist.barrier()
+        if RANK == 0:
+            print("Done! Exiting...")
+        dist.destroy_process_group()
+
 
 #############################################################################################################
 
