@@ -1,13 +1,11 @@
 import os
 import xml.sax
-import polars as pl
-import psutil
+import pandas as pd
 import time
-import gc
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
 CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_full.csv"
-OUTPUT_PATH = "./Dataframes/v3/FoundEntriesTremblProteins.csv"
+OUTPUT_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesCompleteProteins.csv"
 
 
 
@@ -25,14 +23,14 @@ class DatasetPreprocessor:
         list_ids, list_seq = self._load_in_csv()
         
         # testset:
-        # list_ids= ["A0A001", "A0A003", "A0A005", "A0A002", "A0A004", "A0A000",]
+        # list_ids= ["A0A8B7VBX7", "A0A003", "A0A005", "A0A002", "A0A004", "A0A000",]
         # list_seq= list_seq[:6]  # Limit to first 10 sequences for testing
 
         self.target_ids = set(list_ids)
         self.target_seqs = set(list_seq)
 
 
-        self.compare_frame= pl.DataFrame(
+        self.compare_frame= pd.DataFrame(
             {
                 "ID": list_ids,
                 "Sequences": list_seq
@@ -59,7 +57,7 @@ class DatasetPreprocessor:
         if not os.path.exists(self.input_path_csv):
             raise FileNotFoundError(f"CSV file not found: {self.input_path_csv}")
 
-        df = pl.read_csv(self.input_path_csv)
+        df = pd.read_csv(self.input_path_csv)
 
         if "categories" in df.columns:
             df = df.drop("categories")
@@ -173,7 +171,7 @@ class DatasetPreprocessor:
                     self.outer_self.processed += 1
                     
                     # Print progress every 1 processed proteins
-                    if self.outer_self.processed % 1 == 0:
+                    if self.outer_self.processed % 10000 == 0:
                         elapsed_time = time.time() - self.outer_self.t0
                         rate = self.outer_self.processed / elapsed_time if elapsed_time > 0 else 0
                         print(f"Targets found: {self.outer_self.processed}/{len(self.outer_self.target_ids)} | "
@@ -260,7 +258,7 @@ class DatasetPreprocessor:
             # os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
             
             # Create a DataFrame from the found entries
-            self.df = pl.DataFrame(self.all_list, schema=["start", "end", "id", "Pfam_id"])
+            self.df = pd.DataFrame(self.all_list, columns=["start", "end", "id", "Pfam_id"])
             print(f"Created DataFrame with {len(self.df)} entries")
             
         except Exception as e:
@@ -277,17 +275,21 @@ class DatasetPreprocessor:
 
             # Create a dictionary for O(1) lookup
             sequence_dict = {}
-            for row in self.compare_frame.iter_rows():
-                entry_id = row[0]  
-                sequence = row[1]  
+            for _, row in self.compare_frame.iterrows():
+                entry_id = row["ID"]  
+                sequence = row["Sequences"]
+                # print(entry_id, sequence)  
                 sequence_dict[entry_id] = sequence
+
+            # print(sequence_dict)
 
             # Flatten the nested structure and extend with sequences
             flattened_entries = []
+            # print(self.all_list)
             for entry in self.all_list:
                 entry_id = entry['id']  # Use dictionary key instead of index
                 sequence = sequence_dict.get(entry_id, None)
-                
+                # print(sequence)
                 # Create rows for each lcn_data entry
                 for lcn in entry['lcn_data']:
                     flattened_entries.append([
@@ -300,11 +302,11 @@ class DatasetPreprocessor:
 
             # Convert to DataFrame
             if flattened_entries:
-                self.df = pl.DataFrame(flattened_entries, schema=["start", "end", "id", "Pfam_id", "Sequence"])
+                self.df = pd.DataFrame(flattened_entries, columns=["start", "end", "id", "Pfam_id", "Sequence"])
                 print(f"Extended entries with sequences, total entries: {len(self.df)}")
 
                 # Save to CSV
-                self.df.write_csv(output_path)
+                self.df.to_csv(output_path,index=False)
                 print(f"Successfully saved {len(flattened_entries)} entries to {output_path}")
             else:
                 print("No entries to save after flattening.")
@@ -314,7 +316,6 @@ class DatasetPreprocessor:
             import traceback
             traceback.print_exc()
             raise
-
 #############################################################################################
 DatasetPreprocessor(
     input_path_xml=XML_PATH,

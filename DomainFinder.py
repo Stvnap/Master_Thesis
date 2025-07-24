@@ -33,7 +33,7 @@ CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"
-PROJECT_NAME = "Optuna_100d_uncut_t33_domains"
+PROJECT_NAME = "Optuna_100d_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
@@ -41,7 +41,7 @@ NUM_LAYERS = 6
 NUM_HEADS = 8
 
 
-NUM_CLASSES = 2
+NUM_CLASSES = 1 # Number of classes for domain detection, set to 1 for binary classification
 TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
@@ -89,10 +89,10 @@ class Transformer(nn.Module):
             "esm2_t48_15B_UR50D": 5120,
         }
         expected_dim = model_dims.get(ESM_MODEL, None) 
-        self.input_dim = expected_dim
-        self.hidden_dims = expected_dim
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
 
-        assert hidden_dims % num_heads == 0, "Hidden dim must be divisible by num heads"
+        # assert hidden_dims % num_heads == 0, "Hidden dim must be divisible by num heads"
         
         
         # Classification head
@@ -109,32 +109,32 @@ class Transformer(nn.Module):
             num_layers=NUM_LAYERS)
         
         
-        self.positional_encoding(input_dim, hidden_dims)
+        # self.positional_encoding(input_dim, hidden_dims)
         
 
-    # ATTENTION MASKING & PADDING:
-    # not learn from future tokens,  ie square masker
-    def square_mask(self,size):
-        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
-        return mask
 
-    # padding tokens are ignored
+    # padding tokens are ignored, not needed if batch size is 1
     def padding_mask(self,seq, pad_token=0):
         mask = (seq != pad_token).unsqueeze(1).unsqueeze(2)
         return mask
 
     # POSITIONAL ENCODING:
     # add a order so the model knows how to read it
-    def positional_encoding(self,seq_len, d_model):
-        # self.dropout = nn.Dropout(p=dropout)
+    def generate_positional_encoding(self,seq_len, d_model,device):
+        '''
+        Standard pe found in most transformer papers.
+        It uses sine and cosine functions of different frequencies.
+        '''
+        position = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)                            # create a column vector of positions, shape (seq_len, 1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))  # early positions have higher frequencies, later positions have lower frequencies
+        pe = torch.zeros(seq_len, d_model, device=device) # empty tensor for positional encoding
 
-        position = torch.arange(seq_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(seq_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        pe[:, 0::2] = torch.sin(position * div_term)  # apply sine to even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # apply cosine to odd indices
 
+        pe = pe.unsqueeze(1)  # add batch dimension, so shape becomes (seq_len, 1, d_model)
+
+        return pe
 
 
     # ENCODER:
@@ -149,17 +149,19 @@ class Transformer(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]          # positional encoding
-        mask = (x.abs().sum(dim=-1) != 0)       # create mask for padding tokens  
-        src_key_padding_mask = ~mask            # padding mask for encoder
+        seq_len, batch_size, input_dim = x.size()
+        pe = self.generate_positional_encoding(seq_len, input_dim, x.device)
+        x = x + pe  # add positional encoding to input embeddings
 
-        x = x.transpose(0, 1)  # (seq_len, batch_size, input_dim) -> (batch_size, seq_len, input_dim)
-        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # actual padding mask
-        x = x.transpose(0, 1)  # (batch_size, seq_len, input_dim) -> (seq_len, batch_size, input_dim) \back
+        x = nn.Dropout(self.dropout)(x)  # apply dropout to input embeddings
 
-        logits = self.classifier(x) 
+        print("Input shape:", x.shape)      # before encoder
+        x = self.encoder(x)
+        print("Encoder output:", x.shape)
+        logits = self.classifier(x)
+        print("Classifier output:", logits.shape)
 
-        return logits,mask
+        return logits
 
 
 # -------------------------
@@ -180,12 +182,14 @@ def main(Final_training=False):
             train_embeddings, train_labels, val_embeddings, val_labels = pickle.load(f)
         if RANK == 0:
             print("Loaded cached embeddings & labels from disk.")
+            print("Train embedding shape:", train_embeddings.shape)  # <-- Add this line
 
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
 
     else:
-        esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=True)
+        esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=True,num_classes=NUM_CLASSES,esm_model=ESM_MODEL,
+                              csv_path=CSV_PATH, category_col=CATEGORY_COL, sequence_col=SEQUENCE_COL)
 
         train_embeddings = esm_data.train_embeddings
         train_labels = esm_data.train_labels
@@ -203,14 +207,6 @@ def main(Final_training=False):
         if RANK == 0:
             print("Computed embeddings & labels, then wrote them to cache.")
 
-    counts = torch.bincount(train_labels, minlength=NUM_CLASSES).float()
-    total = train_labels.size(0)
-    weights = total / (NUM_CLASSES * counts)
-    weights = weights * (NUM_CLASSES / weights.sum())
-    weights = weights.to(DEVICE)
-    if RANK == 0:
-        print("Dataset building complete")
-
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS_EMB, pin_memory=True
@@ -220,15 +216,25 @@ def main(Final_training=False):
         val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
 
-    study = optuna.create_study(
-        direction="minimize",
-        storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
-        load_if_exists=True,
-        study_name=PROJECT_NAME,
-    )
+    if RANK == 0:
+        study = optuna.create_study(
+            direction="minimize",
+            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            load_if_exists=True,
+            study_name=PROJECT_NAME,
+        )
+    dist.barrier()  # Ensure all ranks are synchronized before starting the study
+
+    if RANK != 0:
+        study = optuna.create_study(
+            direction="minimize",
+            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            load_if_exists=True,
+            study_name=PROJECT_NAME,
+        )
 
     def objective_wrapper(trial):
-        return objective(trial, train_embeddings, train_loader, val_loader, weights,domain_task=True)
+        return objective(trial, train_embeddings, train_loader, val_loader, weights=None,domain_task=True)
     study.optimize(objective_wrapper, n_trials=STUDY_N_TRIALS,)
 
     if RANK == 0:
@@ -248,7 +254,9 @@ def main(Final_training=False):
     # Evaluate on validation set
     device = lit_model.device
     with torch.no_grad():
-        val_embeddings_gpu = val_embeddings.to(device)  # Use different variable name
+        val_embeddings_gpu = val_embeddings.to(device)
+        # Permute to [seq_len, batch_size, input_dim]
+        val_embeddings_gpu = val_embeddings_gpu.permute(1, 0, 2)
         val_logits = lit_model(val_embeddings_gpu)
     val_preds = val_logits.argmax(dim=1).cpu().numpy()
     val_true = val_labels.numpy()

@@ -38,8 +38,8 @@ pd.set_option("display.max_rows", None)
 CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d_.pkl"
-PROJECT_NAME = "Optuna_1000d_uncut_t33"
+CACHE_PATH = "./pickle/FoundEntriesALLProteins_1000d_.pkl"
+PROJECT_NAME = "Optuna_1000d_uncut_t33_ALL"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
@@ -116,6 +116,7 @@ class LitClassifier(pl.LightningModule):
         self.optimizer_class = optimizer_class
         self.lr = lr
         self.weight_decay = weight_decay
+        self.domain_task = domain_task
 
         # base model
         if domain_task is False:
@@ -136,7 +137,6 @@ class LitClassifier(pl.LightningModule):
             from DomainFinder import Transformer
 
             self.model = Transformer(
-                self,
                 input_dim,
                 hidden_dims,
                 num_classes,
@@ -157,8 +157,11 @@ class LitClassifier(pl.LightningModule):
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
         )
 
+
     def forward(self, x):
         return self.model(x)
+    
+
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -169,7 +172,10 @@ class LitClassifier(pl.LightningModule):
         assert not torch.isnan(x).any(), "Input contains NaN values"
         logits = self(x)
         assert not torch.isnan(logits).any(), "Logits contain NaN values"
-        loss = self.loss_fn(logits, y)
+        try:
+            loss = self.loss_fn(logits.view(-1, 2), y.view(-1))         # for domain boundary detection
+        except:
+            loss = self.loss_fn(logits, y)
         # print(loss)
         assert not torch.isnan(loss), "Validation loss is NaN"
         self.log("train_loss", loss, prog_bar=True)
@@ -184,10 +190,18 @@ class LitClassifier(pl.LightningModule):
         assert not torch.isnan(x).any(), "Input contains NaN values"
         logits = self(x)
         assert not torch.isnan(logits).any(), "Logits contain NaN values"
-        loss = self.loss_fn(logits, y)
+        try:
+            loss = self.loss_fn(logits.view(-1, 2), y.view(-1))         # for domain boundary detection
+        except:
+            loss = self.loss_fn(logits, y)
         # print(loss)
         assert not torch.isnan(loss), "Validation loss is NaN"
         preds = torch.argmax(logits, dim=1)
+
+        if self.domain_task is True:  # for domain boundary detection
+            preds = preds.view(-1)  # Flatten predictions
+            y = y.view(-1)  # Flatten labels
+
 
         acc = (preds == y).float().mean()
 
@@ -345,10 +359,10 @@ def objective(
     else:
         # Domain boundary detection task, HPs for Transformer model
         if RANK == 0:
-            d_model = trial.suggest_categorical(
-                "d_model", [64, 128, 256, 512, 1024, 2048]
-            )
-            n_heads = trial.suggest_categorical("n_heads", [8, 12, 16, 24, 32])
+
+            d_model = 8
+            n_heads = trial.suggest_int("num_heads", 2, 8, step=2)
+
             n_layers = trial.suggest_int("num_hidden_layers", 6, 12, 24)
             d_ff = 4 * d_model
             max_seq_len = trial.suggest_int("max_seq_len", 100, 1000, step=100)
@@ -402,7 +416,7 @@ def objective(
 
         model = LitClassifier(
             input_dim=train_embeddings.size(1),
-            hidden_dims=params["hidden_dims"],
+            hidden_dims=params["d_model"],
             num_classes=NUM_CLASSES,
             optimizer_class=params["optimizer_class"],
             activation=params["activation"],
