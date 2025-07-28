@@ -5,7 +5,7 @@ import time
 
 XML_PATH = "/global/scratch2/sapelt/Protein_matched_complete/Protein_match_complete.xml"
 CSV_PATH = "/global/scratch2/sapelt/Protein_matched_complete/uniprot_full.csv"
-OUTPUT_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesCompleteProteins.csv"
+OUTPUT_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesCompleteProteins_tax.csv"
 
 
 
@@ -111,6 +111,7 @@ class DatasetPreprocessor:
                 self.outer_self = outer_self
                 self.current_protein_id = None
                 self.current_match_id = None
+                self.current_taxid = None
                 self.current_match_name = None
                 self.in_protein = False
                 self.in_match = False
@@ -119,9 +120,11 @@ class DatasetPreprocessor:
             def startElement(self, name, attrs):
                 if name == 'protein':
                     protein_id = attrs.get('id', '')
+                    taxid = attrs.get('taxid', '')
                     if protein_id in self.outer_self.target_ids:
                         # print(f"Found target protein ID: {protein_id}")
                         self.current_protein_id = protein_id
+                        self.current_taxid = taxid 
                         self.in_protein = True
                         self.current_lcn_data = []
                         
@@ -158,6 +161,7 @@ class DatasetPreprocessor:
 
                         protein_data = {
                             'id': self.current_protein_id,
+                            'taxid': self.current_taxid,
                             'lcn_data': self.current_lcn_data
                         }
                         self.outer_self.all_lists.append(protein_data)
@@ -182,6 +186,7 @@ class DatasetPreprocessor:
                     
                     self.in_protein = False
                     self.current_protein_id = None
+                    self.current_taxid = None
                     self.current_lcn_data = []
                     
                 elif name == 'match':
@@ -288,6 +293,7 @@ class DatasetPreprocessor:
             # print(self.all_list)
             for entry in self.all_list:
                 entry_id = entry['id']  # Use dictionary key instead of index
+                taxid = entry['taxid']
                 sequence = sequence_dict.get(entry_id, None)
                 # print(sequence)
                 # Create rows for each lcn_data entry
@@ -297,12 +303,13 @@ class DatasetPreprocessor:
                         lcn['end'], 
                         entry_id,
                         lcn['match_id'],
+                        taxid,
                         sequence
                     ])
 
             # Convert to DataFrame
             if flattened_entries:
-                self.df = pd.DataFrame(flattened_entries, columns=["start", "end", "id", "Pfam_id", "Sequence"])
+                self.df = pd.DataFrame(flattened_entries, columns=["start", "end", "id", "Pfam_id", "taxid","Sequence"])
                 print(f"Extended entries with sequences, total entries: {len(self.df)}")
 
                 # Save to CSV

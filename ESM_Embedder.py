@@ -32,10 +32,6 @@ else:
     print("Running in single-GPU mode without DDP.")
 
 
-
-
-
-
 TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
@@ -180,7 +176,7 @@ class ESMDataset:
 
 
         if skip_df is None:
-            df = pd.read_csv(csv_path,nrows=100)          ##################### TESTING PURPOSES
+            df = pd.read_csv(csv_path,nrows=1000)          ##################### TESTING PURPOSES
             if (
                 "start" in df.columns
                 and "end" in df.columns
@@ -324,6 +320,9 @@ class ESMDataset:
 
             self.labels = labels_list  # Store as list of tensors
             # print(self.labels[3:4])  # Print first 5 labels for verification
+            # print("SHAPE OF LABELS:")
+            # print(self.labels[0].shape)
+
 
         start_time = time.time()
 
@@ -549,7 +548,16 @@ class ESMDataset:
 
                         for (slice_start, slice_end) in slice_positions:
                             if start >= slice_start and start < slice_end:
-                                new_labels.append(label)
+                                # Window the label to match the sequence window
+                                windowed_label = label[slice_start:slice_end]  # Slice the label
+                                # Pad to dimension if needed
+                                if windowed_label.shape[0] < dimension:
+                                    windowed_label = torch.nn.functional.pad(
+                                        windowed_label, (0, dimension - windowed_label.shape[0]), value=0
+                                    )
+                                elif windowed_label.shape[0] > dimension:
+                                    windowed_label = windowed_label[:dimension]  # Truncate if too long
+                                new_labels.append(windowed_label)
                             else:
                                 new_labels.append(torch.zeros(dimension, dtype=torch.long))
                         
@@ -638,6 +646,28 @@ class ESMDataset:
         if self.training is False:
             seq_dataset.starts = new_starts
             seq_dataset.ends = new_ends
+
+
+
+        if self.domain_boundary_detection is True:
+            
+            # print(seq_dataset.labels[0:2])
+
+            # Convert seq_dataset.labels to a tensor if it's a list
+            if isinstance(seq_dataset.labels, list):
+                if isinstance(seq_dataset.labels[0], torch.Tensor):
+                    # Pad all tensors to the same length before stacking
+                    max_len = max(label.shape[0] for label in seq_dataset.labels)
+                    padded_labels = []
+                    for label in seq_dataset.labels:
+                        # Pad with zeros to reach max_len
+                        padded = torch.nn.functional.pad(label, (0, max_len - label.shape[0]), value=0)
+                        padded_labels.append(padded)
+                    seq_dataset.labels = torch.stack(padded_labels)
+                else:
+                    seq_dataset.labels = torch.tensor(seq_dataset.labels, dtype=torch.long)
+
+            # print(seq_dataset.labels.shape)  # Print shape for debugging  
 
         # if RANK == 0:
         #     print( f"Seq: {seq_dataset.seqs[0:5]}, Label: {seq_dataset.labels[0:5]}")
@@ -950,6 +980,8 @@ class ESMDataset:
 
             total_size = size_tensor.item()
             chunk_size = 10000
+            if self.domain_boundary_detection is True:
+                chunk_size = 1000  # Smaller chunk size for domain boundary detection
 
 
             if RANK == 0:

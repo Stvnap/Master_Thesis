@@ -37,22 +37,22 @@ PROJECT_NAME = "Optuna_100d_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-NUM_LAYERS = 6
+NUM_LAYERS = 8
 NUM_HEADS = 8
 
 
-NUM_CLASSES = 1 # Number of classes for domain detection, set to 1 for binary classification
+NUM_CLASSES = 2 # Number of classes for domain detection, set to 1 for binary classification
 TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 
 EMB_BATCH = 1
-NUM_WORKERS_EMB = max(16, os.cpu_count())
+NUM_WORKERS_EMB = 1
 print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
-BATCH_SIZE = 64
+BATCH_SIZE = 8
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
-EPOCHS = 150
+EPOCHS = 50
 STUDY_N_TRIALS = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,10 +65,10 @@ print(f"Using device: {DEVICE}")
 class Transformer(nn.Module):
     def __init__(
         self,
-        input_dim,
-        hidden_dims,
-        num_classes,
-        num_heads,
+        input_dim,      # 1280 for ESM2-t33
+        hidden_dims,    # e.g., 512
+        num_classes,    # 1 for binary domain/non-domain
+        num_heads,      # 8
         dropout,
         activation,
         kernel_init,
@@ -79,90 +79,75 @@ class Transformer(nn.Module):
         self.dropout = dropout
         self.activation = activation
         self.kernel_init = kernel_init
-
-        model_dims = {
-            "esm2_t6_8M_UR50D": 320,
-            "esm2_t12_35M_UR50D": 480,
-            "esm2_t30_150M_UR50D": 640,
-            "esm2_t33_650M_UR50D": 1280,
-            "esm2_t36_3B_UR50D": 2560,
-            "esm2_t48_15B_UR50D": 5120,
-        }
-        expected_dim = model_dims.get(ESM_MODEL, None) 
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
 
-        # assert hidden_dims % num_heads == 0, "Hidden dim must be divisible by num heads"
+        # Ensure input_dim is divisible by num_heads for attention
+        assert input_dim % num_heads == 0, f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads})"
         
+        # Optional: Project ESM embeddings to different dimension
+        # self.input_projection = nn.Linear(input_dim, hidden_dims)
+        # working_dim = hidden_dims
+        working_dim = input_dim  # Use ESM embeddings directly
         
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dims),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dims, num_classes)
-        )
-
-
-        self.encoder = nn.TransformerEncoder(
-            self.encoder_layer(input_dim, hidden_dims, num_heads, dropout, activation),
-            num_layers=NUM_LAYERS)
-        
-        
-        # self.positional_encoding(input_dim, hidden_dims)
-        
-
-
-    # padding tokens are ignored, not needed if batch size is 1
-    def padding_mask(self,seq, pad_token=0):
-        mask = (seq != pad_token).unsqueeze(1).unsqueeze(2)
-        return mask
-
-    # POSITIONAL ENCODING:
-    # add a order so the model knows how to read it
-    def generate_positional_encoding(self,seq_len, d_model,device):
-        '''
-        Standard pe found in most transformer papers.
-        It uses sine and cosine functions of different frequencies.
-        '''
-        position = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)                            # create a column vector of positions, shape (seq_len, 1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))  # early positions have higher frequencies, later positions have lower frequencies
-        pe = torch.zeros(seq_len, d_model, device=device) # empty tensor for positional encoding
-
-        pe[:, 0::2] = torch.sin(position * div_term)  # apply sine to even indices
-        pe[:, 1::2] = torch.cos(position * div_term)  # apply cosine to odd indices
-
-        pe = pe.unsqueeze(1)  # add batch dimension, so shape becomes (seq_len, 1, d_model)
-
-        return pe
-
-
-    # ENCODER:
-    # the part that encodes the input sequence into a fixed-size representation
-    def encoder_layer(self,input_dim, hidden_dims, num_heads, dropout, activation):
-        return nn.TransformerEncoderLayer(
-            d_model=input_dim,
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=working_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dims,
+            dim_feedforward=working_dim * 4,  # Standard: 4x model dimension
             dropout=dropout,
             activation=activation,
+            batch_first=True  # Much easier to work with
+        )
+        
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=NUM_LAYERS
+        )
+        
+        # Per-position domain boundary classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(working_dim, hidden_dims),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dims, hidden_dims // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dims // 2, num_classes)
         )
 
+    def generate_positional_encoding(self, seq_len, d_model, device):
+        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, device=device).float() * 
+                           -(math.log(10000.0) / d_model))
+        
+        pe = torch.zeros(seq_len, d_model, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe.unsqueeze(0)  # Add batch dimension [1, seq_len, d_model]
+
     def forward(self, x):
-        seq_len, batch_size, input_dim = x.size()
+        # x shape: [batch_size, seq_len, input_dim]
+        batch_size, seq_len, input_dim = x.size()
+        
+        # Optional input projection
+        # x = self.input_projection(x)
+        
+        # Add positional encoding
         pe = self.generate_positional_encoding(seq_len, input_dim, x.device)
-        x = x + pe  # add positional encoding to input embeddings
-
-        x = nn.Dropout(self.dropout)(x)  # apply dropout to input embeddings
-
-        print("Input shape:", x.shape)      # before encoder
-        x = self.encoder(x)
-        print("Encoder output:", x.shape)
-        logits = self.classifier(x)
-        print("Classifier output:", logits.shape)
-
+        x = x + pe  # Broadcasting: [batch, seq, dim] + [1, seq, dim]
+        
+        # Apply dropout
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        
+        # Transformer processing (batch_first=True, so no transpose needed)
+        x = self.encoder(x)  # [batch_size, seq_len, input_dim]
+        
+        # Per-position classification for domain boundaries
+        logits = self.classifier(x)  # [batch_size, seq_len, num_classes]
+        
         return logits
-
 
 # -------------------------
 # 3. TRAINER
@@ -183,6 +168,10 @@ def main(Final_training=False):
         if RANK == 0:
             print("Loaded cached embeddings & labels from disk.")
             print("Train embedding shape:", train_embeddings.shape)  # <-- Add this line
+            print("Val embedding shape:", val_embeddings.shape)      # <-- Add this line
+            
+            print(train_labels.shape, val_labels.shape)
+
 
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
@@ -216,6 +205,16 @@ def main(Final_training=False):
         val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS_EMB, pin_memory=True
     )
 
+
+    train_labels_flat = train_labels.view(-1)  
+    counts = torch.bincount(train_labels_flat, minlength=NUM_CLASSES).float()
+    total = train_labels_flat.size(0)
+    weights = total / (NUM_CLASSES * counts)
+    weights = weights * (NUM_CLASSES / weights.sum())
+    weights = weights.to(DEVICE)
+    print(f"Class weights: {weights}")
+
+
     if RANK == 0:
         study = optuna.create_study(
             direction="minimize",
@@ -234,7 +233,7 @@ def main(Final_training=False):
         )
 
     def objective_wrapper(trial):
-        return objective(trial, train_embeddings, train_loader, val_loader, weights=None,domain_task=True)
+        return objective(trial, train_embeddings, train_loader, val_loader, weights=weights,domain_task=True,EPOCHS=EPOCHS)
     study.optimize(objective_wrapper, n_trials=STUDY_N_TRIALS,)
 
     if RANK == 0:
@@ -245,7 +244,7 @@ def main(Final_training=False):
     best_trial = study.best_trial
 
 
-    lit_model = load_best_model(best_trial, train_embeddings, weights)
+    lit_model = load_best_model(best_trial, train_embeddings, weights=None)
 
     lit_model.eval()
     if RANK == 0:
@@ -279,6 +278,7 @@ def main(Final_training=False):
             devices=-1,
             strategy="ddp",
             enable_progress_bar=True,
+            mixed_precision="16-mixed",
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
                 save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME

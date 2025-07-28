@@ -16,8 +16,11 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import Precision, Recall
+from sklearn.utils.class_weight import compute_class_weight
 
 from ESM_Embedder import DEVICE, RANK, ESMDataset
+
+torch.set_printoptions(threshold=float('inf'))  # Show full tensor
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
 
@@ -39,12 +42,12 @@ CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 CACHE_PATH = "./pickle/FoundEntriesALLProteins_1000d_.pkl"
-PROJECT_NAME = "Optuna_1000d_uncut_t33_ALL"
+PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 NUM_CLASSES = 1001  # classes + 1 for "other" class
-EPOCHS = 1
+EPOCHS = 49
 STUDY_N_TRIALS = 0
 BATCH_SIZE = 64
 NUM_WORKERS_EMB = max(16, os.cpu_count())
@@ -146,9 +149,9 @@ class LitClassifier(pl.LightningModule):
                 kernel_init,
             )
 
-            self.loss_fn = nn.BCEWithLogitsLoss(
-                reduction="none"
-            )  # for domain boundary detection
+
+
+            self.loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 15.0])) # for domain boundary detection
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -172,17 +175,31 @@ class LitClassifier(pl.LightningModule):
         assert not torch.isnan(x).any(), "Input contains NaN values"
         logits = self(x)
         assert not torch.isnan(logits).any(), "Logits contain NaN values"
-        try:
-            loss = self.loss_fn(logits.view(-1, 2), y.view(-1))         # for domain boundary detection
-        except:
+
+        # print('SHAPES',logits.shape, y.shape)
+
+        if self.domain_task is True:
+            # Process each sequence individually
+            batch_size, seq_len, num_classes = logits.shape
+            losses = []
+            
+            for i in range(batch_size):
+                seq_logits = logits[i]  # [seq_len, num_classes]
+                seq_labels = y[i]       # [seq_len]
+                seq_loss = self.loss_fn(seq_logits, seq_labels)
+                losses.append(seq_loss)
+            
+            loss = torch.stack(losses).mean()
+        else:
             loss = self.loss_fn(logits, y)
-        # print(loss)
-        assert not torch.isnan(loss), "Validation loss is NaN"
+
+        assert not torch.isnan(loss), "Training loss is NaN"
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
+        
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
@@ -190,20 +207,48 @@ class LitClassifier(pl.LightningModule):
         assert not torch.isnan(x).any(), "Input contains NaN values"
         logits = self(x)
         assert not torch.isnan(logits).any(), "Logits contain NaN values"
-        try:
-            loss = self.loss_fn(logits.view(-1, 2), y.view(-1))         # for domain boundary detection
-        except:
+        
+        if self.domain_task is True:
+            # Process each sequence individually
+            batch_size, seq_len, num_classes = logits.shape
+            losses = []
+            all_preds = []
+            all_labels = []
+            
+            for i in range(batch_size):
+                seq_logits = logits[i]  # [seq_len, num_classes]
+                seq_labels = y[i]       # [seq_len]
+                seq_loss = self.loss_fn(seq_logits, seq_labels)
+                losses.append(seq_loss)
+                
+                seq_preds = torch.argmax(seq_logits, dim=-1)  # [seq_len]
+                all_preds.append(seq_preds)
+                all_labels.append(seq_labels)
+            
+            loss = torch.stack(losses).mean()
+            preds = torch.cat(all_preds)  # Concatenate all sequence predictions
+            y_flat = torch.cat(all_labels)  # Concatenate all sequence labels
+        else:
             loss = self.loss_fn(logits, y)
-        # print(loss)
+            preds = torch.argmax(logits, dim=-1)
+            y_flat = y
+
         assert not torch.isnan(loss), "Validation loss is NaN"
-        preds = torch.argmax(logits, dim=1)
 
-        if self.domain_task is True:  # for domain boundary detection
-            preds = preds.view(-1)  # Flatten predictions
-            y = y.view(-1)  # Flatten labels
+        if RANK == 0:  # Only print for first batch to avoid spam
+            if batch_idx == 0:  # Only print for first batch to avoid spam
+                print(f"Batch {batch_idx}:")
+                print(f"Preds: {preds}")
+                print(f"Logits sample (first sequence, first 5 positions):\n{logits[0, :5, :]}")
+                print(f"Max logits: {logits.max()}, Min logits:\n{logits.min()}")
+                print(f"Class 0 logits mean: {logits[:, :, 0].mean()}")
+                print(f"Class 1 logits mean: {logits[:, :, 1].mean()}")
+                print(f"Loss function weights: {self.loss_fn.weight}")
+                print(f"Prediction distribution: {torch.bincount(preds)}")
+                print(f"True label distribution: {torch.bincount(y_flat)}")
+                print("-" * 50)
 
-
-        acc = (preds == y).float().mean()
+        acc = (preds == y_flat).float().mean()
 
         self.log(
             "val_loss",
@@ -217,41 +262,61 @@ class LitClassifier(pl.LightningModule):
             "val_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
         )
 
-        self.precision_metric(preds, y)
-        self.recall_metric(preds, y)
+        self.precision_metric(preds, y_flat)
+        self.recall_metric(preds, y_flat)
 
     def on_validation_epoch_end(self):
         prec_all = self.precision_metric.compute()
         rec_all = self.recall_metric.compute()
 
         # Log metrics for each class individually
-        for class_idx in range(NUM_CLASSES):
-            if class_idx < len(prec_all):
-                val_prec = (
-                    prec_all[class_idx].item()
-                    if not torch.isnan(prec_all[class_idx])
-                    else 0.0
-                )
-                self.log(
-                    f"val_prec_{class_idx}", val_prec, prog_bar=False, sync_dist=True
-                )
+        # print(NUM_CLASSES, "classes in total")
+        if self.domain_task is True:
+            NUM_CLASSES = 2
+            if RANK == 0:
+                print("Domain boundary detection task, only 2 classes")
 
-            if class_idx < len(rec_all):
-                val_rec = (
-                    rec_all[class_idx].item()
-                    if not torch.isnan(rec_all[class_idx])
-                    else 0.0
-                )
-                self.log(
-                    f"val_rec_{class_idx}", val_rec, prog_bar=False, sync_dist=True
-                )
+            boundary_precision = (
+                prec_all[1].item() if not torch.isnan(prec_all[1]) else 0.0
+            )
+            boundary_recall = (
+                rec_all[1].item() if not torch.isnan(rec_all[1]) else 0.0
+            )
+            self.log(
+                "val_boundary_prec", boundary_precision, prog_bar=True, sync_dist=True
+            )
+            self.log(
+                "val_boundary_rec", boundary_recall, prog_bar=True, sync_dist=True
+            )
 
-        # Log average metrics across all classes
-        avg_prec = prec_all.nanmean().item() if len(prec_all) > 0 else 0.0
-        avg_rec = rec_all.nanmean().item() if len(rec_all) > 0 else 0.0
+        else:
+            for class_idx in range(NUM_CLASSES):
+                if class_idx < len(prec_all):
+                    val_prec = (
+                        prec_all[class_idx].item()
+                        if not torch.isnan(prec_all[class_idx])
+                        else 0.0
+                    )
+                    self.log(
+                        f"val_prec_{class_idx}", val_prec, prog_bar=False, sync_dist=True
+                    )
 
-        self.log("val_prec_avg", avg_prec, prog_bar=True, sync_dist=True)
-        self.log("val_rec_avg", avg_rec, prog_bar=True, sync_dist=True)
+                if class_idx < len(rec_all):
+                    val_rec = (
+                        rec_all[class_idx].item()
+                        if not torch.isnan(rec_all[class_idx])
+                        else 0.0
+                    )
+                    self.log(
+                        f"val_rec_{class_idx}", val_rec, prog_bar=False, sync_dist=True
+                    )
+
+            # Log average metrics across all classes
+            avg_prec = prec_all.nanmean().item() if len(prec_all) > 0 else 0.0
+            avg_rec = rec_all.nanmean().item() if len(rec_all) > 0 else 0.0
+
+            self.log("val_prec_avg", avg_prec, prog_bar=True, sync_dist=True)
+            self.log("val_rec_avg", avg_rec, prog_bar=True, sync_dist=True)
 
         self.precision_metric.reset()
         self.recall_metric.reset()
@@ -279,7 +344,7 @@ class LitClassifier(pl.LightningModule):
 
 
 def objective(
-    trial, train_embeddings, train_loader, val_loader, weights, domain_task=False
+    trial, train_embeddings, train_loader, val_loader, weights, domain_task=False, EPOCHS=EPOCHS
 ):
     if domain_task is False:
         if RANK == 0:
@@ -360,8 +425,9 @@ def objective(
         # Domain boundary detection task, HPs for Transformer model
         if RANK == 0:
 
+
             d_model = 8
-            n_heads = trial.suggest_int("num_heads", 2, 8, step=2)
+            n_heads = 2
 
             n_layers = trial.suggest_int("num_hidden_layers", 6, 12, 24)
             d_ff = 4 * d_model
@@ -369,7 +435,7 @@ def objective(
 
             drop = trial.suggest_float("dropout", 0.1, 0.5)
             drop_attn = trial.suggest_float("dropout_attn", 0.1, 0.5)
-            lr = trial.suggest_float("lr", 1e-5, 1e2, log=True)
+            lr = trial.suggest_float("lr", 1e-5, 1e-4, log=True)
             wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
             optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
             if optimizer == "adam":
@@ -406,18 +472,25 @@ def objective(
                 "activation": activation,
                 "kernel_init": kernel_init,
             }
+            print(
+            f"\n=== Trial {trial.number} ===\n"
+            f"Hidden layers: {params['n_layers']}, Model dim: {params['d_model']}\n"
+            f"Dropout: {params['drop']:.3f}, LR: {params['lr']:.6f}, WD: {params['weight_decay']:.6f}\n"
+            f"Optimizer: {params['optimizer_class'].__name__}, Activation: {params['activation'].__class__.__name__}\n"
+            f"========================\n")
 
         else:
             params = None
+
 
         params_list = [params]
         dist.broadcast_object_list(params_list, src=0)
         params = params_list[0]
 
         model = LitClassifier(
-            input_dim=train_embeddings.size(1),
+            input_dim=train_embeddings.size(2),
             hidden_dims=params["d_model"],
-            num_classes=NUM_CLASSES,
+            num_classes=2,  # Binary classification for domain boundary detection
             optimizer_class=params["optimizer_class"],
             activation=params["activation"],
             kernel_init=params["kernel_init"],
@@ -533,7 +606,12 @@ def main(Final_training=False):
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, "rb") as f:
             train_embeddings, train_labels, val_embeddings, val_labels = pickle.load(f)
-        print("Loaded cached embeddings & labels from disk.")
+        print("Loaded cached embeddings & labels from disk.\n")
+
+
+
+        print(train_embeddings.shape, train_labels.shape)
+        print(val_embeddings.shape, val_labels.shape)
 
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
@@ -557,6 +635,9 @@ def main(Final_training=False):
 
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
+
+
+
 
         with open(CACHE_PATH, "wb") as f:
             pickle.dump(
