@@ -1,5 +1,6 @@
 import time
-
+import h5py
+import numpy as np
 import esm
 import pandas as pd
 import torch
@@ -12,6 +13,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
+import gc
+import sys
 world_size = int(os.environ.get("WORLD_SIZE", 1))
 use_ddp = world_size > 1
 
@@ -176,7 +179,7 @@ class ESMDataset:
 
 
         if skip_df is None:
-            df = pd.read_csv(csv_path,nrows=1000)          ##################### TESTING PURPOSES
+            df = pd.read_csv(csv_path,nrows=3000)          ##################### TESTING PURPOSES
             if (
                 "start" in df.columns
                 and "end" in df.columns
@@ -695,6 +698,10 @@ class ESMDataset:
             )
         print(f"Each Rank will process sequences {sampler.num_samples}")
 
+        chunk = 1
+
+        seq_dataset = None  # Clear the dataset to free memory
+
         for batch_num, batch_data in enumerate(dataloader):
             if self.training is True:
                 batch_seqs, batch_labels = batch_data
@@ -720,10 +727,46 @@ class ESMDataset:
                     mask = mask[:, 1:-1]
                     embeddings = embeddings[:, 1:-1, :]
 
+                    if RANK == 0 and batch_num == 0:
+                        print(
+                            f"Batch {batch_num + 1}: {embeddings.shape} embeddings, {mask.shape} mask"
+                        )
+                        print(embeddings[0:2, 0:5, 0:5])  # Print first 2 embeddings for debugging
+
                     if self.domain_boundary_detection is True:
-                        embeddings = embeddings.cpu()   # Move to CPU immediately
+                        # embeddings = embeddings.cpu()   # Move to CPU immediately
                         all_embeddings.append(embeddings)
                         all_labels.append(batch_labels)
+
+                        if batch_num % 1000 == 0 and batch_num > 0:
+                            # # Move the previous chunk to CPU in batch
+                            # start_idx = 0
+                            # end_idx = min(1001, len(all_embeddings))
+
+                            start_idx = (chunk-1) * 1000
+                            end_idx = min((chunk * 1000)+1, len(all_embeddings))
+                            
+                            # print(start_idx, end_idx, len(all_embeddings), len(all_labels))
+
+                            # Batch move to CPU (more efficient)
+                            for i in range(start_idx, end_idx):
+                                all_embeddings[i] = all_embeddings[i].cpu()
+                            
+                            for i in range(start_idx, end_idx):
+                                all_labels[i] = all_labels[i].cpu()
+                            
+                            chunk += 1
+
+                            # Optional: Check for any remaining CUDA tensors
+                            for i, emb in enumerate(all_embeddings):
+                                if emb.is_cuda:
+                                    print(f"Warning: embedding {i} still on GPU")
+            
+                            torch.cuda.empty_cache()  # Add this
+                            torch.cuda.synchronize()  # Ensure all operations are complete
+
+
+
                     else:
                         lengths = mask.sum(dim=1, keepdim=True)
                         pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
@@ -736,7 +779,7 @@ class ESMDataset:
                         all_ends.append(batch_end)
 
                 # Progress reporting
-                if batch_num % 10 == 0 or batch_num == len(dataloader) - 1 and RANK == 0:   # for clearer output
+                if batch_num % 1 == 0 or batch_num == len(dataloader) - 1 and RANK == 0:   # for clearer output
                     elapsed_time = time.time() - start_time
                     if batch_num > 0:
                         avg_time_per_batch = elapsed_time / (batch_num + 1)
@@ -819,35 +862,71 @@ class ESMDataset:
 
             # gather global max legnth of embeddings and labels for padding
             if self.domain_boundary_detection is True:
-                # First, ensure all embeddings are [L, D]
-                all_embeddings = [emb.squeeze(0) if emb.dim() == 3 and emb.shape[0] == 1 else emb for emb in all_embeddings]
+                if batch_num % 1000 == 0 and batch_num > 0 or batch_num == len(dataloader) - 1: 
 
-                # Pad all to the same length
-                max_len = max(emb.shape[0] for emb in all_embeddings)
-                all_embeddings = [
-                    torch.nn.functional.pad(emb, (0, 0, 0, max_len - emb.shape[0]), value=0)
-                    for emb in all_embeddings
-                ]  # Each is now [max_len, D]
+                    # Pad all to the same length
+                    max_len = 1000
 
-                # Stack into [N, max_len, D]
-                local_embeddings = torch.stack(all_embeddings, dim=0)
-
-                # Ensure all elements in all_labels are tensors
-                # Ensure all elements in all_labels are [L]
-                all_labels = [
-                    lbl.squeeze(0) if lbl.dim() == 2 and lbl.shape[0] == 1 else lbl
-                    for lbl in all_labels
-                ]
-                max_len = max(lbl.shape[0] for lbl in all_labels)
-
-                all_labels = [
-                    torch.nn.functional.pad(lbl, (0, max_len - lbl.shape[0]), value=0)
-                    for lbl in all_labels
-                ]  # Each is now [max_len]
+                    all_embeddings = [
+                        torch.nn.functional.pad(emb, (0, 0, 0, max_len - emb.shape[1]), value=0)
+                        for emb in all_embeddings
+                    ]  
+                    # local_embeddings = torch.stack(all_embeddings, dim=0)
 
 
 
-                local_labels = torch.stack(all_labels, dim=0)
+                    all_labels = [
+                        torch.nn.functional.pad(lbl, (0, max_len - lbl.shape[0]), value=0)
+                        for lbl in all_labels
+                    ]  
+
+                    # local_labels = torch.stack(all_labels, dim=0)
+
+
+                    # Convert list of tensors to a single tensor, then to numpy
+                    embeddings_tensor = torch.stack([emb.cpu() for emb in all_embeddings])
+                    labels_tensor = torch.stack([lbl.cpu() for lbl in all_labels])
+
+                    with h5py.File(f"./temp/embeddings_rank_{RANK}.h5", "a") as f:
+                        f[f"batch_{batch_num}_rank_{RANK}"] = embeddings_tensor.numpy()
+                        f[f"labels_batch_{batch_num}_rank_{RANK}"] = labels_tensor.numpy()
+
+
+                    embeddings_tensor = None
+                    labels_tensor = None
+                    all_embeddings.clear()
+                    all_labels.clear()
+                    chunk=1
+
+
+                    # # Memory profiling - check top 10 memory objects
+
+                    # def get_top_memory_objects():
+                    #     gc.collect()
+                    #     objects = gc.get_objects()
+                        
+                    #     # Count objects by type
+                    #     type_counts = {}
+                    #     for obj in objects:
+                    #         obj_type = type(obj).__name__
+                    #         size = sys.getsizeof(obj)
+                    #         if obj_type not in type_counts:
+                    #             type_counts[obj_type] = {'count': 0, 'total_size': 0}
+                    #         type_counts[obj_type]['count'] += 1
+                    #         type_counts[obj_type]['total_size'] += size
+                        
+                    #     # Sort by total size
+                    #     sorted_types = sorted(type_counts.items(), 
+                    #                          key=lambda x: x[1]['total_size'], 
+                    #                          reverse=True)
+                        
+                    #     print(f"Rank {RANK}: Top 10 memory objects:")
+                    #     for i, (obj_type, info) in enumerate(sorted_types[:10]):
+                    #         print(f"  {i+1}. {obj_type}: {info['count']} objects, "
+                    #               f"{info['total_size'] / 1024 / 1024:.2f} MB")
+
+                    # get_top_memory_objects()
+
 
 
             else:
@@ -893,7 +972,7 @@ class ESMDataset:
         # Synchronize all processes
         dist.barrier()
 
-        if dist.get_world_size() > 1:
+        if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
             # Gather embeddings and labels from all processes
             local_size = torch.tensor([local_embeddings.size(0)], dtype=torch.int64, device="cuda")
             all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
@@ -1055,6 +1134,50 @@ class ESMDataset:
                     del ends_chunk_gpu
 
                 torch.cuda.empty_cache()
+
+        elif self.domain_boundary_detection is True:
+            
+        # Open embeddings and labels from all ranks from .h5 files
+            all_embeddings = []
+            all_labels = []
+
+            if RANK == 0:
+                print("Gathering embeddings and labels from all ranks...")
+
+            for rank in range(dist.get_world_size()):
+                try:
+                    with h5py.File(f"./temp/embeddings_rank_{rank}.h5", "r") as f:
+                        for key in f.keys():
+                            if "batch" in key and not key.startswith("labels_"):
+                                # Load embeddings
+                                embeddings = torch.tensor(f[key][:], dtype=torch.float32)
+                                all_embeddings.append(embeddings)
+                                
+                                # Construct corresponding labels key
+                                labels_key = f"labels_{key}"
+                                if labels_key in f:
+                                    labels = torch.tensor(f[labels_key][:], dtype=torch.long)
+                                    all_labels.append(labels)
+                                else:
+                                    print(f"Warning: No labels found for key {key}")
+                except FileNotFoundError:
+                    print(f"Warning: File ./temp/embeddings_rank_{rank}.h5 not found")
+                    continue
+
+            # Concatenate all embeddings and labels
+            if all_embeddings:
+                final_embeddings = torch.cat(all_embeddings, dim=0)
+                final_labels = torch.cat(all_labels, dim=0)
+                if self.training is False:
+                    final_starts = torch.cat(all_starts, dim=0)
+                    final_ends = torch.cat(all_ends, dim=0)
+
+
+                if RANK == 0:
+                    print(f"Loaded {final_embeddings.shape[0]} total samples")
+                    print(f"Final embeddings shape: {final_embeddings.shape}")
+                    print(f"Final labels shape: {final_labels.shape}")
+
 
         else:
             final_embeddings = local_embeddings

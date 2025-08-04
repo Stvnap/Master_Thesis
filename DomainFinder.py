@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
+import numpy as np
 import math
 import pickle
 import optuna
@@ -10,7 +11,7 @@ import pytorch_lightning as pl
 import torch.distributed as dist
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier
 from ESM_Embeddings_HP_search import objective,load_best_model
 
@@ -33,13 +34,9 @@ CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"
-PROJECT_NAME = "Optuna_100d_uncut_t33_domains_boundary"
+PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
-
-NUM_LAYERS = 8
-NUM_HEADS = 8
-
 
 NUM_CLASSES = 2 # Number of classes for domain detection, set to 1 for binary classification
 TRAIN_FRAC = 0.6
@@ -47,16 +44,16 @@ VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 
 EMB_BATCH = 1
-NUM_WORKERS_EMB = 1
-print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
+NUM_WORKERS_EMB = 32
+# print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 8
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 50
-STUDY_N_TRIALS = 10
+STUDY_N_TRIALS = 20
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
+# print(f"Using device: {DEVICE}")
 
 
 # -------------------------
@@ -66,12 +63,13 @@ class Transformer(nn.Module):
     def __init__(
         self,
         input_dim,      # 1280 for ESM2-t33
-        hidden_dims,    # e.g., 512
-        num_classes,    # 1 for binary domain/non-domain
-        num_heads,      # 8
+        hidden_dims,    
+        num_classes,   
+        num_heads,     
         dropout,
         activation,
         kernel_init,
+        num_layers
     ):
         super(Transformer, self).__init__()
         self.num_classes = num_classes
@@ -81,6 +79,7 @@ class Transformer(nn.Module):
         self.kernel_init = kernel_init
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
+        self.num_layers = num_layers
 
         # Ensure input_dim is divisible by num_heads for attention
         assert input_dim % num_heads == 0, f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads})"
@@ -97,23 +96,20 @@ class Transformer(nn.Module):
             dim_feedforward=working_dim * 4,  # Standard: 4x model dimension
             dropout=dropout,
             activation=activation,
-            batch_first=True  # Much easier to work with
+            batch_first=True  # Much easier to work withs
         )
         
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=NUM_LAYERS
+            num_layers=self.num_layers
         )
         
         # Per-position domain boundary classifier
         self.classifier = nn.Sequential(
-            nn.Linear(working_dim, hidden_dims),
+            nn.Linear(working_dim, working_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dims, hidden_dims // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dims // 2, num_classes)
+            nn.Linear(working_dim // 2, num_classes)
         )
 
     def generate_positional_encoding(self, seq_len, d_model, device):
@@ -222,6 +218,7 @@ def main(Final_training=False):
             load_if_exists=True,
             study_name=PROJECT_NAME,
         )
+
     dist.barrier()  # Ensure all ranks are synchronized before starting the study
 
     if RANK != 0:
@@ -244,7 +241,7 @@ def main(Final_training=False):
     best_trial = study.best_trial
 
 
-    lit_model = load_best_model(best_trial, train_embeddings, weights=None)
+    lit_model = load_best_model(best_trial, train_embeddings, weights=None,domain_task=True)
 
     lit_model.eval()
     if RANK == 0:
@@ -252,21 +249,60 @@ def main(Final_training=False):
 
     # Evaluate on validation set
     device = lit_model.device
-    with torch.no_grad():
-        val_embeddings_gpu = val_embeddings.to(device)
-        # Permute to [seq_len, batch_size, input_dim]
-        val_embeddings_gpu = val_embeddings_gpu.permute(1, 0, 2)
-        val_logits = lit_model(val_embeddings_gpu)
-    val_preds = val_logits.argmax(dim=1).cpu().numpy()
-    val_true = val_labels.numpy()
+    # print(device)
 
-    acc = accuracy_score(val_true, val_preds)
+    all_preds = []
+    all_true = []
+    sequence_level_metrics = []
+    
+    with torch.no_grad():
+        for batch_embeddings, batch_labels in val_loader:
+            batch_embeddings = batch_embeddings.to(device)
+            batch_logits = lit_model(batch_embeddings)
+            batch_preds = batch_logits.argmax(dim=-1)  # [batch, seq_len]
+            
+            # Keep sequence structure for analysis
+            for i in range(batch_preds.size(0)):
+                seq_preds = batch_preds[i].cpu().numpy()
+                seq_labels = batch_labels[i].cpu().numpy()
+                
+                # Sequence-level metrics
+                boundary_positions_pred = np.where(seq_preds == 1)[0]
+                boundary_positions_true = np.where(seq_labels == 1)[0]
+                
+                # Store for sequence-level analysis
+                sequence_level_metrics.append({
+                    'pred_boundaries': len(boundary_positions_pred),
+                    'true_boundaries': len(boundary_positions_true),
+                    'correct_boundaries': len(np.intersect1d(boundary_positions_pred, boundary_positions_true))
+                })
+                
+                # Flatten for overall metrics
+                all_preds.extend(seq_preds)
+                all_true.extend(seq_labels)
+
+    
+    # Boundary-specific metrics
+    boundary_prec = precision_score(all_true, all_preds, pos_label=1, zero_division=0)
+    boundary_rec = recall_score(all_true, all_preds, pos_label=1, zero_division=0)
+    
+    # Sequence-level metrics
+    total_sequences = len(sequence_level_metrics)
+    sequences_with_correct_boundaries = sum(1 for m in sequence_level_metrics if m['correct_boundaries'] > 0)
+    avg_boundary_detection_rate = np.mean([m['correct_boundaries'] / max(m['true_boundaries'], 1) for m in sequence_level_metrics])
+    
     if RANK == 0:
-        print(f"Validation Accuracy: {acc:.4f}")
+        print(f"\n=== Boundary-Specific Metrics ===")
+        print(f"Boundary Precision: {boundary_prec:.4f}")
+        print(f"Boundary Recall: {boundary_rec:.4f}")
+        print(f"\n=== Sequence-Level Metrics ===")
+        print(f"Sequences with detected boundaries: {sequences_with_correct_boundaries}/{total_sequences} ({sequences_with_correct_boundaries/total_sequences:.2%})")
+        print(f"Average boundary detection rate: {avg_boundary_detection_rate:.4f}")
+        
 
     if Final_training is True:
         early_stop = EarlyStopping(
-            monitor="val_loss", patience=10, mode="min", verbose=True
+            monitor="val_loss", patience=5, mode="min", verbose=True
         )
         checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
@@ -278,12 +314,16 @@ def main(Final_training=False):
             devices=-1,
             strategy="ddp",
             enable_progress_bar=True,
-            mixed_precision="16-mixed",
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
                 save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
             ),
         )
+
+        if RANK == 0:
+            print("-" * 100)
+            print("Starting training...")
+            print("-" * 100)
 
         trainer.fit(lit_model, train_loader, val_loader)
 
@@ -295,3 +335,7 @@ def main(Final_training=False):
 
 if __name__ == "__main__":
     main(Final_training=False)
+    if RANK == 0:
+        print("\nFinished running DomainFinder\n")
+    dist.barrier()  # Ensure all processes reach this point before exiting
+    dist.destroy_process_group()  # Clean up the process group

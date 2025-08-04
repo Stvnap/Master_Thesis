@@ -47,7 +47,7 @@ pickle/
 checkpoints/
 Results/
 temp/
-
+backup/
 
 
 # scripts #

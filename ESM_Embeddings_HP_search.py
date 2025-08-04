@@ -112,6 +112,7 @@ class LitClassifier(pl.LightningModule):
         class_weights=None,
         domain_task=False,
         num_heads=8,
+        num_layers=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -120,6 +121,7 @@ class LitClassifier(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.domain_task = domain_task
+        self.class_weights = class_weights
 
         # base model
         if domain_task is False:
@@ -147,11 +149,59 @@ class LitClassifier(pl.LightningModule):
                 dropout,
                 activation,
                 kernel_init,
+                num_layers
             )
 
 
 
-            self.loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 15.0])) # for domain boundary detection
+            def loss_fn_boundary(logits, labels, class_weights=None):                
+                """
+                Custom loss function for domain boundary detection with margin-based clustering penalty
+                and spatial distance penalty for isolated predictions.
+                """
+                # Use weighted cross-entropy if class weights provided
+                if class_weights is not None:
+                    base_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')(logits, labels)
+                else:
+                    base_loss = nn.CrossEntropyLoss(reduction='none')(logits, labels)
+                                    
+                # Apply margin weighting
+                margin = 0.5  # Margin for clustering penalty
+                margin_weights = torch.where(labels == 1, 1.0, 1.0 + margin)
+                
+                # Get predictions for spatial penalty
+                preds = torch.argmax(logits, dim=-1)
+                
+                # Spatial clustering penalty
+                spatial_penalty = torch.ones_like(base_loss)
+                distance_threshold = 20  # Maximum distance to consider for clustering
+                isolation_penalty = 2.0  # Multiplier for isolated predictions
+                
+                # Find positions where we predict boundary (class 1)
+                pred_boundary_positions = (preds == 1).nonzero(as_tuple=True)[0]
+                true_boundary_positions = (labels == 1).nonzero(as_tuple=True)[0]
+                
+                if len(pred_boundary_positions) > 0 and len(true_boundary_positions) > 0:
+                    for pred_pos in pred_boundary_positions:
+                        # Calculate minimum distance to any true boundary
+                        distances = torch.abs(true_boundary_positions.float() - pred_pos.float())
+                        min_distance = torch.min(distances)
+                        
+                        # Apply penalty if prediction is too far from any true boundary
+                        if min_distance > distance_threshold:
+                            spatial_penalty[pred_pos] = isolation_penalty
+                
+                # Combine all penalties
+                combined_weights = margin_weights * spatial_penalty
+                weighted_loss = base_loss * combined_weights
+                
+                return weighted_loss.mean()
+
+
+            def loss_fn_boundary_wrapper(logits, labels):
+                return loss_fn_boundary(logits, labels, self.class_weights)
+
+            self.loss_fn = loss_fn_boundary_wrapper
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -237,16 +287,17 @@ class LitClassifier(pl.LightningModule):
 
         if RANK == 0:  # Only print for first batch to avoid spam
             if batch_idx == 0:  # Only print for first batch to avoid spam
-                print(f"Batch {batch_idx}:")
-                print(f"Preds: {preds}")
-                print(f"Logits sample (first sequence, first 5 positions):\n{logits[0, :5, :]}")
-                print(f"Max logits: {logits.max()}, Min logits:\n{logits.min()}")
-                print(f"Class 0 logits mean: {logits[:, :, 0].mean()}")
-                print(f"Class 1 logits mean: {logits[:, :, 1].mean()}")
-                print(f"Loss function weights: {self.loss_fn.weight}")
-                print(f"Prediction distribution: {torch.bincount(preds)}")
-                print(f"True label distribution: {torch.bincount(y_flat)}")
-                print("-" * 50)
+        #         # print(f"Batch {batch_idx}:")
+                  print(f"Preds: {preds}")
+                  # print(f"Labels: {y_flat}")
+        #         print(f"Logits sample (first sequence, first 5 positions):\n{logits[0, :5, :]}")
+        #         # print(f"Max logits: {logits.max()}, Min logits:\n{logits.min()}")
+        #         # print(f"Class 0 logits mean: {logits[:, :, 0].mean()}")
+        #         # print(f"Class 1 logits mean: {logits[:, :, 1].mean()}")
+        #         # print(f"Loss function weights: {self.loss_fn.weight}")
+        #         print(f"Prediction distribution: {torch.bincount(preds)}")
+        #         print(f"True label distribution: {torch.bincount(y_flat)}")
+        #         print("-" * 50)
 
         acc = (preds == y_flat).float().mean()
 
@@ -273,8 +324,8 @@ class LitClassifier(pl.LightningModule):
         # print(NUM_CLASSES, "classes in total")
         if self.domain_task is True:
             NUM_CLASSES = 2
-            if RANK == 0:
-                print("Domain boundary detection task, only 2 classes")
+            # if RANK == 0:
+            #     print("Domain boundary detection task, only 2 classes")
 
             boundary_precision = (
                 prec_all[1].item() if not torch.isnan(prec_all[1]) else 0.0
@@ -426,10 +477,14 @@ def objective(
         if RANK == 0:
 
 
-            d_model = 8
-            n_heads = 2
+            d_model = trial.suggest_categorical("d_model", [256, 512, 768, 1024])
+            n_heads = trial.suggest_categorical("n_heads", [4, 8, 16])
 
-            n_layers = trial.suggest_int("num_hidden_layers", 6, 12, 24)
+            while d_model % n_heads != 0:
+                n_heads = trial.suggest_categorical("n_heads", [4, 8, 16])
+
+
+            n_layers = trial.suggest_int("n_layers", 2, 4, step=2)
             d_ff = 4 * d_model
             max_seq_len = trial.suggest_int("max_seq_len", 100, 1000, step=100)
 
@@ -471,10 +526,13 @@ def objective(
                 "optimizer_class": optimizer_class,
                 "activation": activation,
                 "kernel_init": kernel_init,
-            }
+                }
+    
             print(
             f"\n=== Trial {trial.number} ===\n"
             f"Hidden layers: {params['n_layers']}, Model dim: {params['d_model']}\n"
+            f"Number of heads: {params['n_heads']}, FF dim: {params['d_ff']}\n"
+            f"Attention dropout: {params['drop_attn']:.3f}, weights: {weights}\n"
             f"Dropout: {params['drop']:.3f}, LR: {params['lr']:.6f}, WD: {params['weight_decay']:.6f}\n"
             f"Optimizer: {params['optimizer_class'].__name__}, Activation: {params['activation'].__class__.__name__}\n"
             f"========================\n")
@@ -500,10 +558,11 @@ def objective(
             class_weights=weights,
             domain_task=True,  # Set to True if using domain boundary detection
             num_heads=params["n_heads"],
+            num_layers=params["n_layers"],
         )
 
     early_stop = EarlyStopping(
-        monitor="val_loss", patience=10, mode="min", verbose=True
+        monitor="val_loss", patience=5, mode="min", verbose=True
     )
     checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
@@ -527,40 +586,89 @@ def objective(
     return checkpoint_callback.best_model_score.item()
 
 
-def load_best_model(trial, train_embeddings, weights):
-    p = trial.params
+def load_best_model(trial, train_embeddings, weights, domain_task=False):
 
-    n_neurons = p["num_neurons"]
-    n_layers = p["num_hidden_layers"]
-    hidden_dims = [n_neurons] * n_layers
+    if domain_task is False:
+        p = trial.params
 
-    opt_name = p["optimizer"]
-    if opt_name == "adam":
-        optimizer_class = torch.optim.Adam
-    elif opt_name == "adamw":
-        optimizer_class = torch.optim.AdamW
+        n_neurons = p["num_neurons"]
+        n_layers = p["num_hidden_layers"]
+        hidden_dims = [n_neurons] * n_layers
+
+        opt_name = p["optimizer"]
+        if opt_name == "adam":
+            optimizer_class = torch.optim.Adam
+        elif opt_name == "adamw":
+            optimizer_class = torch.optim.AdamW
+        else:
+            optimizer_class = torch.optim.SGD
+
+        act_name = p["activation"]
+        if act_name == "relu":
+            activation_fn = nn.ReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+        elif act_name == "gelu":
+            activation_fn = nn.GELU()
+            kernel_init = nn.init.xavier_normal_
+        else:  # "leaky_relu"
+            activation_fn = nn.LeakyReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+
+        drop = p["dropout"]
+        lr = p["lr"]
+        wd = p["weight_decay"]
+
+        model = LitClassifier(
+            input_dim=train_embeddings.size(1),
+            hidden_dims=hidden_dims,
+            num_classes=NUM_CLASSES,
+            optimizer_class=optimizer_class,
+            activation=activation_fn,
+            kernel_init=kernel_init,
+            lr=lr,
+            weight_decay=wd,
+            dropout=drop,
+            class_weights=weights,
+        )
+
     else:
-        optimizer_class = torch.optim.SGD
+        p = trial.params
+        # print(f"Available parameters: {list(p.keys())}")  # Debug line
+        # print(f"Full params: {p}")  # Debug line
+        d_model = p["d_model"]
+        n_heads = p["n_heads"]
 
-    act_name = p["activation"]
-    if act_name == "relu":
-        activation_fn = nn.ReLU(inplace=True)
-        kernel_init = nn.init.kaiming_normal_
-    elif act_name == "gelu":
-        activation_fn = nn.GELU()
-        kernel_init = nn.init.xavier_normal_
-    else:  # "leaky_relu"
-        activation_fn = nn.LeakyReLU(inplace=True)
-        kernel_init = nn.init.kaiming_normal_
+        n_layers = p["n_layers"]
+       
+        d_ff = 4* d_model
 
-    drop = p["dropout"]
-    lr = p["lr"]
-    wd = p["weight_decay"]
+        act_name = p["activation"]
+        if act_name == "relu":
+            activation_fn = nn.ReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+        elif act_name == "gelu":
+            activation_fn = nn.GELU()
+            kernel_init = nn.init.xavier_normal_
+        else:  # "leaky_relu"
+            activation_fn = nn.LeakyReLU(inplace=True)
+            kernel_init = nn.init.kaiming_normal_
+        
+        drop = p["dropout"]
+        drop_attn = p["dropout_attn"]
+        lr = p["lr"]
+        wd = p["weight_decay"]
+        opt_name = p["optimizer"]
+        if opt_name == "adam":
+            optimizer_class = torch.optim.Adam
+        elif opt_name == "adamw":
+            optimizer_class = torch.optim.AdamW
+        else:
+            optimizer_class = torch.optim.SGD
 
-    model = LitClassifier(
-        input_dim=train_embeddings.size(1),
-        hidden_dims=hidden_dims,
-        num_classes=NUM_CLASSES,
+        model = LitClassifier(
+        input_dim=train_embeddings.size(2),
+        hidden_dims=d_model,
+        num_classes=2,  # Binary classification for domain boundary detection
         optimizer_class=optimizer_class,
         activation=activation_fn,
         kernel_init=kernel_init,
@@ -568,7 +676,10 @@ def load_best_model(trial, train_embeddings, weights):
         weight_decay=wd,
         dropout=drop,
         class_weights=weights,
-    )
+        domain_task=True,  # Set to True if using domain boundary detection
+        num_heads= n_heads,
+        num_layers=n_layers,
+        )
 
     ckpt_dir = (
         f"./logs/{PROJECT_NAME}/optuna_trial_{trial.number}/version_0/checkpoints/"
@@ -726,7 +837,7 @@ def main(Final_training=False):
 
     if Final_training is True:
         early_stop = EarlyStopping(
-            monitor="val_loss", patience=10, mode="min", verbose=True
+            monitor="val_loss", patience=5, mode="min", verbose=True
         )
         checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
