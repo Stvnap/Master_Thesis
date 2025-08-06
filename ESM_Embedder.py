@@ -2,9 +2,14 @@ import time
 import h5py
 import numpy as np
 import esm
+import gc
 import pandas as pd
 import torch
 import os
+import psutil
+# from pympler import asizeof
+# from pympler import summary,muppy
+# from pympler.classtracker import ClassTracker
 import torch.distributed as dist
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
@@ -18,6 +23,9 @@ import sys
 world_size = int(os.environ.get("WORLD_SIZE", 1))
 use_ddp = world_size > 1
 
+# print(torch.__version__)
+
+
 if use_ddp:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     if not dist.is_initialized():
@@ -25,7 +33,8 @@ if use_ddp:
         if dist.get_rank() == 0:
             print("Initializing process group for DDP")
     RANK = dist.get_rank()
-    print(f"Start running basic DDP example on rank {RANK}.")
+    if RANK == 0:
+        print(f"Start running basic DDP example with worldsize {dist.get_world_size()}.")
     # create model and move it to GPU with id rank
     DEVICE_ID = RANK % torch.cuda.device_count()
 else:
@@ -89,12 +98,12 @@ class ESMDataset:
         training=False,
 
     ):
+
         self.esm_model = esm_model
         self.training = training
         self.skip_df = skip_df
         self.domain_boundary_detection = domain_boundary_detection
         self.sequence_col = sequence_col
-
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
             # Classes 0-9 get mapped to 1-10
@@ -179,7 +188,7 @@ class ESMDataset:
 
 
         if skip_df is None:
-            df = pd.read_csv(csv_path,nrows=3000)          ##################### TESTING PURPOSES
+            df = pd.read_csv(csv_path,nrows=100)          ##################### TESTING PURPOSES
             if (
                 "start" in df.columns
                 and "end" in df.columns
@@ -336,11 +345,41 @@ class ESMDataset:
         else:
             self.embeddings, self.labels = self._embed(sequences)
 
-        self.embeddings = self.embeddings.cpu()
-        self.labels = self.labels.cpu()
-        if self.training is False:
-            self.starts = self.starts.cpu()
-            self.ends = self.ends.cpu()
+
+        if self.domain_boundary_detection is True:
+            return  # Return early if domain boundary detection is enabled
+
+
+        if self.domain_boundary_detection is False:
+
+            self.embeddings = self.embeddings.cpu()
+            self.labels = self.labels.cpu()
+            if self.training is False:
+                self.starts = self.starts.cpu()
+                self.ends = self.ends.cpu()
+
+            if len(self.embeddings) != len(self.labels):
+                if RANK == 0:
+                    print(
+                        f"WARNING: Number of embeddings does not match number of labels! {len(self.embeddings)} != {len(self.labels)}"
+                    )
+                if len(self.embeddings) > len(self.labels):
+                    self.embeddings = self.embeddings[
+                        : len(self.labels)
+                    ]  # Discarding last embedding, due to being a duplicate
+                    if self.training is False:
+                        self.starts = self.starts[: len(self.labels)]
+                        self.ends = self.ends[: len(self.labels)]
+                    print(f"After fix length: {len(self.embeddings)} == {len(self.labels)}")
+                else:
+                    raise ValueError(
+                        f"Number of embeddings is less than number of labels! {len(self.embeddings)} < {len(self.labels)}, check your data!"
+                    )
+
+            print(
+                f"{RANK}: embedding 1, label 1: {self.embeddings[0].shape}, {self.labels[0]}"
+            )
+
 
         end_time = time.time()
         embedding_time = end_time - start_time
@@ -352,28 +391,6 @@ class ESMDataset:
         )
         print(f"Time per sequence: {embedding_time / len(sequences):.4f} seconds")
         print(f"Sequences per second: {len(sequences) / embedding_time:.2f}")
-
-        if len(self.embeddings) != len(self.labels):
-            if RANK == 0:
-                print(
-                    f"WARNING: Number of embeddings does not match number of labels! {len(self.embeddings)} != {len(self.labels)}"
-                )
-            if len(self.embeddings) > len(self.labels):
-                self.embeddings = self.embeddings[
-                    : len(self.labels)
-                ]  # Discarding last embedding, due to being a duplicate
-                if self.training is False:
-                    self.starts = self.starts[: len(self.labels)]
-                    self.ends = self.ends[: len(self.labels)]
-                print(f"After fix length: {len(self.embeddings)} == {len(self.labels)}")
-            else:
-                raise ValueError(
-                    f"Number of embeddings is less than number of labels! {len(self.embeddings)} < {len(self.labels)}, check your data!"
-                )
-
-        print(
-            f"{RANK}: embedding 1, label 1: {self.embeddings[0].shape}, {self.labels[0]}"
-        )
 
 
         if self.training is True:
@@ -411,36 +428,104 @@ class ESMDataset:
             print("Embeddings computed and split completed")
 
         if self.domain_boundary_detection is True:
-            # Split embeddings and labels into chunks for training
-            X_temp, X_test, y_temp, y_test = train_test_split(
-                self.embeddings,
-                self.labels,
-                test_size=TEST_FRAC,
-                shuffle=True,
-                random_state=42,
-            )
-            # Calculate validation size from remaining data
-            val_size_adjusted = VAL_FRAC / (TRAIN_FRAC + VAL_FRAC)
 
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_temp,
-                y_temp,
-                test_size=val_size_adjusted,
+            # DATASET AND DATALOADER FOR DOMAIN BOUNDARY DETECTION NEEDED
+
+
+            class DomainBoundaryDataset(Dataset):
+                """Custom dataset for domain boundary detection with ESM embeddings that loads data from an H5 file."""
+
+                def __init__(self, h5_file):
+                    self.h5_file = h5_file
+                    self.file = None  # Will be opened in __getitem__
+                    
+                    # Determine the total length by inspecting the H5 file
+                    with h5py.File(self.h5_file, "r") as f:
+                        self.embedding_keys = sorted([k for k in f.keys() if k.startswith("batch_")])
+                        self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                        self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                        self.length = self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+
+                def __len__(self):
+                    return self.length
+
+                def __getitem__(self, idx):
+                    if idx < 0 or idx >= self.length:
+                        raise IndexError("Index out of range")
+
+                    # Open the file here to be safe for multiprocessing
+                    if self.file is None:
+                        self.file = h5py.File(self.h5_file, 'r')
+
+                    # Find which chunk the index belongs to
+                    chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side='right')
+                    if chunk_idx > 0:
+                        local_idx = idx - self.cumulative_sizes[chunk_idx - 1]
+                    else:
+                        local_idx = idx
+
+                    embedding_key = self.embedding_keys[chunk_idx]
+                    # Construct corresponding keys for other data
+                    key_suffix = embedding_key.replace("batch_", "")
+                    labels_key = f"labels_batch_{key_suffix}"
+                    starts_key = f"starts_batch_{key_suffix}"
+                    ends_key = f"ends_batch_{key_suffix}"
+
+                    embeddings = torch.tensor(self.file[embedding_key][local_idx], dtype=torch.float32)
+                    labels = torch.tensor(self.file[labels_key][local_idx], dtype=torch.long)
+                    
+                    # Assuming starts and ends are also saved per chunk
+                    starts = torch.tensor(self.file[starts_key][local_idx], dtype=torch.long)
+                    ends = torch.tensor(self.file[ends_key][local_idx], dtype=torch.long)
+                    
+                    return embeddings, labels, starts, ends
+
+                def __del__(self):
+                    if self.file:
+                        self.file.close()
+
+
+                
+            # Create the dataset and dataloader
+            self.domain_boundary_dataset = DomainBoundaryDataset("./temp/embeddings_domain.h5")
+
+            # Split indices for train and validation sets
+            dataset_size = len(self.domain_boundary_dataset)
+            indices = list(range(dataset_size))
+
+            # Split indices into training and validation
+            val_size = VAL_FRAC / (TRAIN_FRAC + VAL_FRAC)
+            train_indices, val_indices = train_test_split(
+                indices,
+                test_size=val_size,
                 shuffle=True,
-                random_state=42,
+                random_state=42
             )
 
-            self.train_embeddings = X_train
-            self.train_labels = y_train
-            self.val_embeddings = X_val
-            self.val_labels = y_val
-            self.test_embeddings = X_test
-            self.test_labels = y_test
-            
-            print(f"Train set: {len(self.train_embeddings)} samples")
-            print(f"Val set: {len(self.val_embeddings)} samples")
-            print(f"Test set: {len(self.test_embeddings)} samples")
-            print("Embeddings computed and split completed")
+            # Create Subset datasets
+            train_dataset = torch.utils.data.Subset(self.domain_boundary_dataset, train_indices)
+            val_dataset = torch.utils.data.Subset(self.domain_boundary_dataset, val_indices)
+
+            # Create DataLoaders for each subset
+            self.train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=EMB_BATCH,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True
+            )
+            self.val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=EMB_BATCH,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True
+            )
+
+            print(f"Train set: {len(train_dataset)} samples")
+            print(f"Val set: {len(val_dataset)} samples")
+            print("Datasets and DataLoaders for domain boundary detection created.")
+
 
 
     def esm_loader(self):
@@ -496,7 +581,7 @@ class ESMDataset:
 
     def _embed(self, seqs):
         """
-        Generate embeddings for a list of sequences using ESM model.
+        Generate embeddings for a list of sequences using ESM model. 
         """
         def windower(stepsize=1000,dimension=1000):
             # cut sequences longer than 1000 characters into sliding windows, because of ESM2 limitations
@@ -546,35 +631,40 @@ class ESMDataset:
                             slices.append(seq[-dimension:])
                             slice_positions.append((len(seq) - dimension, len(seq)))
                         
-                        
                         new_seqs.extend(slices)
 
                         for (slice_start, slice_end) in slice_positions:
-                            if start >= slice_start and start < slice_end:
-                                # Window the label to match the sequence window
-                                windowed_label = label[slice_start:slice_end]  # Slice the label
-                                # Pad to dimension if needed
-                                if windowed_label.shape[0] < dimension:
-                                    windowed_label = torch.nn.functional.pad(
-                                        windowed_label, (0, dimension - windowed_label.shape[0]), value=0
-                                    )
-                                elif windowed_label.shape[0] > dimension:
-                                    windowed_label = windowed_label[:dimension]  # Truncate if too long
-                                new_labels.append(windowed_label)
-                            else:
-                                new_labels.append(torch.zeros(dimension, dtype=torch.long))
+                            # Always window the label to match the sequence window (dimension=1000)
+                            windowed_label = label[slice_start:slice_end]  # Slice the label
+                            
+                            # Ensure windowed_label is exactly dimension length
+                            if windowed_label.shape[0] < dimension:
+                                windowed_label = torch.nn.functional.pad(
+                                    windowed_label, (0, dimension - windowed_label.shape[0]), value=0
+                                )
+                            elif windowed_label.shape[0] > dimension:
+                                windowed_label = windowed_label[:dimension]  # Truncate to dimension
+                            
+                            new_labels.append(windowed_label)
                         
-
                         new_starts.extend([start] * len(slices))
                         new_ends.extend([end] * len(slices))
-
-                        
-
                     else:
                         new_seqs.append(seq)
-                        new_labels.append(label)
+                        # Ensure label is padded/truncated to dimension=1000 for consistency
+                        if label.shape[0] < dimension:
+                            padded_label = torch.nn.functional.pad(
+                                label, (0, dimension - label.shape[0]), value=0
+                            )
+                        elif label.shape[0] > dimension:
+                            padded_label = label[:dimension]
+                        else:
+                            padded_label = label
+                        
+                        new_labels.append(padded_label)
                         new_starts.append(start)
                         new_ends.append(end)
+
                 self.end_window = [len(seq) for seq in new_seqs]
                 print(
                     f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
@@ -653,28 +743,19 @@ class ESMDataset:
 
 
         if self.domain_boundary_detection is True:
-            
-            # print(seq_dataset.labels[0:2])
-
             # Convert seq_dataset.labels to a tensor if it's a list
             if isinstance(seq_dataset.labels, list):
                 if isinstance(seq_dataset.labels[0], torch.Tensor):
-                    # Pad all tensors to the same length before stacking
-                    max_len = max(label.shape[0] for label in seq_dataset.labels)
-                    padded_labels = []
-                    for label in seq_dataset.labels:
-                        # Pad with zeros to reach max_len
-                        padded = torch.nn.functional.pad(label, (0, max_len - label.shape[0]), value=0)
-                        padded_labels.append(padded)
-                    seq_dataset.labels = torch.stack(padded_labels)
+                    seq_dataset.labels = torch.stack(seq_dataset.labels)
                 else:
                     seq_dataset.labels = torch.tensor(seq_dataset.labels, dtype=torch.long)
 
-            # print(seq_dataset.labels.shape)  # Print shape for debugging  
+            print(seq_dataset.labels.shape) 
 
         # if RANK == 0:
         #     print( f"Seq: {seq_dataset.seqs[0:5]}, Label: {seq_dataset.labels[0:5]}")
 
+        # Create a DataLoader with DistributedSampler for distributed training
         sampler = DistributedSampler(
             seq_dataset,
             num_replicas=dist.get_world_size(),
@@ -701,12 +782,18 @@ class ESMDataset:
         chunk = 1
 
         seq_dataset = None  # Clear the dataset to free memory
-
         for batch_num, batch_data in enumerate(dataloader):
+            # if batch_num % 100 == 0 and RANK == 0:
+                # all_objects = muppy.get_objects()
+                # sum1 = summary.summarize(all_objects)
+                # del all_objects  # Clear the list to free memory
             if self.training is True:
                 batch_seqs, batch_labels = batch_data
             else:
                 batch_seqs, batch_labels, batch_start, batch_end = batch_data
+                
+                if batch_num == 0 and RANK == 0:
+                    print(batch_seqs, batch_labels, batch_start, batch_end)
 
             try:
                 # batch_seqs and batch_labels are now properly paired
@@ -720,75 +807,107 @@ class ESMDataset:
                         repr_layers=[self.model_layers],
                         return_contacts=False,
                     )
-                    embeddings = results["representations"][self.model_layers].float()
-
-                    # Pool over sequence dimension (dim=1), ignoring padding (token > 1)
-                    mask = batch_tokens != 1
-                    mask = mask[:, 1:-1]
-                    embeddings = embeddings[:, 1:-1, :]
-
-                    if RANK == 0 and batch_num == 0:
-                        print(
-                            f"Batch {batch_num + 1}: {embeddings.shape} embeddings, {mask.shape} mask"
-                        )
-                        print(embeddings[0:2, 0:5, 0:5])  # Print first 2 embeddings for debugging
-
-                    if self.domain_boundary_detection is True:
-                        # embeddings = embeddings.cpu()   # Move to CPU immediately
-                        all_embeddings.append(embeddings)
-                        all_labels.append(batch_labels)
-
-                        if batch_num % 1000 == 0 and batch_num > 0:
-                            # # Move the previous chunk to CPU in batch
-                            # start_idx = 0
-                            # end_idx = min(1001, len(all_embeddings))
-
-                            start_idx = (chunk-1) * 1000
-                            end_idx = min((chunk * 1000)+1, len(all_embeddings))
-                            
-                            # print(start_idx, end_idx, len(all_embeddings), len(all_labels))
-
-                            # Batch move to CPU (more efficient)
-                            for i in range(start_idx, end_idx):
-                                all_embeddings[i] = all_embeddings[i].cpu()
-                            
-                            for i in range(start_idx, end_idx):
-                                all_labels[i] = all_labels[i].cpu()
-                            
-                            chunk += 1
-
-                            # Optional: Check for any remaining CUDA tensors
-                            for i, emb in enumerate(all_embeddings):
-                                if emb.is_cuda:
-                                    print(f"Warning: embedding {i} still on GPU")
+                    
             
-                            torch.cuda.empty_cache()  # Add this
-                            torch.cuda.synchronize()  # Ensure all operations are complete
+                embeddings = results["representations"][self.model_layers].float()
+
+                mask = batch_tokens != 1
+                mask = mask[:, 1:-1]
+                embeddings = embeddings[:, 1:-1, :]         #remove <eos> and <cls> tokens, made by esm model (start and end tokens)
+
+                if RANK == 0 and batch_num < 2:  # Print first 2 batches for debugging
+                    print(
+                        f"Batch {batch_num + 1}: {embeddings.shape} embeddings, {mask.shape} mask"
+                    )
+                    print(embeddings[0:2, 0:5, 0:5])
+
+                if self.domain_boundary_detection is True:
+                    # no pooling, just store the embeddings as they are
+
+                    all_embeddings.append(embeddings)
+                    all_labels.append(batch_labels)
 
 
+                    # if RANK == 0:
+                    #     print(type(all_embeddings), "type of embeddings before move")
+                    #     print(type(all_labels), "type of labels before move")
+                    
+                    if batch_num % 1000 == 0 and batch_num > 0:
+                        # # Move the previous chunk to CPU in batch to stop vram overflow, but yet keep speed high
+                        
+                        # start_idx = 0
+                        # end_idx = min(1001, len(all_embeddings))
 
-                    else:
-                        lengths = mask.sum(dim=1, keepdim=True)
-                        pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
-                        pooled = pooled.cpu()  # Move to CPU immediately
+                        start_idx = (chunk-1) * 1000
+                        end_idx = min((chunk * 1000)+1, len(all_embeddings))
+                        
+                        # print(start_idx, end_idx, len(all_embeddings), len(all_labels))
 
-                        all_embeddings.append(pooled)
-                        all_labels.append(batch_labels)  # Store the corresponding labels
-                    if self.training is False or self.domain_boundary_detection is True:
-                        all_starts.append(batch_start)
-                        all_ends.append(batch_end)
+                        # Batch move to CPU (more efficient)
+                        for i in range(start_idx, end_idx):
+                            # if RANK == 0:
+                            #     print(type(all_embeddings), "type of embeddings")
+                                    
+                            all_embeddings[i] = all_embeddings[i].cpu()
+                        
+                            # if RANK == 0:
+                                # print(type(all_embeddings), "type of embeddings")
+                                
 
-                # Progress reporting
-                if batch_num % 1 == 0 or batch_num == len(dataloader) - 1 and RANK == 0:   # for clearer output
+                        for i in range(start_idx, end_idx):
+                            all_labels[i] = all_labels[i].cpu()
+                        
+                        chunk += 1
+
+                        # Optional: Check for any remaining CUDA tensors, sanity check
+                        for i, emb in enumerate(all_embeddings):
+                            if emb.is_cuda:
+                                print(f"Warning: embedding {i} still on GPU")
+        
+
+                else:
+                    # For ID classification, we pool the embeddings
+                    lengths = mask.sum(dim=1, keepdim=True)
+                    pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
+                    pooled = pooled.cpu()  # Move to CPU immediately
+
+                    all_embeddings.append(pooled)
+                    all_labels.append(batch_labels)  # Store the corresponding labels
+                if self.training is False or self.domain_boundary_detection is True:
+                    all_starts.append(batch_start)
+                    all_ends.append(batch_end)
+
+                # Progress reporting, nothing special here
+                if batch_num % 100 == 0 or batch_num == len(dataloader) - 1 and RANK == 0:   
                     elapsed_time = time.time() - start_time
                     if batch_num > 0:
                         avg_time_per_batch = elapsed_time / (batch_num + 1)
                         remaining_batches = len(dataloader) - batch_num - 1
                         eta_seconds = remaining_batches * avg_time_per_batch
 
+
+
+
                         eta_hours = int(eta_seconds // 3600)
                         eta_minutes = int((eta_seconds % 3600) // 60)
                         eta_seconds_remainder = int(eta_seconds % 60)
+                        if RANK == 0:
+                            # summary.print_(sum1)
+
+                            # Add RAM monitoring
+                            process = psutil.Process(os.getpid())
+                            memory_info = process.memory_info()
+                            memory_gb = memory_info.rss / 1024 / 1024 / 1024
+                            
+                            system_memory = psutil.virtual_memory()
+                            total_gb = system_memory.total / 1024 / 1024 / 1024
+                            available_gb = system_memory.available / 1024 / 1024 / 1024
+                            used_percent = system_memory.percent
+                            
+                            print(f"\n=== Memory Status at Batch {batch_num} ===")
+                            print(f"Process RAM: {memory_gb:.2f} GB")
+                            print(f"System RAM: {used_percent:.1f}% used ({total_gb-available_gb:.1f}/{total_gb:.1f} GB)")
+                            print(f"Available RAM: {available_gb:.1f} GB")
 
                         print(
                             f"Rank {RANK}: Batch {batch_num + 1}/{len(dataloader)} | "
@@ -797,12 +916,15 @@ class ESMDataset:
                             flush=True,
                         )
 
-                if self.domain_boundary_detection is True:
-                    del batch_tokens, results, embeddings, mask
-                else:
-                    del batch_tokens, results, embeddings, pooled, mask
 
-            except Exception as e:
+
+
+
+
+            except Exception as e:                                                  
+                # Handle exceptions during batch processing, if vram blows up, we will try to process each sequence individually
+                # kind of unnecessary, cuz emb_batch is already 1 is the fastes (no padding the batch to same length needed, due to 1 sequence only), but was already implemented
+                # can be ignored because it never triggers during ram oom
                 print(f"\nRank {RANK}: Error processing batch {batch_num + 1}: {e}")
                 # Handle individual sequences...
                 for seq, label in zip(batch_seqs, batch_labels):
@@ -849,6 +971,8 @@ class ESMDataset:
                                 )
 
                     except Exception as single_e:
+                        # last fallback, empty embedding, if something goes wrong
+                        # never triggers, at least never seen it trigger
                         print(
                             f"Rank {RANK}: Error processing individual sequence: {single_e}"
                         )
@@ -860,77 +984,73 @@ class ESMDataset:
                             all_ends.append(torch.tensor([len(seq)], dtype=torch.long))
 
 
-            # gather global max legnth of embeddings and labels for padding
             if self.domain_boundary_detection is True:
+                # Save embeddings and labels in chunks to avoid memory overflow
+                # on palma i do only 100 
                 if batch_num % 1000 == 0 and batch_num > 0 or batch_num == len(dataloader) - 1: 
 
-                    # Pad all to the same length
                     max_len = 1000
 
-                    all_embeddings = [
-                        torch.nn.functional.pad(emb, (0, 0, 0, max_len - emb.shape[1]), value=0)
-                        for emb in all_embeddings
-                    ]  
-                    # local_embeddings = torch.stack(all_embeddings, dim=0)
+                    # if RANK == 0:
+                        # print(all_labels[0].shape, "labels shape before padding")
 
 
+                    # Verify all embeddings and labels are already the correct size
+                    for i, (emb, lbl) in enumerate(zip(all_embeddings, all_labels)):
+                        if emb.shape[1] != max_len:
+                            all_embeddings[i] = torch.nn.functional.pad(
+                                emb, (0, 0, 0, max_len - emb.shape[1]), value=0
+                            )
 
-                    all_labels = [
-                        torch.nn.functional.pad(lbl, (0, max_len - lbl.shape[0]), value=0)
-                        for lbl in all_labels
-                    ]  
+                    #     if lbl.shape[0] != max_len:
+                    #         all_labels[i] = torch.nn.functional.pad(
+                    #             lbl, (0, max_len - lbl.shape[0]), value=0
+                    #         )
 
-                    # local_labels = torch.stack(all_labels, dim=0)
+                    # if RANK == 0:
+                    #     print(all_labels[0].shape, "labels shape after padding")
 
 
                     # Convert list of tensors to a single tensor, then to numpy
                     embeddings_tensor = torch.stack([emb.cpu() for emb in all_embeddings])
                     labels_tensor = torch.stack([lbl.cpu() for lbl in all_labels])
 
-                    with h5py.File(f"./temp/embeddings_rank_{RANK}.h5", "a") as f:
-                        f[f"batch_{batch_num}_rank_{RANK}"] = embeddings_tensor.numpy()
-                        f[f"labels_batch_{batch_num}_rank_{RANK}"] = labels_tensor.numpy()
+
+                    dist.barrier()  # Ensure all ranks are synchronized before saving
+
+                    if RANK == 0:
+                        print("\n\nWriting...")
+                    for rank_id in range(dist.get_world_size()):
+                        if RANK == rank_id:
+                            with h5py.File(f"./temp/embeddings_domain.h5", "a") as f:
+                                f[f"batch_{batch_num}_rank_{RANK}"] = embeddings_tensor.numpy()
+                                f[f"labels_batch_{batch_num}_rank_{RANK}"] = labels_tensor.numpy()
+                        dist.barrier()  # Ensure only one rank writes at a time
+                    if RANK == 0:
+                        print(
+                            f"Wrote embeddings and labels for batch {batch_num} to file"
+                        )
 
 
-                    embeddings_tensor = None
-                    labels_tensor = None
+                    # Clear the lists to free memory, should do the job, but somewhere i leak memory
+
+                    del embeddings_tensor, labels_tensor
+
+                    # Clear references before deleting the lists
                     all_embeddings.clear()
                     all_labels.clear()
-                    chunk=1
 
+                    # Reinitialize the lists
+                    all_embeddings = []
+                    all_labels = []
 
-                    # # Memory profiling - check top 10 memory objects
-
-                    # def get_top_memory_objects():
-                    #     gc.collect()
-                    #     objects = gc.get_objects()
-                        
-                    #     # Count objects by type
-                    #     type_counts = {}
-                    #     for obj in objects:
-                    #         obj_type = type(obj).__name__
-                    #         size = sys.getsizeof(obj)
-                    #         if obj_type not in type_counts:
-                    #             type_counts[obj_type] = {'count': 0, 'total_size': 0}
-                    #         type_counts[obj_type]['count'] += 1
-                    #         type_counts[obj_type]['total_size'] += size
-                        
-                    #     # Sort by total size
-                    #     sorted_types = sorted(type_counts.items(), 
-                    #                          key=lambda x: x[1]['total_size'], 
-                    #                          reverse=True)
-                        
-                    #     print(f"Rank {RANK}: Top 10 memory objects:")
-                    #     for i, (obj_type, info) in enumerate(sorted_types[:10]):
-                    #         print(f"  {i+1}. {obj_type}: {info['count']} objects, "
-                    #               f"{info['total_size'] / 1024 / 1024:.2f} MB")
-
-                    # get_top_memory_objects()
-
-
+                    # Force garbage collection
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    chunk = 1
 
             else:
-            
+                # basic way for ID classification, just store the embeddings and labels
                 
                 # Concatenate local embeddings and labels
                 local_embeddings = (
@@ -969,8 +1089,17 @@ class ESMDataset:
 
 
 
-        # Synchronize all processes
+        # Synchronize all processes, so all embeddings are done
         dist.barrier()
+
+
+        # ------------------------------------------------------
+        #   BROADCASTING AND GATHERING EMBEDDINGS AND LABELS
+        # ------------------------------------------------------
+        # used in classification tasks, where we need to gather all embeddings and labels from all ranks,
+        # tried my way here, it works, but some parts i dont understand fully
+        # NOT NEEDED FOR DOMAIN BOUDNARY TASK
+
 
         if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
             # Gather embeddings and labels from all processes
@@ -1135,66 +1264,80 @@ class ESMDataset:
 
                 torch.cuda.empty_cache()
 
+
+
+
         elif self.domain_boundary_detection is True:
+            # # Counterpart for domain boundary detection, where we gather all embeddings and labels from all ranks via their .h5 files            
+            # # Open embeddings and labels from the single h5 file
+            # all_embeddings = []
+            # all_labels = []
+
+            # if RANK == 0:
+            #     print("Gathering embeddings and labels from single h5 file...")
+
+            # try:
+            #     with h5py.File(f"./temp/embeddings_doamain.h5", "r") as f:
+            #         # Get all keys and sort them for consistent ordering
+            #         embedding_keys = sorted([key for key in f.keys() if "batch" in key and not key.startswith("labels_")])
+                    
+            #         for key in embedding_keys:
+            #             # Load embeddings
+            #             embeddings = torch.tensor(f[key][:], dtype=torch.float32)
+            #             all_embeddings.append(embeddings)
+                        
+            #             # Construct corresponding labels key
+            #             labels_key = f"labels_{key}"
+            #             if labels_key in f:
+            #                 labels = torch.tensor(f[labels_key][:], dtype=torch.long)
+            #                 all_labels.append(labels)
+            #             else:
+            #                 print(f"Warning: No labels found for key {key}")
+            # except FileNotFoundError:
+            #     print(f"Warning: File ./temp/embeddings_doamain.h5 not found")
+            #     # Initialize empty lists as fallback
+            #     all_embeddings = []
+            #     all_labels = []
+
+            # # Concatenate all embeddings and labels
+            # final_embeddings = torch.cat(all_embeddings, dim=0)
+            # final_labels = torch.cat(all_labels, dim=0)
+            # if self.training is False:
+            #     final_starts = torch.cat(all_starts, dim=0)
+            #     final_ends = torch.cat(all_ends, dim=0)
+
+            # # Safety check if the embeddings and labels have the expected dimensions
+            # if final_embeddings.dim() == 4 and final_labels.dim() == 3:
+            #     final_embeddings = final_embeddings.squeeze(1)
+            #     final_labels = final_labels.squeeze(1)
+            #     if RANK == 0:
+            #         print("Squeezed embeddings and labels to correct dimensions.")
+
+            # if RANK == 0 and len(all_embeddings) > 0:
+            #     print(f"Loaded {final_embeddings.shape[0]} total samples")
+            #     print(f"Final embeddings shape: {final_embeddings.shape}")
+            #     print(f"Final labels shape: {final_labels.shape}")
+            pass
             
-        # Open embeddings and labels from all ranks from .h5 files
-            all_embeddings = []
-            all_labels = []
-
-            if RANK == 0:
-                print("Gathering embeddings and labels from all ranks...")
-
-            for rank in range(dist.get_world_size()):
-                try:
-                    with h5py.File(f"./temp/embeddings_rank_{rank}.h5", "r") as f:
-                        for key in f.keys():
-                            if "batch" in key and not key.startswith("labels_"):
-                                # Load embeddings
-                                embeddings = torch.tensor(f[key][:], dtype=torch.float32)
-                                all_embeddings.append(embeddings)
-                                
-                                # Construct corresponding labels key
-                                labels_key = f"labels_{key}"
-                                if labels_key in f:
-                                    labels = torch.tensor(f[labels_key][:], dtype=torch.long)
-                                    all_labels.append(labels)
-                                else:
-                                    print(f"Warning: No labels found for key {key}")
-                except FileNotFoundError:
-                    print(f"Warning: File ./temp/embeddings_rank_{rank}.h5 not found")
-                    continue
-
-            # Concatenate all embeddings and labels
-            if all_embeddings:
-                final_embeddings = torch.cat(all_embeddings, dim=0)
-                final_labels = torch.cat(all_labels, dim=0)
-                if self.training is False:
-                    final_starts = torch.cat(all_starts, dim=0)
-                    final_ends = torch.cat(all_ends, dim=0)
-
-
-                if RANK == 0:
-                    print(f"Loaded {final_embeddings.shape[0]} total samples")
-                    print(f"Final embeddings shape: {final_embeddings.shape}")
-                    print(f"Final labels shape: {final_labels.shape}")
-
 
         else:
+            # if no ddp is used, just return the local embeddings and labels
             final_embeddings = local_embeddings
             final_labels = local_labels
             if self.training is False:
                 final_starts = local_starts
                 final_ends = local_ends
 
-        # At the end of _embed function
-        if self.training is False:
+        # At the end of _embed function, return the final embeddings and labels
+        if self.training is False and self.domain_boundary_detection is False:
             return final_embeddings, final_labels, final_starts, final_ends
+        elif self.domain_boundary_detection is True:
+            return None, None, None, None
         else:
             return final_embeddings, final_labels
 
 
 if __name__ == "__main__":
-    # Run the main function if this script is executed directly
     raise NotImplementedError(
         "This script is not intended to be run directly"
     )

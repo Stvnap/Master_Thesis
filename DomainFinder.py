@@ -1,9 +1,10 @@
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 import pandas as pd
 import numpy as np
+import h5py
 import math
 import pickle
 import optuna
@@ -12,6 +13,7 @@ import torch.distributed as dist
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier
 from ESM_Embeddings_HP_search import objective,load_best_model
 
@@ -125,6 +127,9 @@ class Transformer(nn.Module):
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, input_dim]
+
+        # print(f"Input shape: {x.shape}")  # Debugging line
+
         batch_size, seq_len, input_dim = x.size()
         
         # Optional input projection
@@ -163,8 +168,8 @@ def main(Final_training=False):
             train_embeddings, train_labels, val_embeddings, val_labels = pickle.load(f)
         if RANK == 0:
             print("Loaded cached embeddings & labels from disk.")
-            print("Train embedding shape:", train_embeddings.shape)  # <-- Add this line
-            print("Val embedding shape:", val_embeddings.shape)      # <-- Add this line
+            print("Train embedding shape:", train_embeddings.shape) 
+            print("Val embedding shape:", val_embeddings.shape)    
             
             print(train_labels.shape, val_labels.shape)
 
@@ -172,43 +177,133 @@ def main(Final_training=False):
         train_ds = TensorDataset(train_embeddings, train_labels)
         val_ds = TensorDataset(val_embeddings, val_labels)
 
-    else:
+    elif not os.path.exists("./temp/embeddings_domain.h5"):
         esm_data = ESMDataset(FSDP_used=False,domain_boundary_detection=True,num_classes=NUM_CLASSES,esm_model=ESM_MODEL,
                               csv_path=CSV_PATH, category_col=CATEGORY_COL, sequence_col=SEQUENCE_COL)
 
-        train_embeddings = esm_data.train_embeddings
-        train_labels = esm_data.train_labels
-        val_embeddings = esm_data.val_embeddings
-        val_labels = esm_data.val_labels
+    else:
 
-        train_ds = TensorDataset(train_embeddings, train_labels)
-        val_ds = TensorDataset(val_embeddings, val_labels)
+        class DomainBoundaryDataset(Dataset):
+            """Custom dataset for domain boundary detection with ESM embeddings that loads data from an H5 file."""
 
-        with open(CACHE_PATH, "wb") as f:
-            pickle.dump(
-                (train_embeddings, train_labels, val_embeddings, val_labels),
-                f,
-            )
-        if RANK == 0:
-            print("Computed embeddings & labels, then wrote them to cache.")
+            def __init__(self, h5_file):
+                self.h5_file = h5_file
+                self.file = None  # Will be opened in __getitem__
+                
+                # Determine the total length by inspecting the H5 file
+                with h5py.File(self.h5_file, "r") as f:
+                    self.embedding_keys = sorted([k for k in f.keys() if k.startswith("batch_")])
+                    self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                    self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                    self.length = self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+
+            def __len__(self):
+                return self.length
+
+            def __getitem__(self, idx):
+                if idx < 0 or idx >= self.length:
+                    raise IndexError("Index out of range")
+
+                # Open the file here to be safe for multiprocessing
+                if self.file is None:
+                    self.file = h5py.File(self.h5_file, 'r')
+
+                # Find which chunk the index belongs to
+                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side='right')
+                if chunk_idx > 0:
+                    local_idx = idx - self.cumulative_sizes[chunk_idx - 1]
+                else:
+                    local_idx = idx
+
+                embedding_key = self.embedding_keys[chunk_idx]
+                # Construct corresponding keys for other data
+                key_suffix = embedding_key.replace("batch_", "")
+                labels_key = f"labels_batch_{key_suffix}"
+                starts_key = f"starts_batch_{key_suffix}"
+                ends_key = f"ends_batch_{key_suffix}"
+
+                embeddings = torch.tensor(self.file[embedding_key][local_idx], dtype=torch.float32)
+                labels = torch.tensor(self.file[labels_key][local_idx], dtype=torch.long)
+                
+
+                
+                return embeddings, labels
+
+            def __del__(self):
+                if self.file:
+                    self.file.close()
 
 
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS_EMB, pin_memory=True
-    )
+            
+        # Create the dataset and dataloader
+        domain_boundary_dataset = DomainBoundaryDataset("./temp/embeddings_domain.h5")
 
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS_EMB, pin_memory=True
-    )
+        # Split indices for train and validation sets
+        dataset_size = len(domain_boundary_dataset)
+        indices = list(range(dataset_size))
+
+        # Split indices into training and validation
+        val_size = VAL_FRAC / (TRAIN_FRAC + VAL_FRAC)
+        train_indices, val_indices = train_test_split(
+            indices,
+            test_size=val_size,
+            shuffle=True,
+            random_state=42
+        )
+
+        # Create Subset datasets
+        train_dataset = torch.utils.data.Subset(domain_boundary_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(domain_boundary_dataset, val_indices)
+
+        # Create DataLoaders for each subset
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1000,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1000,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True
+        )
+
+        print(f"Train set: {len(train_dataset)} samples")
+        print(f"Val set: {len(val_dataset)} samples")
+        print("Datasets and DataLoaders for domain boundary detection created.")
+
+        # Calculate class weights by iterating through the dataset
+        print("Calculating class weights for training set...")
+        all_labels = []
+        for i in range(len(train_dataset)):
+            _, labels = train_dataset[i]
+            all_labels.append(labels)
+        
+        train_labels = torch.cat(all_labels)
 
 
-    train_labels_flat = train_labels.view(-1)  
+    # Calculate class weights for the loss function
+    train_labels_flat = train_labels.view(-1)
     counts = torch.bincount(train_labels_flat, minlength=NUM_CLASSES).float()
-    total = train_labels_flat.size(0)
-    weights = total / (NUM_CLASSES * counts)
-    weights = weights * (NUM_CLASSES / weights.sum())
+    
+    # Handle cases where a class might be missing in a small sample
+    if torch.any(counts == 0):
+        print("Warning: One or more classes have zero samples. Using uniform weights.")
+        weights = torch.ones(NUM_CLASSES, device=DEVICE)
+    else:
+        total = train_labels_flat.size(0)
+        weights = total / (NUM_CLASSES * counts)
+        # Normalize weights to prevent them from scaling the loss too much
+        weights = weights * (NUM_CLASSES / weights.sum())
+
     weights = weights.to(DEVICE)
-    print(f"Class weights: {weights}")
+    if RANK == 0:
+        print(f"Class counts: {counts.cpu().numpy()}")
+        print(f"Calculated class weights: {weights.cpu().numpy()}")
+
 
 
     if RANK == 0:
