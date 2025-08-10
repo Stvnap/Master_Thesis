@@ -17,9 +17,7 @@ from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.utils.rnn import pad_sequence
-import gc
-import sys
+
 world_size = int(os.environ.get("WORLD_SIZE", 1))
 use_ddp = world_size > 1
 
@@ -347,6 +345,7 @@ class ESMDataset:
 
 
         if self.domain_boundary_detection is True:
+            print("Closing ESM Embedder")
             return  # Return early if domain boundary detection is enabled
 
 
@@ -1022,7 +1021,7 @@ class ESMDataset:
                         print("\n\nWriting...")
                     for rank_id in range(dist.get_world_size()):
                         if RANK == rank_id:
-                            with h5py.File(f"./temp/embeddings_domain.h5", "a") as f:
+                            with h5py.File("./temp/embeddings_domain.h5", "a") as f:
                                 f[f"batch_{batch_num}_rank_{RANK}"] = embeddings_tensor.numpy()
                                 f[f"labels_batch_{batch_num}_rank_{RANK}"] = labels_tensor.numpy()
                         dist.barrier()  # Ensure only one rank writes at a time
@@ -1091,6 +1090,8 @@ class ESMDataset:
 
         # Synchronize all processes, so all embeddings are done
         dist.barrier()
+
+        print("embeddings DONE!")
 
 
         # ------------------------------------------------------

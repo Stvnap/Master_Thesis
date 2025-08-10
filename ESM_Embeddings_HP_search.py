@@ -16,8 +16,6 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import Precision, Recall
-from sklearn.utils.class_weight import compute_class_weight
-
 from ESM_Embedder import DEVICE, RANK, ESMDataset
 
 torch.set_printoptions(threshold=float('inf'))  # Show full tensor
@@ -155,53 +153,15 @@ class LitClassifier(pl.LightningModule):
 
 
             def loss_fn_boundary(logits, labels, class_weights=None):                
-                """
-                Custom loss function for domain boundary detection with margin-based clustering penalty
-                and spatial distance penalty for isolated predictions.
-                """
-                # Use weighted cross-entropy if class weights provided
-                if class_weights is not None:
-                    base_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')(logits, labels)
-                else:
-                    base_loss = nn.CrossEntropyLoss(reduction='none')(logits, labels)
-                                    
-                # Apply margin weighting
-                margin = 0.5  # Margin for clustering penalty
-                margin_weights = torch.where(labels == 1, 1.0, 1.0 + margin)
-                
-                # Get predictions for spatial penalty
-                preds = torch.argmax(logits, dim=-1)
-                
-                # Spatial clustering penalty
-                spatial_penalty = torch.ones_like(base_loss)
-                distance_threshold = 20  # Maximum distance to consider for clustering
-                isolation_penalty = 2.0  # Multiplier for isolated predictions
-                
-                # Find positions where we predict boundary (class 1)
-                pred_boundary_positions = (preds == 1).nonzero(as_tuple=True)[0]
-                true_boundary_positions = (labels == 1).nonzero(as_tuple=True)[0]
-                
-                if len(pred_boundary_positions) > 0 and len(true_boundary_positions) > 0:
-                    for pred_pos in pred_boundary_positions:
-                        # Calculate minimum distance to any true boundary
-                        distances = torch.abs(true_boundary_positions.float() - pred_pos.float())
-                        min_distance = torch.min(distances)
-                        
-                        # Apply penalty if prediction is too far from any true boundary
-                        if min_distance > distance_threshold:
-                            spatial_penalty[pred_pos] = isolation_penalty
-                
-                # Combine all penalties
-                combined_weights = margin_weights * spatial_penalty
-                weighted_loss = base_loss * combined_weights
-                
-                return weighted_loss.mean()
+                return
 
 
             def loss_fn_boundary_wrapper(logits, labels):
                 return loss_fn_boundary(logits, labels, self.class_weights)
 
-            self.loss_fn = loss_fn_boundary_wrapper
+            self.loss_fn = nn.CrossEntropyLoss(
+                weight=self.class_weights, reduction='none'         # to keep per residue losses (one per sequence position)
+            )
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -244,7 +204,7 @@ class LitClassifier(pl.LightningModule):
             loss = self.loss_fn(logits, y)
 
         assert not torch.isnan(loss), "Training loss is NaN"
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", loss.detach(), prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -303,18 +263,18 @@ class LitClassifier(pl.LightningModule):
 
         self.log(
             "val_loss",
-            loss,
+            loss.detach(),
             prog_bar=True,
             on_step=False,
             on_epoch=True,
             sync_dist=True,
         )
         self.log(
-            "val_acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
+            "val_acc", acc.detach(), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
         )
 
-        self.precision_metric(preds, y_flat)
-        self.recall_metric(preds, y_flat)
+        self.precision_metric(preds.detach(), y_flat.detach())
+        self.recall_metric(preds.detach(), y_flat.detach())
 
     def on_validation_epoch_end(self):
         prec_all = self.precision_metric.compute()
@@ -640,7 +600,7 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
 
         n_layers = p["n_layers"]
        
-        d_ff = 4* d_model
+        # d_ff = 4* d_model
 
         act_name = p["activation"]
         if act_name == "relu":
@@ -654,7 +614,7 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
             kernel_init = nn.init.kaiming_normal_
         
         drop = p["dropout"]
-        drop_attn = p["dropout_attn"]
+        # drop_attn = p["dropout_attn"]
         lr = p["lr"]
         wd = p["weight_decay"]
         opt_name = p["optimizer"]
@@ -771,6 +731,7 @@ def main(Final_training=False):
         train_ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
+        persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,
         pin_memory=True,
     )
@@ -780,6 +741,7 @@ def main(Final_training=False):
         val_ds,
         batch_size=BATCH_SIZE,
         shuffle=False,
+        persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,
         pin_memory=True,
     )
