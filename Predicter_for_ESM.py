@@ -14,7 +14,6 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
 import torch.distributed as dist    
 torch.set_float32_matmul_precision("high")
@@ -26,24 +25,23 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 
 GLOBAL_RUN = 0  # keep 0
 
-CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins_Eval.csv"
+CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 MODEL_PATH = "./models/Optuna_1000d_uncut_t33.pt"
 CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d_predicter.pkl"
-TENSBORBOARD_LOG_DIR = "./models/1000d_uncut_logs"
+TENSBORBOARD_LOG_DIR = "./models/2d_uncut_ALL"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 
-NUM_CLASSES = 1001
+NUM_CLASSES = 3
 BATCH_SIZE = 128
 EMB_BATCH = 1
-NUM_WORKERS = 0
-NUM_WORKERS_EMB = -0.1
+NUM_WORKERS = min(16, os.cpu_count())
+NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 THRESHOLD = 5  # Number of consecutive drops to trigger exclusion
-THRESHOLD_K = 0.0  # Threshold for topk probabilities to be considered close and therefore multiclass prediction
 print("Treshold:", THRESHOLD)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -766,6 +764,9 @@ def main():
     predictions, true_labels, raw_scores_nocut = predict(
         MODEL_PATH, df_embeddings, df_labels, firstrun=True
     )
+
+
+
 
     # temp quit
     dist.barrier()  # Ensure all processes reach this point before quitting

@@ -3,8 +3,9 @@
 # -------------------------
 import glob
 import os
-import pickle
 
+import h5py
+import numpy as np
 import optuna
 import pandas as pd
 import pytorch_lightning as pl
@@ -13,12 +14,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from sklearn.metrics import accuracy_score
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from torchmetrics import Precision, Recall
+
 from ESM_Embedder import DEVICE, RANK, ESMDataset
 
-torch.set_printoptions(threshold=float('inf'))  # Show full tensor
+torch.set_printoptions(threshold=float("inf"))  # Show full tensor
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
 
@@ -36,19 +37,22 @@ pd.set_option("display.max_rows", None)
 # 1. GLOBALS
 # -------------------------
 
-CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
+CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./pickle/FoundEntriesALLProteins_1000d_.pkl"
-PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
+CACHE_PATH = "./temp/embeddings_classification_2d.pt.h5"
+PROJECT_NAME = "t33_ALL_2d"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-NUM_CLASSES = 1001  # classes + 1 for "other" class
-EPOCHS = 49
-STUDY_N_TRIALS = 0
-BATCH_SIZE = 64
-NUM_WORKERS_EMB = max(16, os.cpu_count())
+NUM_CLASSES = 3  # classes + 1 for "other" class
+EPOCHS = 50
+STUDY_N_TRIALS = 30
+BATCH_SIZE = 256
+NUM_WORKERS_EMB = min(16, os.cpu_count())
+
+VAL_FRAC = 0.2
+TRAIN_FRAC = 1 - VAL_FRAC
 
 
 # -------------------------
@@ -120,6 +124,7 @@ class LitClassifier(pl.LightningModule):
         self.weight_decay = weight_decay
         self.domain_task = domain_task
         self.class_weights = class_weights
+        self.num_classes = num_classes
 
         # base model
         if domain_task is False:
@@ -147,20 +152,18 @@ class LitClassifier(pl.LightningModule):
                 dropout,
                 activation,
                 kernel_init,
-                num_layers
+                num_layers,
             )
 
-
-
-            def loss_fn_boundary(logits, labels, class_weights=None):                
+            def loss_fn_boundary(logits, labels, class_weights=None):
                 return
-
 
             def loss_fn_boundary_wrapper(logits, labels):
                 return loss_fn_boundary(logits, labels, self.class_weights)
 
             self.loss_fn = nn.CrossEntropyLoss(
-                weight=self.class_weights, reduction='none'         # to keep per residue losses (one per sequence position)
+                weight=self.class_weights,
+                reduction="none",  # to keep per residue losses (one per sequence position)
             )
 
         self.precision_metric = Precision(
@@ -170,13 +173,11 @@ class LitClassifier(pl.LightningModule):
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
         )
 
-
     def forward(self, x):
         return self.model(x)
-    
-
 
     def training_step(self, batch, batch_idx):
+        # time_start = time.time()
         x, y = batch
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
@@ -192,24 +193,26 @@ class LitClassifier(pl.LightningModule):
             # Process each sequence individually
             batch_size, seq_len, num_classes = logits.shape
             losses = []
-            
+
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
-                seq_labels = y[i]       # [seq_len]
+                seq_labels = y[i]  # [seq_len]
                 seq_loss = self.loss_fn(seq_logits, seq_labels)
                 losses.append(seq_loss)
-            
+
             loss = torch.stack(losses).mean()
         else:
             loss = self.loss_fn(logits, y)
 
         assert not torch.isnan(loss), "Training loss is NaN"
         self.log("train_loss", loss.detach(), prog_bar=True)
+        # if RANK == 0:
+        #     print(f"Training step time: {time.time() - time_start:.2f} seconds")
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        
+
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 
@@ -217,24 +220,24 @@ class LitClassifier(pl.LightningModule):
         assert not torch.isnan(x).any(), "Input contains NaN values"
         logits = self(x)
         assert not torch.isnan(logits).any(), "Logits contain NaN values"
-        
+
         if self.domain_task is True:
             # Process each sequence individually
             batch_size, seq_len, num_classes = logits.shape
             losses = []
             all_preds = []
             all_labels = []
-            
+
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
-                seq_labels = y[i]       # [seq_len]
+                seq_labels = y[i]  # [seq_len]
                 seq_loss = self.loss_fn(seq_logits, seq_labels)
                 losses.append(seq_loss)
-                
+
                 seq_preds = torch.argmax(seq_logits, dim=-1)  # [seq_len]
                 all_preds.append(seq_preds)
                 all_labels.append(seq_labels)
-            
+
             loss = torch.stack(losses).mean()
             preds = torch.cat(all_preds)  # Concatenate all sequence predictions
             y_flat = torch.cat(all_labels)  # Concatenate all sequence labels
@@ -245,11 +248,11 @@ class LitClassifier(pl.LightningModule):
 
         assert not torch.isnan(loss), "Validation loss is NaN"
 
-        if RANK == 0:  # Only print for first batch to avoid spam
-            if batch_idx == 0:  # Only print for first batch to avoid spam
+        # if RANK == 0:  # Only print for first batch to avoid spam
+        # if batch_idx == 0:  # Only print for first batch to avoid spam
         #         # print(f"Batch {batch_idx}:")
-                  print(f"Preds: {preds}")
-                  # print(f"Labels: {y_flat}")
+        #   print(f"Preds: {preds}")
+        # print(f"Labels: {y_flat}")
         #         print(f"Logits sample (first sequence, first 5 positions):\n{logits[0, :5, :]}")
         #         # print(f"Max logits: {logits.max()}, Min logits:\n{logits.min()}")
         #         # print(f"Class 0 logits mean: {logits[:, :, 0].mean()}")
@@ -270,8 +273,15 @@ class LitClassifier(pl.LightningModule):
             sync_dist=True,
         )
         self.log(
-            "val_acc", acc.detach(), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
+            "val_acc",
+            acc.detach(),
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
         )
+
+        self.log("hp_metric", loss.detach(), on_step=False, on_epoch=True, sync_dist=True)
 
         self.precision_metric(preds.detach(), y_flat.detach())
         self.recall_metric(preds.detach(), y_flat.detach())
@@ -281,27 +291,32 @@ class LitClassifier(pl.LightningModule):
         rec_all = self.recall_metric.compute()
 
         # Log metrics for each class individually
-        # print(NUM_CLASSES, "classes in total")
         if self.domain_task is True:
-            NUM_CLASSES = 2
+            
             # if RANK == 0:
             #     print("Domain boundary detection task, only 2 classes")
 
             boundary_precision = (
                 prec_all[1].item() if not torch.isnan(prec_all[1]) else 0.0
             )
-            boundary_recall = (
-                rec_all[1].item() if not torch.isnan(rec_all[1]) else 0.0
+            boundary_recall = rec_all[1].item() if not torch.isnan(rec_all[1]) else 0.0
+
+            beta = 1.5  # approxx 70% recall, 30% precision
+            fbeta = (
+                (1 + beta**2)
+                * (boundary_precision * boundary_recall)
+                / ((beta**2 * boundary_precision) + boundary_recall)
             )
+
             self.log(
                 "val_boundary_prec", boundary_precision, prog_bar=True, sync_dist=True
             )
-            self.log(
-                "val_boundary_rec", boundary_recall, prog_bar=True, sync_dist=True
-            )
+            self.log("val_boundary_rec", boundary_recall, prog_bar=True, sync_dist=True)
+
+            self.log("f_beta", fbeta, prog_bar=True, sync_dist=True)
 
         else:
-            for class_idx in range(NUM_CLASSES):
+            for class_idx in range(self.num_classes):
                 if class_idx < len(prec_all):
                     val_prec = (
                         prec_all[class_idx].item()
@@ -309,7 +324,10 @@ class LitClassifier(pl.LightningModule):
                         else 0.0
                     )
                     self.log(
-                        f"val_prec_{class_idx}", val_prec, prog_bar=False, sync_dist=True
+                        f"val_prec_{class_idx}",
+                        val_prec,
+                        prog_bar=False,
+                        sync_dist=True,
                     )
 
                 if class_idx < len(rec_all):
@@ -355,7 +373,13 @@ class LitClassifier(pl.LightningModule):
 
 
 def objective(
-    trial, train_embeddings, train_loader, val_loader, weights, domain_task=False, EPOCHS=EPOCHS
+    trial,
+    input_dim,
+    train_loader,
+    val_loader,
+    weights,
+    domain_task=False,
+    EPOCHS=EPOCHS,
 ):
     if domain_task is False:
         if RANK == 0:
@@ -417,7 +441,7 @@ def objective(
         params = params_list[0]
 
         model = LitClassifier(
-            input_dim=train_embeddings.size(1),
+            input_dim=input_dim,
             hidden_dims=params["hidden_dims"],
             num_classes=NUM_CLASSES,
             optimizer_class=params["optimizer_class"],
@@ -427,7 +451,7 @@ def objective(
             weight_decay=params["weight_decay"],
             dropout=params["drop"],
             class_weights=params["weights"],
-            domain_task=False,  # Set to True if using domain boundary detection
+            domain_task=False,
         )
 
         # print(model)
@@ -435,14 +459,11 @@ def objective(
     else:
         # Domain boundary detection task, HPs for Transformer model
         if RANK == 0:
-
-
             d_model = trial.suggest_categorical("d_model", [256, 512, 768, 1024])
             n_heads = trial.suggest_categorical("n_heads", [4, 8, 16])
 
             while d_model % n_heads != 0:
                 n_heads = trial.suggest_categorical("n_heads", [4, 8, 16])
-
 
             n_layers = trial.suggest_int("n_layers", 2, 4, step=2)
             d_ff = 4 * d_model
@@ -486,27 +507,27 @@ def objective(
                 "optimizer_class": optimizer_class,
                 "activation": activation,
                 "kernel_init": kernel_init,
-                }
-    
+            }
+
             print(
-            f"\n=== Trial {trial.number} ===\n"
-            f"Hidden layers: {params['n_layers']}, Model dim: {params['d_model']}\n"
-            f"Number of heads: {params['n_heads']}, FF dim: {params['d_ff']}\n"
-            f"Attention dropout: {params['drop_attn']:.3f}, weights: {weights}\n"
-            f"Dropout: {params['drop']:.3f}, LR: {params['lr']:.6f}, WD: {params['weight_decay']:.6f}\n"
-            f"Optimizer: {params['optimizer_class'].__name__}, Activation: {params['activation'].__class__.__name__}\n"
-            f"========================\n")
+                f"\n=== Trial {trial.number} ===\n"
+                f"Hidden layers: {params['n_layers']}, Model dim: {params['d_model']}\n"
+                f"Number of heads: {params['n_heads']}, FF dim: {params['d_ff']}\n"
+                f"Attention dropout: {params['drop_attn']:.3f}, weights: {weights}\n"
+                f"Dropout: {params['drop']:.3f}, LR: {params['lr']:.6f}, WD: {params['weight_decay']:.6f}\n"
+                f"Optimizer: {params['optimizer_class'].__name__}, Activation: {params['activation'].__class__.__name__}\n"
+                f"========================\n"
+            )
 
         else:
             params = None
-
 
         params_list = [params]
         dist.broadcast_object_list(params_list, src=0)
         params = params_list[0]
 
         model = LitClassifier(
-            input_dim=train_embeddings.size(2),
+            input_dim=input_dim.size(2),
             hidden_dims=params["d_model"],
             num_classes=2,  # Binary classification for domain boundary detection
             optimizer_class=params["optimizer_class"],
@@ -516,14 +537,12 @@ def objective(
             weight_decay=params["weight_decay"],
             dropout=params["drop"],
             class_weights=weights,
-            domain_task=True,  # Set to True if using domain boundary detection
+            domain_task=True,
             num_heads=params["n_heads"],
             num_layers=params["n_layers"],
         )
 
-    early_stop = EarlyStopping(
-        monitor="val_loss", patience=5, mode="min", verbose=True
-    )
+    early_stop = EarlyStopping(monitor="val_loss", patience=5, mode="min", verbose=True)
     checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
     trainer = pl.Trainer(
@@ -534,20 +553,38 @@ def objective(
         enable_progress_bar=True,
         callbacks=[early_stop, checkpoint_callback],
         logger=TensorBoardLogger(
-            save_dir=f"./logs/{PROJECT_NAME}", name=f"optuna_trial_{trial.number}"
+            save_dir=f"./logs/FINAL/{PROJECT_NAME}/tensorboard", 
+            name=f"optuna_trial_{trial.number}"
         ),
     )
 
+    # Log hyperparameters to TensorBoard
+    if RANK == 0:
+        hparams = {
+            "num_neurons": params["hidden_dims"][0] if params["hidden_dims"] else 0,
+            "num_hidden_layers": int(len(params["hidden_dims"])),
+            "dropout": params["drop"],
+            "lr": params["lr"],
+            "weight_decay": params["weight_decay"],
+            "optimizer": params["optimizer_class"].__name__,
+            "activation": params["activation"].__class__.__name__,
+        }
+        
+        # Log hyperparameters
+        trainer.logger.log_hyperparams(hparams)
+
     trainer.fit(model, train_loader, val_loader)
-    # Ensure logger is flushed
-    logger = trainer.logger
-    if hasattr(logger, "finalize"):
-        logger.finalize("success")
-    return checkpoint_callback.best_model_score.item()
+    
+    # Log final metrics as hp_metric
+    best_val_loss = checkpoint_callback.best_model_score.item()
+    if RANK == 0:
+        # Log the final metric for hyperparameter comparison
+        trainer.logger.experiment.add_scalar('hp_metric', best_val_loss, 0)
+    
+    return best_val_loss
 
 
-def load_best_model(trial, train_embeddings, weights, domain_task=False):
-
+def load_best_model(trial, input_dim, weights, domain_task=False):
     if domain_task is False:
         p = trial.params
 
@@ -579,7 +616,7 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
         wd = p["weight_decay"]
 
         model = LitClassifier(
-            input_dim=train_embeddings.size(1),
+            input_dim=input_dim,
             hidden_dims=hidden_dims,
             num_classes=NUM_CLASSES,
             optimizer_class=optimizer_class,
@@ -599,7 +636,7 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
         n_heads = p["n_heads"]
 
         n_layers = p["n_layers"]
-       
+
         # d_ff = 4* d_model
 
         act_name = p["activation"]
@@ -612,7 +649,7 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
         else:  # "leaky_relu"
             activation_fn = nn.LeakyReLU(inplace=True)
             kernel_init = nn.init.kaiming_normal_
-        
+
         drop = p["dropout"]
         # drop_attn = p["dropout_attn"]
         lr = p["lr"]
@@ -626,23 +663,23 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
             optimizer_class = torch.optim.SGD
 
         model = LitClassifier(
-        input_dim=train_embeddings.size(2),
-        hidden_dims=d_model,
-        num_classes=2,  # Binary classification for domain boundary detection
-        optimizer_class=optimizer_class,
-        activation=activation_fn,
-        kernel_init=kernel_init,
-        lr=lr,
-        weight_decay=wd,
-        dropout=drop,
-        class_weights=weights,
-        domain_task=True,  # Set to True if using domain boundary detection
-        num_heads= n_heads,
-        num_layers=n_layers,
+            input_dim=input_dim.size(2),
+            hidden_dims=d_model,
+            num_classes=2,  # Binary classification for domain boundary detection
+            optimizer_class=optimizer_class,
+            activation=activation_fn,
+            kernel_init=kernel_init,
+            lr=lr,
+            weight_decay=wd,
+            dropout=drop,
+            class_weights=weights,
+            domain_task=True,  # Set to True if using domain boundary detection
+            num_heads=n_heads,
+            num_layers=n_layers,
         )
 
     ckpt_dir = (
-        f"./logs/{PROJECT_NAME}/optuna_trial_{trial.number}/version_0/checkpoints/"
+        f"./logs/FINAL/{PROJECT_NAME}/tensorboard/optuna_trial_{trial.number}/version_0/checkpoints/"
     )
     print(f"Looking for checkpoints in: {ckpt_dir}")
     pattern = os.path.join(ckpt_dir, "*.ckpt")
@@ -657,38 +694,123 @@ def load_best_model(trial, train_embeddings, weights, domain_task=False):
 
     # Load from checkpoint (this automatically restores all parameters)
     model = LitClassifier.load_from_checkpoint(chosen_ckpt)
-
-    torch.save(model, f"./models/{PROJECT_NAME}.pt")
+    model_path = f"./models/FINAL/{PROJECT_NAME}.pt"
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    torch.save(model, model_path)
     model = model.to(DEVICE).eval()
 
     return model
 
 
 # -------------------------
-# 6. Main
+# 6. Class distribution checker and weights calculation
+# -------------------------
+
+
+def class_distribution(train_dataset, val_dataset, range_train=None, range_val=None):
+    # Set defaults inside the function
+    if range_train is None:
+        range_train = len(train_dataset)
+    if range_val is None:
+        range_val = len(val_dataset)
+        if RANK == 0:
+            print("NOT USING FULL SET!")
+
+
+
+
+    train_labels_all = []
+    for i in range(range_train):
+        _, labels = train_dataset[i]
+        train_labels_all.append(labels.item())
+
+    train_labels_array = np.array(train_labels_all)
+    train_class_counts = np.bincount(train_labels_array, minlength=NUM_CLASSES)
+
+    if RANK == 0:
+        print("Training set label distribution:")
+        for i in range(NUM_CLASSES):
+            print(
+                f"  Class {i}: {train_class_counts[i]} samples ({train_class_counts[i] / range_train * 100:.2f}%)"
+            )
+        print(f"  Total training samples: {range_train}")
+
+    # Count ALL validation labels
+    if RANK == 0:
+        print("Extracting all validation labels for complete class distribution...")
+    val_labels_all = []
+    for i in range(range_val):
+        _, labels = val_dataset[i]
+        val_labels_all.append(labels.item())
+
+    val_labels_array = np.array(val_labels_all)
+    val_class_counts = np.bincount(val_labels_array, minlength=NUM_CLASSES)
+
+    if RANK == 0:
+        print("Validation set label distribution:")
+        for i in range(NUM_CLASSES):
+            print(
+                f"  Class {i}: {val_class_counts[i]} samples ({val_class_counts[i] / range_val * 100:.2f}%)"
+            )
+        print(f"  Total validation samples: {range_val}")
+
+    # Combined statistics
+    total_class_counts = train_class_counts + val_class_counts
+    total_samples = range_train + range_val
+
+    if RANK == 0:
+        print("Combined dataset label distribution:")
+        for i in range(NUM_CLASSES):
+            print(
+                f"  Class {i}: {total_class_counts[i]} samples ({total_class_counts[i] / total_samples * 100:.2f}%)"
+            )
+        print(f"  Total combined samples: {total_samples}")
+
+    # Calculate class weights based on training set
+    total_count = train_class_counts.sum()
+    weights = torch.tensor(
+        [
+            total_count / (NUM_CLASSES * count) if count > 0 else 0.0
+            for count in train_class_counts
+        ],
+        dtype=torch.float32,
+    )
+    if RANK == 0:
+        print("Class weights calculated:", weights.numpy())
+    weights = weights.to(DEVICE)
+
+    # Create the validation tensors for final evaluation
+    val_embeddings = []
+    val_labels = []
+    if RANK == 0:
+        print("Creating validation tensors for final evaluation...")
+    for i in range(range_val):
+        emb, label = val_dataset[i]
+        val_embeddings.append(emb)
+        val_labels.append(label.item())
+
+    val_embeddings = torch.stack(val_embeddings)
+    val_labels = torch.tensor(val_labels)
+
+    # Clean up intermediate variables
+    del train_labels_all, val_labels_all, train_labels_array, val_labels_array
+
+    # Return the computed values
+    return weights, val_embeddings, val_labels
+
+
+# -------------------------
+# 7. Main
 # -------------------------
 
 
 def main(Final_training=False):
     os.makedirs("pickle", exist_ok=True)
-    os.makedirs(f"logs/{PROJECT_NAME}", exist_ok=True)
+    os.makedirs(f"logs/FINAL/{PROJECT_NAME}", exist_ok=True)
     os.makedirs("models", exist_ok=True)
 
-    if os.path.exists(CACHE_PATH):
-        with open(CACHE_PATH, "rb") as f:
-            train_embeddings, train_labels, val_embeddings, val_labels = pickle.load(f)
-        print("Loaded cached embeddings & labels from disk.\n")
-
-
-
-        print(train_embeddings.shape, train_labels.shape)
-        print(val_embeddings.shape, val_labels.shape)
-
-        train_ds = TensorDataset(train_embeddings, train_labels)
-        val_ds = TensorDataset(val_embeddings, val_labels)
-
-    else:
-        esm_data = ESMDataset(
+    if not os.path.exists(CACHE_PATH):
+        ESMDataset(
             esm_model=ESM_MODEL,
             FSDP_used=False,
             domain_boundary_detection=False,
@@ -699,60 +821,124 @@ def main(Final_training=False):
             sequence_col=SEQUENCE_COL,
         )
 
-        train_embeddings = esm_data.train_embeddings
-        train_labels = esm_data.train_labels
-        val_embeddings = esm_data.val_embeddings
-        val_labels = esm_data.val_labels
+    # Create separate datasets for train and validation data from H5 file
+    class TrainDataset(torch.utils.data.Dataset):
+        def __init__(self, h5_file):
+            self.h5_file = h5_file
 
-        train_ds = TensorDataset(train_embeddings, train_labels)
-        val_ds = TensorDataset(val_embeddings, val_labels)
+            with h5py.File(self.h5_file, "r") as f:
+                # Get train embedding keys
+                self.embedding_keys = sorted(
+                    [k for k in f.keys() if k.startswith("train_embeddings_")]
+                )
+                self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                self.length = (
+                    self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+                )
 
+        def __len__(self):
+            return self.length
 
+        def __getitem__(self, idx):
+            with h5py.File(self.h5_file, "r") as f:
+                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+                local_idx = (
+                    idx - self.cumulative_sizes[chunk_idx - 1] if chunk_idx > 0 else idx
+                )
 
+                embedding_key = self.embedding_keys[chunk_idx]
+                labels_key = embedding_key.replace("train_embeddings_", "train_labels_")
 
-        with open(CACHE_PATH, "wb") as f:
-            pickle.dump(
-                (train_embeddings, train_labels, val_embeddings, val_labels),
-                f,
-            )
-        print("Computed embeddings & labels, then wrote them to cache.")
+                embeddings = torch.tensor(
+                    f[embedding_key][local_idx], dtype=torch.float32
+                )
+                labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
 
-    # dist.destroy_process_group()                # temporary fix to move on on one GPU for training
+                return embeddings, labels
 
-    counts = torch.bincount(train_labels, minlength=NUM_CLASSES).float()
-    total = train_labels.size(0)
-    weights = total / (NUM_CLASSES * counts)
-    weights = weights * (NUM_CLASSES / weights.sum())
-    weights = weights.to(DEVICE)
+    class ValDataset(torch.utils.data.Dataset):
+        def __init__(self, h5_file):
+            self.h5_file = h5_file
 
-    print("Dataset building complete")
+            with h5py.File(self.h5_file, "r") as f:
+                # Get validation embedding keys
+                self.embedding_keys = sorted(
+                    [k for k in f.keys() if k.startswith("val_embeddings_")]
+                )
+                self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                self.length = (
+                    self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+                )
+
+        def __len__(self):
+            return self.length
+
+        def __getitem__(self, idx):
+            with h5py.File(self.h5_file, "r") as f:
+                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+                local_idx = (
+                    idx - self.cumulative_sizes[chunk_idx - 1] if chunk_idx > 0 else idx
+                )
+
+                embedding_key = self.embedding_keys[chunk_idx]
+                labels_key = embedding_key.replace("val_embeddings_", "val_labels_")
+
+                embeddings = torch.tensor(
+                    f[embedding_key][local_idx], dtype=torch.float32
+                )
+                labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
+
+                return embeddings, labels
+
+    # Create train and validation datasets
+    train_dataset = TrainDataset(CACHE_PATH)
+    val_dataset = ValDataset(CACHE_PATH)
+
+    sample_embedding, sample_label = train_dataset[0]
+
+    # print("shapes:", sample_embedding.dim(), sample_label.dim())
+    # print(sample_embedding, sample_label)
 
     train_loader = DataLoader(
-        train_ds,
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,
         pin_memory=True,
+        prefetch_factor=4,
     )
-    print("Train loader created")
 
     val_loader = DataLoader(
-        val_ds,
+        val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,
         pin_memory=True,
+        prefetch_factor=4,
     )
-    print("Val loader created")
-
-    print("Starting Optuna hyperparameter search...")
 
     if RANK == 0:
+        print("Train and validation datasets created from cached embeddings.")
+        print(
+            f"Train dataset size: {len(train_dataset)}, Val dataset size: {len(val_dataset)}"
+        )
+        print("Dataset building complete")
+        print("Calculating class weights and label distributions...")
+        print("Extracting all training labels for complete class distribution...")
+
+    weights, val_embeddings, val_labels = class_distribution(
+        train_dataset, val_dataset, 10000, 10000
+    )
+
+    if RANK == 0:
+        print("Starting Optuna hyperparameter search...")
         study = optuna.create_study(
             direction="minimize",
-            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            storage=f"sqlite:///logs/FINAL/{PROJECT_NAME}/optuna_study.db",
             load_if_exists=True,
             study_name=PROJECT_NAME,
         )
@@ -762,13 +948,25 @@ def main(Final_training=False):
     if RANK != 0:
         study = optuna.create_study(
             direction="minimize",
-            storage=f"sqlite:///logs/{PROJECT_NAME}/optuna_study.db",
+            storage=f"sqlite:///logs/FINAL/{PROJECT_NAME}/optuna_study.db",
             load_if_exists=True,
             study_name=PROJECT_NAME,
         )
 
+    input_dim = sample_embedding.shape[
+        0
+    ]  # print(f"Input dimension for model: {input_dim_sample}")
+
     def objective_wrapper(trial):
-        return objective(trial, train_embeddings, train_loader, val_loader, weights)
+        return objective(
+            trial,
+            input_dim,
+            train_loader,
+            val_loader,
+            weights,
+            domain_task=False,
+            EPOCHS=EPOCHS,
+        )
 
     study.optimize(
         objective_wrapper,
@@ -781,21 +979,12 @@ def main(Final_training=False):
 
     best_trial = study.best_trial
 
-    lit_model = load_best_model(best_trial, train_embeddings, weights)
+
+
+    lit_model = load_best_model(best_trial, input_dim, weights)
 
     lit_model.eval()
     print("Best model loaded and set to eval mode")
-
-    # Evaluate on validation set
-    device = lit_model.device
-    with torch.no_grad():
-        val_embeddings_gpu = val_embeddings.to(device)  # Use different variable name
-        val_logits = lit_model(val_embeddings_gpu)
-    val_preds = val_logits.argmax(dim=1).cpu().numpy()
-    val_true = val_labels.numpy()
-
-    acc = accuracy_score(val_true, val_preds)
-    print(f"Validation Accuracy: {acc:.4f}")
 
     if Final_training is True:
         early_stop = EarlyStopping(
@@ -812,7 +1001,7 @@ def main(Final_training=False):
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
-                save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
+                save_dir=f"./logs/FINAL/{PROJECT_NAME}/tensorboard", name=f"{PROJECT_NAME}_final"
             ),
         )
 
@@ -820,11 +1009,15 @@ def main(Final_training=False):
 
         trainer.fit(lit_model, train_loader, val_loader)
 
-        if RANK == 0:
-            print("\nTraining complete, saving final model...\n")
-
         # save the final model
-        final_model_path = f"./models/{PROJECT_NAME}.pt"
+        final_model_path = f"./models/FINAL/{PROJECT_NAME}.pt"
+
+
+        if RANK == 0:
+            print(f"\nTraining complete, saving final model under: {final_model_path} ...\n")
+
+
+        os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
         torch.save(lit_model, final_model_path)
 
     if dist.is_initialized():

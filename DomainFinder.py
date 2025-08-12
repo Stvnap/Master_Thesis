@@ -132,6 +132,7 @@ class Transformer(nn.Module):
         return pe.unsqueeze(0)  # Add batch dimension [1, seq_len, d_model]
 
     def forward(self, x):
+        # time_start = time.time()
         # x shape: [batch_size, seq_len, input_dim]
 
         # print(f"Input shape: {x.shape}")  # Debugging line
@@ -153,6 +154,9 @@ class Transformer(nn.Module):
 
         # Per-position classification for domain boundaries
         logits = self.classifier(x)  # [batch_size, seq_len, num_classes]
+
+        # if RANK == 0:
+        #     print(f"Forward pass time: {time.time() - time_start:.2f} seconds")
 
         return logits
 
@@ -298,6 +302,8 @@ def main(Final_training=False):
         shuffle=True,
         num_workers=16,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -305,6 +311,8 @@ def main(Final_training=False):
         shuffle=False,
         num_workers=16,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     print(f"Train set: {len(train_dataset)} samples")
@@ -314,7 +322,7 @@ def main(Final_training=False):
     # Calculate class weights by iterating through the dataset
     print("Calculating class weights for training set...")
     all_labels = []
-    for i in range(0, 1000):
+    for i in range(0, 100):
         _, labels = train_dataset[i]
         all_labels.append(labels)
 
