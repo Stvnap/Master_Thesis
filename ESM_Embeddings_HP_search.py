@@ -36,19 +36,20 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
+NUM_CLASSES = 11  # classes + 1 for "other" class
+
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./temp/embeddings_classification_2d.pt.h5"
-PROJECT_NAME = "t33_ALL_2d"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d_THIO.h5"
+PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d_THIO"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-NUM_CLASSES = 3  # classes + 1 for "other" class
 EPOCHS = 50
-STUDY_N_TRIALS = 30
-BATCH_SIZE = 256
+STUDY_N_TRIALS = 5
+BATCH_SIZE = 1028
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 VAL_FRAC = 0.2
@@ -155,16 +156,6 @@ class LitClassifier(pl.LightningModule):
                 num_layers,
             )
 
-            def loss_fn_boundary(logits, labels, class_weights=None):
-                return
-
-            def loss_fn_boundary_wrapper(logits, labels):
-                return loss_fn_boundary(logits, labels, self.class_weights)
-
-            self.loss_fn = nn.CrossEntropyLoss(
-                weight=self.class_weights,
-                reduction="none",  # to keep per residue losses (one per sequence position)
-            )
 
         self.precision_metric = Precision(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
@@ -172,6 +163,46 @@ class LitClassifier(pl.LightningModule):
         self.recall_metric = Recall(
             task="multiclass", num_classes=num_classes, average=None, ignore_index=None
         )
+
+
+    def fbeta (self, precision, recall, beta=1.5):
+        """
+        Calculate the F-beta score.
+        :param precision: Precision value
+        :param recall: Recall value
+        :param beta: Beta value for F-beta score
+        :return: F-beta score
+        """
+        if precision + recall == 0:
+            return 0.0
+        return (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
+
+    def differentiable_fbeta_loss(self, logits, labels, beta=1.5, epsilon=1e-8):
+        """
+        Differentiable F-beta loss using soft predictions.
+        """
+        # Apply softmax to get probabilities
+        probs = torch.softmax(logits, dim=-1)
+        
+        if self.domain_task:
+            # Binary classification - focus on boundary class (class 1)
+            # Convert labels to one-hot
+            labels_onehot = torch.zeros_like(probs)
+            labels_onehot.scatter_(1, labels.unsqueeze(-1), 1)
+            
+            # Calculate soft TP, FP, FN for boundary class
+            boundary_probs = probs[:, 1]  # Probabilities for boundary class
+            boundary_labels = labels_onehot[:, 1]  # True boundary labels
+            
+            tp = (boundary_probs * boundary_labels).sum()
+            fp = (boundary_probs * (1 - boundary_labels)).sum()
+            fn = ((1 - boundary_probs) * boundary_labels).sum()
+            
+            precision = tp / (tp + fp + epsilon)
+            recall = tp / (tp + fn + epsilon)
+            
+            fbeta = (1 + beta**2) * precision * recall / (beta**2 * precision + recall + epsilon)
+            return 1.0 - fbeta  # Convert to loss
 
     def forward(self, x):
         return self.model(x)
@@ -197,7 +228,7 @@ class LitClassifier(pl.LightningModule):
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
                 seq_labels = y[i]  # [seq_len]
-                seq_loss = self.loss_fn(seq_logits, seq_labels)
+                seq_loss = self.differentiable_fbeta_loss(seq_logits, seq_labels)
                 losses.append(seq_loss)
 
             loss = torch.stack(losses).mean()
@@ -231,7 +262,7 @@ class LitClassifier(pl.LightningModule):
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
                 seq_labels = y[i]  # [seq_len]
-                seq_loss = self.loss_fn(seq_logits, seq_labels)
+                seq_loss = self.differentiable_fbeta_loss(seq_logits, seq_labels)
                 losses.append(seq_loss)
 
                 seq_preds = torch.argmax(seq_logits, dim=-1)  # [seq_len]
@@ -301,12 +332,8 @@ class LitClassifier(pl.LightningModule):
             )
             boundary_recall = rec_all[1].item() if not torch.isnan(rec_all[1]) else 0.0
 
-            beta = 1.5  # approxx 70% recall, 30% precision
-            fbeta = (
-                (1 + beta**2)
-                * (boundary_precision * boundary_recall)
-                / ((beta**2 * boundary_precision) + boundary_recall)
-            )
+
+            fbeta = self.fbeta(boundary_precision, boundary_recall, beta=1.5)
 
             self.log(
                 "val_boundary_prec", boundary_precision, prog_bar=True, sync_dist=True
@@ -321,7 +348,7 @@ class LitClassifier(pl.LightningModule):
                     val_prec = (
                         prec_all[class_idx].item()
                         if not torch.isnan(prec_all[class_idx])
-                        else 0.0
+                        else 1.0
                     )
                     self.log(
                         f"val_prec_{class_idx}",
@@ -334,15 +361,23 @@ class LitClassifier(pl.LightningModule):
                     val_rec = (
                         rec_all[class_idx].item()
                         if not torch.isnan(rec_all[class_idx])
-                        else 0.0
+                        else 1.0
                     )
                     self.log(
                         f"val_rec_{class_idx}", val_rec, prog_bar=False, sync_dist=True
                     )
 
+
+            # if RANK == 0:
+            #     print(f"Precision per class: {prec_all}")
+            #     print(f"Recall per class: {rec_all}")
+            #     print(f"NaN count in precision: {torch.isnan(prec_all).sum()}")
+
             # Log average metrics across all classes
-            avg_prec = prec_all.nanmean().item() if len(prec_all) > 0 else 0.0
-            avg_rec = rec_all.nanmean().item() if len(rec_all) > 0 else 0.0
+            valid_prec = prec_all[~torch.isnan(prec_all)]  # Remove NaN values
+            avg_prec = valid_prec.mean().item() if len(valid_prec) > 0 else 0.0
+            valid_rec = rec_all[~torch.isnan(rec_all)]  # Remove NaN values  
+            avg_rec = valid_rec.mean().item() if len(valid_rec) > 0 else 0.0
 
             self.log("val_prec_avg", avg_prec, prog_bar=True, sync_dist=True)
             self.log("val_rec_avg", avg_rec, prog_bar=True, sync_dist=True)
@@ -389,8 +424,8 @@ def objective(
             ]
 
             drop = trial.suggest_float("dropout", 0.1, 0.5)
-            lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)  # was 1e-2
-            wd = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)  # was 1e-2
+            lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)  
+            wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)  
 
             optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
             if optimizer == "adam":
@@ -437,7 +472,10 @@ def objective(
             params = None
 
         params_list = [params]
-        dist.broadcast_object_list(params_list, src=0)
+
+        if dist.is_initialized():
+            # Broadcast the parameters to all ranks
+            dist.broadcast_object_list(params_list, src=0)
         params = params_list[0]
 
         model = LitClassifier(
@@ -548,8 +586,8 @@ def objective(
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator="gpu",
-        devices=-1,
-        strategy="ddp",
+        devices=-1 if dist.is_initialized() else 1,
+        strategy="ddp" if dist.is_initialized() else "auto",
         enable_progress_bar=True,
         callbacks=[early_stop, checkpoint_callback],
         logger=TensorBoardLogger(
@@ -560,17 +598,29 @@ def objective(
 
     # Log hyperparameters to TensorBoard
     if RANK == 0:
-        hparams = {
-            "num_neurons": params["hidden_dims"][0] if params["hidden_dims"] else 0,
-            "num_hidden_layers": int(len(params["hidden_dims"])),
-            "dropout": params["drop"],
-            "lr": params["lr"],
-            "weight_decay": params["weight_decay"],
-            "optimizer": params["optimizer_class"].__name__,
-            "activation": params["activation"].__class__.__name__,
-        }
+        if domain_task is False:
+            hparams = {
+                "num_neurons": params["hidden_dims"][0] if params["hidden_dims"] else 0,
+                "num_hidden_layers": int(len(params["hidden_dims"])),
+                "dropout": params["drop"],
+                "lr": params["lr"],
+                "weight_decay": params["weight_decay"],
+                "optimizer": params["optimizer_class"].__name__,
+                "activation": params["activation"].__class__.__name__,
+            }
+        else:
+            # Domain task hyperparameters
+            hparams = {
+                "d_model": params["d_model"],
+                "num_heads": params["n_heads"],
+                "num_layers": params["n_layers"],
+                "dropout": params["drop"],
+                "lr": params["lr"],
+                "weight_decay": params["weight_decay"],
+                "optimizer": params["optimizer_class"].__name__,
+                "activation": params["activation"].__class__.__name__,
+            }
         
-        # Log hyperparameters
         trainer.logger.log_hyperparams(hparams)
 
     trainer.fit(model, train_loader, val_loader)
@@ -628,6 +678,15 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             class_weights=weights,
         )
 
+        
+        print(
+            f"\n=== FINAL TRAINING WITH {trial.number} ===\n"
+            f"Hidden layers: {n_layers}, Neurons: {n_neurons}\n"
+            f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
+            f"Optimizer: {optimizer_class}, Activation: {activation_fn.__class__.__name__}\n"
+            f"========================\n"
+        )
+
     else:
         p = trial.params
         # print(f"Available parameters: {list(p.keys())}")  # Debug line
@@ -678,6 +737,16 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             num_layers=n_layers,
         )
 
+        print(
+            f"\n=== FINAL TRAINING WITH {trial.number} ===\n"
+            f"Hidden layers: {n_layers}, Hidden dim: {d_model}, n Heads: {n_heads}\n"
+            f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
+            f"Optimizer: {optimizer_class}, Activation: {activation_fn.__class__.__name__}\n"
+            f"========================\n"
+        )
+
+
+
     ckpt_dir = (
         f"./logs/FINAL/{PROJECT_NAME}/tensorboard/optuna_trial_{trial.number}/version_0/checkpoints/"
     )
@@ -699,6 +768,12 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
     torch.save(model, model_path)
     model = model.to(DEVICE).eval()
 
+
+
+
+
+
+
     return model
 
 
@@ -713,6 +788,8 @@ def class_distribution(train_dataset, val_dataset, range_train=None, range_val=N
         range_train = len(train_dataset)
     if range_val is None:
         range_val = len(val_dataset)
+
+    if range_val and range_train is not None:
         if RANK == 0:
             print("NOT USING FULL SET!")
 
@@ -943,7 +1020,9 @@ def main(Final_training=False):
             study_name=PROJECT_NAME,
         )
 
-    dist.barrier()  # Ensure all ranks are synchronized before starting the study
+
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all ranks are synchronized before starting the study
 
     if RANK != 0:
         study = optuna.create_study(
@@ -973,11 +1052,18 @@ def main(Final_training=False):
         n_trials=STUDY_N_TRIALS,
     )
 
-    print("Best trial number:", study.best_trial.number)
-    print("Best trial:", study.best_trial)
-    # print("Best trial params:", study.best_trial.params)
+    if RANK == 0:
+        print("Best trial number:", study.best_trial.number)
+        print("Best trial:", study.best_trial)
+        print("Best trial params:", study.best_trial.params)
 
     best_trial = study.best_trial
+
+    if best_trial is None:
+        best_trial = study.trials[study.best_trial.number+1]
+    if best_trial is None:
+        best_trial = study.trials[study.best_trial.number-2]
+
 
 
 
@@ -996,8 +1082,8 @@ def main(Final_training=False):
         trainer = pl.Trainer(
             max_epochs=EPOCHS,
             accelerator="gpu",
-            devices=-1,
-            strategy="ddp",
+            devices=-1 if dist.is_initialized() else 1,
+            strategy="ddp" if dist.is_initialized() else "auto",
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(

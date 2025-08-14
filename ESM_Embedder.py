@@ -243,15 +243,32 @@ class ESMDataset:
                         priority_pfam_ids = [
                             "PF00177",
                             "PF00210",
-                            # "PF00211",
-                            # "PF00215",
-                            # "PF00217",
-                            # "PF00406",
-                            # "PF00303",
-                            # "PF00246",
-                            # "PF00457",
-                            # "PF00502",
+                            "PF00211",
+                            "PF00215",
+                            "PF00217",
+                            "PF00406",
+                            "PF00303",
+                            "PF00246",
+                            "PF00457",
+                            "PF00502",
                         ]
+
+
+
+                        # FOR THE THIOLASESET ONLY
+                        priority_pfam_ids = [
+                            "PF00108",
+                            "PF00109",
+                            "PF00195",
+                            "PF01154",
+                            "PF02797",
+                            "PF02801",
+                            "PF02803",
+                            "PF07451",
+                            "PF08392",
+                            "PF08540",
+                        ]
+
 
                         if self.training is False:
                             # to ensure same ids used during evaluation on prediction quality
@@ -395,7 +412,7 @@ class ESMDataset:
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
                                 with h5py.File(
-                                    f"./temp/embeddings_classification_{self.num_classes - 1}d.pt.h5",
+                                    f"./temp/embeddings_classification_{self.num_classes - 1}d_THIO.h5",
                                     "a",
                                 ) as f:
                                     f.create_dataset(
@@ -420,6 +437,48 @@ class ESMDataset:
                             print(
                                 f"Wrote embeddings and labels for batch {chunk_num} to file"
                             )
+                    else:
+                        # Save embeddings and labels to files
+                        os.makedirs("./temp", exist_ok=True)
+
+                        if RANK == 0:
+                            print("SHAPES")
+                            print(
+                                f"Embeddings: {self.embeddings.shape}, Labels: {self.labels.shape}"
+                            )
+                            print(
+                                f"Starts: {self.starts.shape}, Ends: {self.ends.shape}"
+                            )
+
+
+                        for rank_id in range(dist.get_world_size()):
+                            if RANK == rank_id:
+                                with h5py.File(
+                                    f"./temp/embeddings_classification_{self.num_classes - 1}d_EVAL.h5",
+                                    "a",
+                                ) as f:
+                                    f.create_dataset(
+                                        f"embeddings_chunk{chunk_num}_rank{RANK}",
+                                        data=self.embeddings.cpu().numpy(),
+                                    )
+                                    f.create_dataset(
+                                        f"labels_chunk{chunk_num}_rank{RANK}",
+                                        data=self.labels.cpu().numpy(),
+                                    )
+                                    if self.training is False:
+                                        f.create_dataset(
+                                            f"starts_chunk{chunk_num}_rank{RANK}",
+                                            data=self.starts.cpu().numpy(),
+                                        )
+                                        f.create_dataset(
+                                            f"ends_chunk{chunk_num}_rank{RANK}",
+                                            data=self.ends.cpu().numpy(),
+                                        )
+
+                        if RANK == 0:
+                            print(f"Wrote embeddings and labels for batch {chunk_num} to file")
+
+
 
                 print("Done Embedding! Closing Embedder")
 
@@ -569,7 +628,7 @@ class ESMDataset:
                     f"Rank {RANK}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
                 )
 
-            if self.training is False:
+            elif self.training is False and self.domain_boundary_detection is False:
                 new_starts = []
                 new_ends = []
                 for seq, label, start, end in zip(
@@ -578,6 +637,44 @@ class ESMDataset:
                     seq_dataset.starts,
                     seq_dataset.ends,
                 ):
+
+                    if len(seq) > 1000:
+                        if RANK == 0:
+                            count += 1
+                        slices = [
+                            seq[i : i + dimension]
+                            for i in range(0, len(seq) - dimension + 1, stepsize)
+                        ]
+                        if len(seq) % dimension != 0:
+                            slices.append(seq[-dimension:])
+                        new_seqs.extend(slices)
+                        new_labels.extend([label] * len(slices))
+                        new_starts.extend([start] * len(slices))
+                        new_ends.extend([end] * len(slices))
+
+                    else:
+                        new_seqs.append(seq)
+                        new_labels.append(label)
+                        new_starts.append(start)
+                        new_ends.append(end)
+                self.end_window = [len(seq) for seq in new_seqs]
+                print(
+                    f"Rank {RANK}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
+                )
+
+
+
+            elif self.domain_boundary_detection is True:
+                new_starts = []
+                new_ends = []
+                print(seq_dataset.labels.shape)
+                for seq, label, start, end in zip(
+                    seq_dataset.seqs,
+                    seq_dataset.labels,
+                    seq_dataset.starts,
+                    seq_dataset.ends,
+                ):
+                    # print("LABEL:", label.shape, "SEQ:", seq, "START:", start, "END:", end)
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -690,6 +787,11 @@ class ESMDataset:
             seq_dataset = SeqDatasetForEval(
                 seqs, self.labels, self.all_starts, self.all_ends
             )
+
+
+        # if RANK == 0:
+            # print(seq_dataset.labels.shape)
+
 
         if self.training is True:
             new_seqs, new_labels = windower(stepsize=500, dimension=1000)
