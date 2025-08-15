@@ -255,19 +255,19 @@ class ESMDataset:
 
 
 
-                        # FOR THE THIOLASESET ONLY
-                        priority_pfam_ids = [
-                            "PF00108",
-                            "PF00109",
-                            "PF00195",
-                            "PF01154",
-                            "PF02797",
-                            "PF02801",
-                            "PF02803",
-                            "PF07451",
-                            "PF08392",
-                            "PF08540",
-                        ]
+                        # # FOR THE THIOLASESET ONLY
+                        # priority_pfam_ids = [
+                        #     "PF00108",
+                        #     "PF00109",
+                        #     "PF00195",
+                        #     "PF01154",
+                        #     "PF02797",
+                        #     "PF02801",
+                        #     "PF02803",
+                        #     "PF07451",
+                        #     "PF08392",
+                        #     "PF08540",
+                        # ]
 
 
                         if self.training is False:
@@ -412,7 +412,7 @@ class ESMDataset:
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
                                 with h5py.File(
-                                    f"./temp/embeddings_classification_{self.num_classes - 1}d_THIO.h5",
+                                    f"./temp/embeddings_classification_{self.num_classes - 1}d.h5",
                                     "a",
                                 ) as f:
                                     f.create_dataset(
@@ -474,6 +474,7 @@ class ESMDataset:
                                             f"ends_chunk{chunk_num}_rank{RANK}",
                                             data=self.ends.cpu().numpy(),
                                         )
+                            dist.barrier()  # Ensure only one rank writes at a time
 
                         if RANK == 0:
                             print(f"Wrote embeddings and labels for batch {chunk_num} to file")

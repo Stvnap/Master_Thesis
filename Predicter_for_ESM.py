@@ -20,23 +20,24 @@ import torch.distributed as dist
 torch.set_float32_matmul_precision("high")
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
+
 # -------------------------
 # 1. Global settings
 # -------------------------
 
 GLOBAL_RUN = 0  # keep 0
 
-CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins_Eval.csv"
+CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-MODEL_PATH = "./models/FINAL/t33_ALL_2d.pt"
-CACHE_PATH = "./temp/embeddings_classification_2d_EVAL.h5"
-TENSBORBOARD_LOG_DIR = "./models/2d_uncut_ALL"
+MODEL_PATH = "./models/FINAL/t33_ALL_10d.pt"
+CACHE_PATH = "./temp/embeddings_classification_10d_EVAL.h5"
+TENSBORBOARD_LOG_DIR = "./models/10d_uncut_ALL"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 
-NUM_CLASSES = 3
+NUM_CLASSES = 11
 BATCH_SIZE = 1000
 EMB_BATCH = 1
 NUM_WORKERS = min(16, os.cpu_count())
@@ -51,7 +52,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -------------------------
 # 2. Opener Function
 # -------------------------
-
 
 def opener():
     """

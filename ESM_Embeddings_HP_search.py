@@ -36,19 +36,19 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
-NUM_CLASSES = 11  # classes + 1 for "other" class
+NUM_CLASSES = 101  # classes + 1 for "other" class
 
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d_THIO.h5"
-PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d_THIO"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d.h5"
+PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 EPOCHS = 50
-STUDY_N_TRIALS = 5
+STUDY_N_TRIALS = 30
 BATCH_SIZE = 1028
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
@@ -678,7 +678,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             class_weights=weights,
         )
 
-        
+
         print(
             f"\n=== FINAL TRAINING WITH {trial.number} ===\n"
             f"Hidden layers: {n_layers}, Neurons: {n_neurons}\n"
