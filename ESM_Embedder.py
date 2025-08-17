@@ -192,7 +192,7 @@ class ESMDataset:
                 chunk_iter = pd.read_csv(
                     csv_path,
                     usecols=["start", "end", "id", "Pfam_id", "Sequence"],
-                    chunksize=10000000,  # Adjust chunk size as needed
+                    chunksize=500000,  # Adjust chunk size as needed
                 )
 
                 for chunk_num, chunk in enumerate(chunk_iter):
@@ -1160,196 +1160,59 @@ class ESMDataset:
         if RANK == 0:
             print("\nEmbeddings DONE!\n")
 
-        # ------------------------------------------------------
-        #   BROADCASTING AND GATHERING EMBEDDINGS AND LABELS
-        # ------------------------------------------------------
-        # used in classification tasks, where we need to gather all embeddings and labels from all ranks,
-        # tried my way here, it works, but some parts i dont understand fully
-        # NOT NEEDED FOR DOMAIN BOUDNARY TASK
+        # Replace the entire distributed section (lines 1120-1350) with this optimized approach:
 
-        if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
-            # Gather embeddings and labels from all processes
-            local_size = torch.tensor(
-                [local_embeddings.size(0)], dtype=torch.int64, device="cuda"
-            )
-            all_sizes = [
-                torch.zeros_like(local_size) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(all_sizes, local_size)
+        # Skip expensive distributed gathering - save locally per rank
+        if RANK == 0:
+            print("Saving embeddings locally per rank (no expensive gathering)")
 
-            total_size = sum(size.item() for size in all_sizes)
-
-            if RANK == 0:
-                # Initialize final_embeddings with the correct dimensions
-                final_embeddings = torch.empty(
-                    total_size, expected_dim, dtype=torch.float32
-                )
-
-                # Initialize final_labels with the correct dimensions
-                final_labels = torch.empty(total_size, dtype=torch.long)
-
+        # OPTIMIZED: Each rank saves its own data independently
+        if self.domain_boundary_detection is False:
+            # Efficient local concatenation
+            if all_embeddings:
+                # Pre-allocate final tensor
+                total_samples = sum(emb.shape[0] for emb in all_embeddings)
+                local_embeddings = torch.empty(total_samples, expected_dim, dtype=torch.float32)
+                local_labels = torch.empty(total_samples, dtype=torch.long)
+                
                 if self.training is False:
-                    final_starts = torch.empty(total_size, dtype=torch.long)
-                    final_ends = torch.empty(total_size, dtype=torch.long)
-
+                    local_starts = torch.empty(total_samples, dtype=torch.long)
+                    local_ends = torch.empty(total_samples, dtype=torch.long)
+                
+                # Efficient copying without creating intermediate tensors
                 current_idx = 0
-                for rank in range(dist.get_world_size()):
-                    rank_size = all_sizes[rank].item()
-                    if rank_size > 0:
-                        if rank == 0:
-                            final_embeddings[current_idx : current_idx + rank_size] = (
-                                local_embeddings
-                            )
-                            final_labels[current_idx : current_idx + rank_size] = (
-                                local_labels
-                            )
-                            if self.training is False:
-                                final_starts[current_idx : current_idx + rank_size] = (
-                                    local_starts
-                                )
-                                final_ends[current_idx : current_idx + rank_size] = (
-                                    local_ends
-                                )
-                        else:
-                            rank_embeddings = torch.empty(
-                                rank_size,
-                                expected_dim,
-                                dtype=torch.float32,
-                                device="cuda",
-                            )
-                            dist.recv(rank_embeddings, src=rank)
-                            final_embeddings[current_idx : current_idx + rank_size] = (
-                                rank_embeddings.cpu()
-                            )
-
-                            rank_labels = torch.empty(
-                                rank_size, dtype=torch.long, device="cuda"
-                            )
-                            dist.recv(rank_labels, src=rank)
-                            final_labels[current_idx : current_idx + rank_size] = (
-                                rank_labels.cpu()
-                            )
-
-                            if self.training is False:
-                                rank_starts = torch.empty(
-                                    rank_size, dtype=torch.long, device="cuda"
-                                )
-                                dist.recv(rank_starts, src=rank)
-                                final_starts[current_idx : current_idx + rank_size] = (
-                                    rank_starts.cpu()
-                                )
-
-                                rank_ends = torch.empty(
-                                    rank_size, dtype=torch.long, device="cuda"
-                                )
-                                dist.recv(rank_ends, src=rank)
-                                final_ends[current_idx : current_idx + rank_size] = (
-                                    rank_ends.cpu()
-                                )
-
-                            del rank_embeddings, rank_labels
-                            if self.training is False:
-                                del rank_starts, rank_ends
-                            torch.cuda.empty_cache()
-                        current_idx += rank_size
-            else:
-                if local_embeddings.size(0) > 0:
-                    local_embeddings_gpu = local_embeddings.cuda()
-                    dist.send(local_embeddings_gpu, dst=0)
-                    del local_embeddings_gpu
-
-                    local_labels_gpu = local_labels.cuda()
-                    dist.send(local_labels_gpu, dst=0)
-                    del local_labels_gpu
-
+                for i, (emb, lbl) in enumerate(zip(all_embeddings, all_labels)):
+                    batch_size = emb.shape[0]
+                    local_embeddings[current_idx:current_idx + batch_size] = emb
+                    local_labels[current_idx:current_idx + batch_size] = lbl
+                    
                     if self.training is False:
-                        local_starts_gpu = local_starts.cuda()
-                        dist.send(local_starts_gpu, dst=0)
-                        del local_starts_gpu
-
-                        local_ends_gpu = local_ends.cuda()
-                        dist.send(local_ends_gpu, dst=0)
-                        del local_ends_gpu
-
-                    torch.cuda.empty_cache()
-
-            # Broadcast final data from rank 0 to all ranks
-            if RANK == 0:
-                size_tensor = torch.tensor([final_embeddings.size(0)], device="cuda")
+                        local_starts[current_idx:current_idx + batch_size] = all_starts[i]
+                        local_ends[current_idx:current_idx + batch_size] = all_ends[i]
+                    
+                    current_idx += batch_size
             else:
-                size_tensor = torch.tensor([0], device="cuda")
-
-            dist.broadcast(size_tensor, 0)
-
-            total_size = size_tensor.item()
-            chunk_size = 10000
-            if self.domain_boundary_detection is True:
-                chunk_size = 1000  # Smaller chunk size for domain boundary detection
-
-            if RANK != 0:
-                final_labels = torch.empty(total_size, dtype=torch.long, device="cuda")
-                final_embeddings = torch.empty(
-                    total_size, expected_dim, dtype=torch.float32
-                )
-
+                local_embeddings = torch.empty(0, expected_dim)
+                local_labels = torch.empty(0, dtype=torch.long)
                 if self.training is False:
-                    final_starts = torch.empty(total_size, dtype=torch.long)
-                    final_ends = torch.empty(total_size, dtype=torch.long)
+                    local_starts = torch.empty(0, dtype=torch.long)
+                    local_ends = torch.empty(0, dtype=torch.long)
 
-            for start_idx in range(0, total_size, chunk_size):
-                end_idx = min(start_idx + chunk_size, total_size)
-                chunk_len = end_idx - start_idx
+        # RETURN LOCAL DATA ONLY - No expensive broadcasting
+        final_embeddings = local_embeddings
+        final_labels = local_labels
+        if self.training is False:
+            final_starts = local_starts
+            final_ends = local_ends
 
-                # Broadcast embeddings chunk
-                if RANK == 0:
-                    chunk_gpu = final_embeddings[start_idx:end_idx].cuda()
-                else:
-                    chunk_gpu = torch.empty(
-                        chunk_len, expected_dim, dtype=torch.float32, device="cuda"
-                    )
-                dist.broadcast(chunk_gpu, 0)
-                if RANK != 0:
-                    final_embeddings[start_idx:end_idx] = chunk_gpu.cpu()
-                del chunk_gpu
+        # Clear memory
+        del all_embeddings, all_labels
+        if self.training is False:
+            del all_starts, all_ends
+        gc.collect()
 
-                # Broadcast labels chunk
-                if RANK == 0:
-                    labels_chunk_gpu = final_labels[start_idx:end_idx].cuda()
-                else:
-                    labels_chunk_gpu = torch.empty(
-                        chunk_len, dtype=torch.long, device="cuda"
-                    )
-                dist.broadcast(labels_chunk_gpu, 0)
-                if RANK != 0:
-                    final_labels[start_idx:end_idx] = labels_chunk_gpu.cpu()
-                del labels_chunk_gpu
-
-                if self.training is False:
-                    # Broadcast starts chunk
-                    if RANK == 0:
-                        starts_chunk_gpu = final_starts[start_idx:end_idx].cuda()
-                    else:
-                        starts_chunk_gpu = torch.empty(
-                            chunk_len, dtype=torch.long, device="cuda"
-                        )
-                    dist.broadcast(starts_chunk_gpu, 0)
-                    if RANK != 0:
-                        final_starts[start_idx:end_idx] = starts_chunk_gpu.cpu()
-                    del starts_chunk_gpu
-
-                    # Broadcast ends chunk
-                    if RANK == 0:
-                        ends_chunk_gpu = final_ends[start_idx:end_idx].cuda()
-                    else:
-                        ends_chunk_gpu = torch.empty(
-                            chunk_len, dtype=torch.long, device="cuda"
-                        )
-                    dist.broadcast(ends_chunk_gpu, 0)
-                    if RANK != 0:
-                        final_ends[start_idx:end_idx] = ends_chunk_gpu.cpu()
-                    del ends_chunk_gpu
-
-                torch.cuda.empty_cache()
+        if RANK == 0:
+            print(f"Rank {RANK}: Processed {final_embeddings.shape[0]} sequences locally")
 
         elif self.domain_boundary_detection is True:
             # # Counterpart for domain boundary detection, where we gather all embeddings and labels from all ranks via their .h5 files

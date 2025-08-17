@@ -30,15 +30,15 @@ GLOBAL_RUN = 0  # keep 0
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-MODEL_PATH = "./models/FINAL/t33_ALL_10d.pt"
-CACHE_PATH = "./temp/embeddings_classification_10d_EVAL.h5"
-TENSBORBOARD_LOG_DIR = "./models/10d_uncut_ALL"
+MODEL_PATH = "./models/FINAL/t33_ALL_10d_THIO.pt"
+CACHE_PATH = "./temp/embeddings_classification_10d_THIO_EVAL.h5"
+TENSBORBOARD_LOG_DIR = "./models/10d_uncut_ALL_THIO"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 
 NUM_CLASSES = 11
-BATCH_SIZE = 1000
+BATCH_SIZE = 10000
 EMB_BATCH = 1
 NUM_WORKERS = min(16, os.cpu_count())
 NUM_WORKERS_EMB = min(16, os.cpu_count())

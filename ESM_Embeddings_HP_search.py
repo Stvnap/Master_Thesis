@@ -36,20 +36,20 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
-NUM_CLASSES = 101  # classes + 1 for "other" class
+NUM_CLASSES = 11  # classes + 1 for "other" class
 
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d.h5"
-PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d_THIO.h5"
+PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d_THIO"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 EPOCHS = 50
 STUDY_N_TRIALS = 30
-BATCH_SIZE = 1028
+BATCH_SIZE = 512
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 VAL_FRAC = 0.2
@@ -116,6 +116,17 @@ class LitClassifier(pl.LightningModule):
         domain_task=False,
         num_heads=8,
         num_layers=None,
+        cosine_T_max=20,
+        cosine_eta_min=1e-6,
+        use_grad_clip=False,
+        grad_clip_value=1.0,
+        beta1=0.9,
+        beta2=0.999,
+        eps=1e-8,
+        momentum=0.9,
+        nesterov=True,  
+        rmsprop_alpha=0.99,
+        rmsprop_momentum=0.9,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -126,6 +137,18 @@ class LitClassifier(pl.LightningModule):
         self.domain_task = domain_task
         self.class_weights = class_weights
         self.num_classes = num_classes
+        self.cosine_T_max = cosine_T_max
+        self.cosine_eta_min = cosine_eta_min
+        self.use_grad_clip = use_grad_clip
+        self.grad_clip_value = grad_clip_value
+
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.momentum = momentum
+        self.nesterov = nesterov
+        self.rmsprop_alpha = rmsprop_alpha
+        self.rmsprop_momentum = rmsprop_momentum
 
         # base model
         if domain_task is False:
@@ -138,7 +161,7 @@ class LitClassifier(pl.LightningModule):
                 kernel_init=kernel_init,
             )
             if class_weights is not None:
-                self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+                self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
             else:
                 self.loss_fn = nn.CrossEntropyLoss()
 
@@ -385,21 +408,56 @@ class LitClassifier(pl.LightningModule):
         self.precision_metric.reset()
         self.recall_metric.reset()
 
+
+
     def configure_optimizers(self):
+        # Create optimizer with tuned parameters
         if self.optimizer_class == torch.optim.SGD:
-            return self.optimizer_class(
+            optimizer = self.optimizer_class(
                 self.parameters(),
                 lr=self.lr,
-                momentum=0.9,
+                momentum=self.momentum,
                 weight_decay=self.weight_decay,
-                nesterov=True,  # Nesterov momentum
+                nesterov=self.nesterov,
+            )
+        elif self.optimizer_class in [torch.optim.Adam, torch.optim.AdamW, torch.optim.NAdam]:
+            optimizer = self.optimizer_class(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                betas=(self.beta1, self.beta2),
+                eps=self.eps,
+            )
+        elif self.optimizer_class == torch.optim.RMSprop:
+            optimizer = self.optimizer_class(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                alpha=self.rmsprop_alpha,
+                momentum=self.rmsprop_momentum,
             )
         else:
-            return self.optimizer_class(
+            optimizer = self.optimizer_class(
                 self.parameters(),
                 lr=self.lr,
                 weight_decay=self.weight_decay,
             )
+        
+        # CosineAnnealingLR scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.cosine_T_max,
+            eta_min=self.cosine_eta_min
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            }
+        }
 
 
 # -------------------------
@@ -418,22 +476,47 @@ def objective(
 ):
     if domain_task is False:
         if RANK == 0:
-            n_neurons = trial.suggest_int("num_neurons", 64, 512, step=64)
+            n_neurons = trial.suggest_int("num_neurons", 128, 1024, step=64)
             hidden_dims = [
-                n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 4))
+                n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 2, step=1))
             ]
 
-            drop = trial.suggest_float("dropout", 0.1, 0.5)
-            lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)  
-            wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)  
+            drop = trial.suggest_float("dropout", 0.05, 0.5)
+            lr = trial.suggest_float("lr", 1e-6, 1e-1, log=True)  
+            wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)  
 
-            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "sgd"])
-            if optimizer == "adam":
-                optimizer_class = torch.optim.Adam
-            elif optimizer == "adamw":
-                optimizer_class = torch.optim.AdamW
-            else:
+            cosine_T_max = trial.suggest_int("cosine_T_max", 10, 30)
+            cosine_eta_min = trial.suggest_float("cosine_eta_min", 1e-7, 1e-5, log=True)
+
+            use_grad_clip = trial.suggest_categorical("use_grad_clip", [True, False])
+            grad_clip_value = trial.suggest_float("grad_clip_value", 0.5, 2.0)
+
+
+            optimizer = trial.suggest_categorical(
+                "optimizer", ["adam", "adamw", "sgd", "rmsprop", "nadam"]
+            )
+            
+            # Tune optimizer-specific parameters
+            if optimizer in ["adam", "adamw", "nadam"]:
+                beta1 = trial.suggest_float("beta1", 0.85, 0.95)
+                beta2 = trial.suggest_float("beta2", 0.99, 0.999)
+                eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
+                
+                if optimizer == "adam":
+                    optimizer_class = torch.optim.Adam
+                elif optimizer == "adamw":
+                    optimizer_class = torch.optim.AdamW
+                else:  # nadam
+                    optimizer_class = torch.optim.NAdam
+                    
+            elif optimizer == "sgd":
+                momentum = trial.suggest_float("momentum", 0.8, 0.95)
+                nesterov = trial.suggest_categorical("nesterov", [True, False])
                 optimizer_class = torch.optim.SGD
+            else:  # rmsprop
+                momentum = trial.suggest_float("rmsprop_momentum", 0.8, 0.95)
+                alpha = trial.suggest_float("rmsprop_alpha", 0.9, 0.99)
+                optimizer_class = torch.optim.RMSprop
 
             activation = trial.suggest_categorical(
                 "activation", ["relu", "gelu", "leaky_relu"]
@@ -444,15 +527,23 @@ def objective(
             elif activation == "gelu":
                 activation = nn.GELU()
                 kernel_init = nn.init.xavier_normal_
-            else:
+            elif activation == "leaky_relu":
                 activation = nn.LeakyReLU(inplace=True)
                 kernel_init = nn.init.kaiming_normal_
+            else:
+                activation = nn.SiLU(inplace=True)  # SiLU is Swish
+                kernel_init = nn.init.xavier_normal_
 
             print(
                 f"\n=== Trial {trial.number} ===\n"
                 f"Hidden layers: {len(hidden_dims)}, Neurons: {n_neurons}\n"
                 f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
                 f"Optimizer: {optimizer}, Activation: {activation.__class__.__name__}\n"
+                f"Cosine T_max: {cosine_T_max}, Cosine eta_min: {cosine_eta_min}\n"
+                f"Use grad clip: {use_grad_clip}, Grad clip value: {grad_clip_value}\n"
+                f"Beta1: {locals().get('beta1', 0.9)}, Beta2: {locals().get('beta2', 0.999)}\n"
+                f"Momentum: {locals().get('momentum', 0.9)}, Nesterov: {locals().get('nesterov', True)}\n"
+                f"RMSprop alpha: {locals().get('alpha', 0.99)}, RMSprop momentum: {locals().get('rmsprop_momentum', 0.9)}\n"
                 f"========================\n"
             )
 
@@ -466,6 +557,16 @@ def objective(
                 "kernel_init": kernel_init,
                 "drop": drop,
                 "weights": weights,
+                "cosine_T_max": cosine_T_max,
+                "cosine_eta_min": cosine_eta_min,
+                "use_grad_clip": use_grad_clip,
+                "grad_clip_value": grad_clip_value,
+                "beta1": locals().get("beta1", 0.9),
+                "beta2": locals().get("beta2", 0.999),
+                "eps": locals().get("eps", 1e-8),
+                "momentum": locals().get("momentum", 0.9),
+                "nesterov": locals().get("nesterov", True),
+                "rmsprop_alpha": locals().get("alpha", 0.99),
             }
 
         else:
@@ -489,6 +590,17 @@ def objective(
             weight_decay=params["weight_decay"],
             dropout=params["drop"],
             class_weights=params["weights"],
+            cosine_T_max=params["cosine_T_max"],
+            cosine_eta_min=params["cosine_eta_min"],
+            use_grad_clip=params["use_grad_clip"],
+            grad_clip_value=params["grad_clip_value"],
+            beta1=params["beta1"],
+            beta2=params["beta2"],
+            eps=params["eps"],
+            momentum=params["momentum"],
+            nesterov=params["nesterov"],
+            rmsprop_alpha=params["rmsprop_alpha"],
+            rmsprop_momentum=params.get("rmsprop_momentum", 0.9),  # Add this if missing
             domain_task=False,
         )
 
@@ -627,11 +739,21 @@ def objective(
     
     # Log final metrics as hp_metric
     best_val_loss = checkpoint_callback.best_model_score.item()
-    if RANK == 0:
-        # Log the final metric for hyperparameter comparison
-        trainer.logger.experiment.add_scalar('hp_metric', best_val_loss, 0)
     
-    return best_val_loss
+    val_precision = trainer.logged_metrics.get("val_prec_avg", 0.0)
+    if hasattr(val_precision, 'item'):
+        val_precision = val_precision.item()    
+         
+        
+    if RANK == 0:
+        print(f"Trial {trial.number}: val_loss={best_val_loss:.4f}, val_precision={val_precision:.4f}")
+        trainer.logger.experiment.add_scalar('hp_metric_loss', best_val_loss, 0)
+        trainer.logger.experiment.add_scalar('hp_metric_precision', val_precision, 0)
+    
+    if domain_task is False:
+        return best_val_loss, val_precision
+    else:
+        return best_val_loss
 
 
 def load_best_model(trial, input_dim, weights, domain_task=False):
@@ -642,12 +764,23 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
         n_layers = p["num_hidden_layers"]
         hidden_dims = [n_neurons] * n_layers
 
+        cosine_T_max = p.get("cosine_T_max", 20)        # Default fallback
+        cosine_eta_min = p.get("cosine_eta_min", 1e-6)  # Default fallback
+
+        # FIX: Don't use trial.suggest_* here, just get from params
+        use_grad_clip = p.get("use_grad_clip", False)      # Get from existing params
+        grad_clip_value = p.get("grad_clip_value", 1.0)    # Get from existing params
+
         opt_name = p["optimizer"]
         if opt_name == "adam":
             optimizer_class = torch.optim.Adam
         elif opt_name == "adamw":
             optimizer_class = torch.optim.AdamW
-        else:
+        elif opt_name == "nadam":  # Add this case
+            optimizer_class = torch.optim.NAdam
+        elif opt_name == "rmsprop":
+            optimizer_class = torch.optim.RMSprop
+        else:  # sgd
             optimizer_class = torch.optim.SGD
 
         act_name = p["activation"]
@@ -664,6 +797,15 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
         drop = p["dropout"]
         lr = p["lr"]
         wd = p["weight_decay"]
+        
+        # Extract optimizer-specific parameters from trial params
+        beta1 = p.get("beta1", 0.9)
+        beta2 = p.get("beta2", 0.999)
+        eps = p.get("eps", 1e-8)
+        momentum = p.get("momentum", 0.9)
+        nesterov = p.get("nesterov", True)
+        rmsprop_alpha = p.get("rmsprop_alpha", 0.99)
+        rmsprop_momentum = p.get("rmsprop_momentum", 0.9)
 
         model = LitClassifier(
             input_dim=input_dim,
@@ -676,27 +818,40 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             weight_decay=wd,
             dropout=drop,
             class_weights=weights,
+            cosine_T_max=cosine_T_max,
+            cosine_eta_min=cosine_eta_min,
+            use_grad_clip=use_grad_clip,
+            grad_clip_value=grad_clip_value,
+            # Add optimizer-specific parameters
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            momentum=momentum,
+            nesterov=nesterov,
+            rmsprop_alpha=rmsprop_alpha,
+            rmsprop_momentum=rmsprop_momentum,
+            domain_task=False,
         )
-
 
         print(
             f"\n=== FINAL TRAINING WITH {trial.number} ===\n"
             f"Hidden layers: {n_layers}, Neurons: {n_neurons}\n"
             f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
-            f"Optimizer: {optimizer_class}, Activation: {activation_fn.__class__.__name__}\n"
+            f"Optimizer: {optimizer_class.__name__}, Activation: {activation_fn.__class__.__name__}\n"
+            f"Cosine T_max: {cosine_T_max}, Cosine eta_min: {cosine_eta_min}\n"
+            f"Use grad clip: {use_grad_clip}, Grad clip value: {grad_clip_value}\n"
+            f"Beta1: {beta1}, Beta2: {beta2}, Eps: {eps}\n"
+            f"Momentum: {momentum}, Nesterov: {nesterov}\n"
+            f"RMSprop alpha: {rmsprop_alpha}, RMSprop momentum: {rmsprop_momentum}\n"
             f"========================\n"
         )
 
     else:
+        # Domain task logic remains the same...
         p = trial.params
-        # print(f"Available parameters: {list(p.keys())}")  # Debug line
-        # print(f"Full params: {p}")  # Debug line
         d_model = p["d_model"]
         n_heads = p["n_heads"]
-
         n_layers = p["n_layers"]
-
-        # d_ff = 4* d_model
 
         act_name = p["activation"]
         if act_name == "relu":
@@ -710,7 +865,6 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             kernel_init = nn.init.kaiming_normal_
 
         drop = p["dropout"]
-        # drop_attn = p["dropout_attn"]
         lr = p["lr"]
         wd = p["weight_decay"]
         opt_name = p["optimizer"]
@@ -724,7 +878,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
         model = LitClassifier(
             input_dim=input_dim.size(2),
             hidden_dims=d_model,
-            num_classes=2,  # Binary classification for domain boundary detection
+            num_classes=2,
             optimizer_class=optimizer_class,
             activation=activation_fn,
             kernel_init=kernel_init,
@@ -732,7 +886,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             weight_decay=wd,
             dropout=drop,
             class_weights=weights,
-            domain_task=True,  # Set to True if using domain boundary detection
+            domain_task=True,
             num_heads=n_heads,
             num_layers=n_layers,
         )
@@ -741,12 +895,11 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             f"\n=== FINAL TRAINING WITH {trial.number} ===\n"
             f"Hidden layers: {n_layers}, Hidden dim: {d_model}, n Heads: {n_heads}\n"
             f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
-            f"Optimizer: {optimizer_class}, Activation: {activation_fn.__class__.__name__}\n"
+            f"Optimizer: {optimizer_class.__name__}, Activation: {activation_fn.__class__.__name__}\n"
             f"========================\n"
         )
 
-
-
+    # Rest of the function remains the same...
     ckpt_dir = (
         f"./logs/FINAL/{PROJECT_NAME}/tensorboard/optuna_trial_{trial.number}/version_0/checkpoints/"
     )
@@ -757,22 +910,14 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
     if not matches:
         raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
 
-    # Choose the best checkpoint (most recent)
     chosen_ckpt = max(matches, key=os.path.getctime)
     print(f"Loading checkpoint: {chosen_ckpt}")
 
-    # Load from checkpoint (this automatically restores all parameters)
     model = LitClassifier.load_from_checkpoint(chosen_ckpt)
     model_path = f"./models/FINAL/{PROJECT_NAME}.pt"
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     torch.save(model, model_path)
     model = model.to(DEVICE).eval()
-
-
-
-
-
-
 
     return model
 
@@ -1014,7 +1159,7 @@ def main(Final_training=False):
     if RANK == 0:
         print("Starting Optuna hyperparameter search...")
         study = optuna.create_study(
-            direction="minimize",
+            directions=["minimize", "maximize"],
             storage=f"sqlite:///logs/FINAL/{PROJECT_NAME}/optuna_study.db",
             load_if_exists=True,
             study_name=PROJECT_NAME,
@@ -1053,11 +1198,37 @@ def main(Final_training=False):
     )
 
     if RANK == 0:
-        print("Best trial number:", study.best_trial.number)
-        print("Best trial:", study.best_trial)
-        print("Best trial params:", study.best_trial.params)
+        print("Optimization complete!")
+        print(f"Number of trials: {len(study.trials)}")
+        
+        # For multi-objective, there's no single "best" trial
+        # Get Pareto front (non-dominated solutions)
+        pareto_trials = []
+        for trial in study.trials:
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                is_dominated = False
+                for other_trial in study.trials:
+                    if (other_trial.state == optuna.trial.TrialState.COMPLETE and 
+                        other_trial != trial):
+                        # Check if other_trial dominates trial
+                        # (lower loss AND higher precision)
+                        if (other_trial.values[0] <= trial.values[0] and  # loss
+                            other_trial.values[1] >= trial.values[1] and  # precision
+                            (other_trial.values[0] < trial.values[0] or 
+                             other_trial.values[1] > trial.values[1])):
+                            is_dominated = True
+                            break
+                if not is_dominated:
+                    pareto_trials.append(trial)
+        
+        print(f"Pareto optimal trials: {len(pareto_trials)}")
+        for i, trial in enumerate(pareto_trials):
+            print(f"  Trial {trial.number}: loss={trial.values[0]:.4f}, precision={trial.values[1]:.4f}")
+        
+        # Choose the trial with best precision among Pareto optimal
+        best_trial = max(pareto_trials, key=lambda t: t.values[1])
+        print(f"Selected trial {best_trial.number} (highest precision): loss={best_trial.values[0]:.4f}, precision={best_trial.values[1]:.4f}")
 
-    best_trial = study.best_trial
 
     if best_trial is None:
         best_trial = study.trials[study.best_trial.number+1]
