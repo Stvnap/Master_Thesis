@@ -170,8 +170,12 @@ def opener():
 
 
 def predict(modelpath, loader, firstrun=False):
-    model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
-    model = model.to(DEVICE)
+
+    if isinstance(modelpath, str):
+        model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
+        model = model.to(DEVICE)
+    else:
+        model = modelpath.to(DEVICE)
     # if torch.cuda.device_count() > 1:
     #     print(f"Using {torch.cuda.device_count()} GPUs for prediction")
     #     model = nn.DataParallel(model)
@@ -200,7 +204,10 @@ def predict(modelpath, loader, firstrun=False):
         for batch in loader:
             predictions = []
             predictions_raw = []
-            inputs, labels, starts, ends = batch
+            try:
+                inputs, labels, starts, ends = batch
+            except:
+                input = batch
             # if len(predictions) == 0:
                 # print("\nTENSORS IN PREDICT():",inputs[0])
             inputs = inputs.to(DEVICE)
@@ -291,10 +298,6 @@ def predict(modelpath, loader, firstrun=False):
                 for i in range(1, NUM_CLASSES):
                     all_precisions_per_class[i].append(prec_per_class[i - 1])
                     all_recalls_per_class[i].append(rec_per_class[i - 1])
-
-
-
-
 
 
 

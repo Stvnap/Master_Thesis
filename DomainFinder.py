@@ -160,17 +160,92 @@ class Transformer(nn.Module):
 
         return logits
 
-
 # -------------------------
-# 3. TRAINER
-# -------------------------
-
-# -------------------------
-# 4. MAIN
+# 4. Loader Class
 # -------------------------
 
+class DomainBoundaryDataset(Dataset):
+    """Custom dataset for domain boundary detection with ESM embeddings that loads data from an H5 file."""
 
-def main(Final_training=False):
+    def __init__(self, h5_file):
+        self.h5_file = h5_file
+
+        # Determine the total length by inspecting the H5 file
+        with h5py.File(self.h5_file, "r") as f:
+            self.embedding_keys = sorted(
+                [k for k in f.keys() if k.startswith("batch_")]
+            )
+            self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+            self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+            self.length = (
+                self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+            )
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.length:
+            raise IndexError("Index out of range")
+
+        # Open file for each access and close immediately
+        with h5py.File(self.h5_file, "r") as f:
+            # Find which chunk the index belongs to
+            chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+            if chunk_idx > 0:
+                local_idx = idx - self.cumulative_sizes[chunk_idx - 1]
+            else:
+                local_idx = idx
+
+            embedding_key = self.embedding_keys[chunk_idx]
+            # Construct corresponding keys for other data
+            key_suffix = embedding_key.replace("batch_", "")
+            labels_key = f"labels_batch_{key_suffix}"
+            # starts_key = f"starts_batch_{key_suffix}"
+            # ends_key = f"ends_batch_{key_suffix}"
+
+            embeddings = torch.tensor(
+                f[embedding_key][local_idx], dtype=torch.float32
+            )
+            labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
+
+            return embeddings, labels
+
+
+
+class SqueezedDataset(Dataset):
+    def __init__(self, original_dataset, indices):
+        self.original_dataset = original_dataset
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        original_idx = self.indices[idx]
+        embedding, label = self.original_dataset[original_idx]
+        return embedding.squeeze(0), label.squeeze(0)
+
+class SqueezedDataset_Usage(Dataset):
+    def __init__(self, original_dataset, actual_seq_lengths):
+        self.original_dataset = original_dataset
+        self.actual_seq_lengths = actual_seq_lengths
+
+    def __len__(self):
+        return len(self.original_dataset)
+
+    def __getitem__(self, idx):
+        embedding, label = self.original_dataset[idx]  # Unpack the tuple first
+        actual_length = self.actual_seq_lengths[idx]
+        
+        # Return embedding, sequence index, and ACTUAL sequence length (not padded length)
+        return embedding.squeeze(0), idx, actual_length
+# -------------------------
+# 6. MAIN TRAINER
+# -------------------------
+
+
+def main_trainer(Final_training=False):
     # os.makedirs("pickle", exist_ok=True)
     os.makedirs(f"logs/{PROJECT_NAME}", exist_ok=True)
     os.makedirs("models", exist_ok=True)
@@ -189,52 +264,6 @@ def main(Final_training=False):
         )
         print("Using preembedded ESM data from scratch")
 
-    class DomainBoundaryDataset(Dataset):
-        """Custom dataset for domain boundary detection with ESM embeddings that loads data from an H5 file."""
-
-        def __init__(self, h5_file):
-            self.h5_file = h5_file
-
-            # Determine the total length by inspecting the H5 file
-            with h5py.File(self.h5_file, "r") as f:
-                self.embedding_keys = sorted(
-                    [k for k in f.keys() if k.startswith("batch_")]
-                )
-                self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
-                self.cumulative_sizes = np.cumsum(self.chunk_sizes)
-                self.length = (
-                    self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
-                )
-
-        def __len__(self):
-            return self.length
-
-        def __getitem__(self, idx):
-            if idx < 0 or idx >= self.length:
-                raise IndexError("Index out of range")
-
-            # Open file for each access and close immediately
-            with h5py.File(self.h5_file, "r") as f:
-                # Find which chunk the index belongs to
-                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
-                if chunk_idx > 0:
-                    local_idx = idx - self.cumulative_sizes[chunk_idx - 1]
-                else:
-                    local_idx = idx
-
-                embedding_key = self.embedding_keys[chunk_idx]
-                # Construct corresponding keys for other data
-                key_suffix = embedding_key.replace("batch_", "")
-                labels_key = f"labels_batch_{key_suffix}"
-                # starts_key = f"starts_batch_{key_suffix}"
-                # ends_key = f"ends_batch_{key_suffix}"
-
-                embeddings = torch.tensor(
-                    f[embedding_key][local_idx], dtype=torch.float32
-                )
-                labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
-
-                return embeddings, labels
 
     print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
@@ -267,18 +296,6 @@ def main(Final_training=False):
         )
         # Create new datasets with squeezed tensors
 
-        class SqueezedDataset(Dataset):
-            def __init__(self, original_dataset, indices):
-                self.original_dataset = original_dataset
-                self.indices = indices
-
-            def __len__(self):
-                return len(self.indices)
-
-            def __getitem__(self, idx):
-                original_idx = self.indices[idx]
-                embedding, label = self.original_dataset[original_idx]
-                return embedding.squeeze(0), label.squeeze(0)
 
         train_dataset = SqueezedDataset(domain_boundary_dataset, train_indices)
         val_dataset = SqueezedDataset(domain_boundary_dataset, val_indices)
@@ -496,11 +513,276 @@ def main(Final_training=False):
         torch.save(lit_model, final_model_path)
 
 
+
+def loader(ESM_Model, input_file):
+    import pandas as pd
+
+    os.makedirs("tempTest/embeddings", exist_ok=True)
+    if not os.path.exists("./tempTest/embeddings/embeddings_domain.h5"):
+        ESMDataset(
+            FSDP_used=False,
+            domain_boundary_detection=True,
+            num_classes=2,
+            esm_model=ESM_Model,
+            csv_path=input_file,
+            category_col=CATEGORY_COL,
+            sequence_col=SEQUENCE_COL,
+        )
+        print("Using preembedded ESM data from scratch")
+
+    # Load the original CSV to get actual sequence lengths
+    df = pd.read_csv(input_file)
+    actual_seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
+    
+    print("Creating DomainBoundaryDataset from embeddings in H5 file...")
+    # Create the dataset and dataloader
+    domain_boundary_dataset = DomainBoundaryDataset("./tempTest/embeddings/embeddings_domain.h5")
+
+    sample_embedding, sample_label = domain_boundary_dataset[0]
+    print("shapes:", sample_embedding.dim(), sample_label.dim())
+
+    if sample_embedding.dim() == 3 and sample_label.dim() == 2:
+        print(
+            "Squeezing dimensions of embeddings and labels in train and val datasets."
+        )
+        # Create new datasets with squeezed tensors
+        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
+
+        if RANK == 0:
+            print(
+                "Squeezed embeddings and labels to correct dimensions for train and val datasets."
+            )
+
+    # Create DataLoader for the dataset
+    domain_boudnary_set_loader = DataLoader(
+        domain_boundary_dataset_squeezed,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    if RANK == 0:
+        print(f"Dataset: {len(domain_boudnary_set_loader)} samples")
+        print("Datasets and DataLoaders for domain boundary detection created.")
+        print("\nLoading Model...\n")
+
+    model = torch.load("./models/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
+    model = model.to(DEVICE)
+    model.eval()
+
+    if RANK == 0:
+        print("Model loaded and set to eval mode")    
+
+    return model, domain_boudnary_set_loader
+
+def Predictor(model, domain_boudnary_set_loader):
+    """
+    Function to call the Predictor script.
+    This function will be used to predict domain boundaries in sequences.
+    """
+
+    all_sequence_preds = []
+    sequence_metadata = []
+
+    # print("STARTING PREDICTION...")
+    with torch.no_grad():
+        for batch_data in domain_boudnary_set_loader:
+            # Unpack the batch data
+            if len(batch_data) == 3:  # embedding, seq_idx, actual_seq_len
+                batch_embeddings, batch_seq_indices, batch_actual_lengths = batch_data
+            else:  # fallback for old format
+                batch_embeddings = batch_data
+                batch_seq_indices = list(range(len(batch_embeddings)))
+                batch_actual_lengths = [emb.shape[0] for emb in batch_embeddings]
+            
+            batch_embeddings = batch_embeddings.to(DEVICE)
+            batch_logits = model(batch_embeddings)
+            batch_preds = batch_logits.argmax(dim=-1)
+
+            # Process each sequence in the batch separately
+            for i in range(batch_preds.size(0)):
+                seq_preds_full = batch_preds[i].cpu().numpy()
+                seq_idx = batch_seq_indices[i] if hasattr(batch_seq_indices, '__iter__') else batch_seq_indices
+                actual_len = batch_actual_lengths[i] if hasattr(batch_actual_lengths, '__iter__') else batch_actual_lengths
+                
+                # IMPORTANT: Truncate predictions to actual sequence length (remove padding)
+                seq_preds = seq_preds_full[:actual_len]
+                
+                # Store predictions and metadata for this sequence
+                all_sequence_preds.append(seq_preds)
+                sequence_metadata.append({
+                    'original_seq_idx': seq_idx,
+                    'actual_seq_length': actual_len,
+                    'padded_length': len(seq_preds_full),
+                    'batch_idx': i
+                })
+    
+    if RANK == 0:
+        print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
+        # Print some debug info
+        for i in range(min(3, len(all_sequence_preds))):
+            metadata = sequence_metadata[i]
+            print(f"Sequence {i}: actual_length={len(all_sequence_preds[i])}, "
+                  f"padded_length={metadata['padded_length']}, "
+                  f"actual_seq_length={metadata['actual_seq_length']}")
+
+    return all_sequence_preds, sequence_metadata
+
+def regions_search(all_preds, sequence_metadata=None):
+    """
+    Function to search for domain regions in the predictions.
+    This function will return the start and end positions of each domain region.
+    """
+    all_regions = []
+    
+    for seq_idx, seq_preds in enumerate(all_preds):
+        regions = []
+        start = None
+        structured_counter = 0
+        
+        # Get actual sequence length from metadata
+        seq_len = len(seq_preds)  # This should now be the actual length (no padding)
+        if sequence_metadata and seq_idx < len(sequence_metadata):
+            original_seq_idx = sequence_metadata[seq_idx]['original_seq_idx']
+            actual_seq_length = sequence_metadata[seq_idx]['actual_seq_length']
+            if RANK == 0 and seq_idx < 3:  # Debug first few sequences
+                print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
+                      f"actual length: {actual_seq_length}, predictions length: {seq_len}")
+        
+        for i, pred in enumerate(seq_preds):
+            # Update counter based on prediction - EXTREMELY HARSH
+            if pred == 1:
+                structured_counter = min(structured_counter + 1, 50)  # Higher max counter
+            else:
+                structured_counter = max(structured_counter - 10, 0)  # EXTREMELY fast decay (was -5, now -10)
+        
+            # Check if we're in a structured region - EXTREMELY HIGH THRESHOLD
+            if structured_counter > 35:  # Increased from 20 to 35 (requires 35+ consecutive predictions)
+                if start is None:  # Start of new region
+                    start = i
+                    if RANK == 0 and seq_idx < 3:
+                        print(f"  Structured region started at index {i}")
+                
+            else:  # structured_counter <= 35
+                if start is not None:  # End of a region
+                    end = i
+                    if RANK == 0 and seq_idx < 3:
+                        print(f"  Structured region ended at index {i}")
+                    
+                    # Only add regions that are long enough - EXTREMELY LONG MINIMUM
+                    if end - start >= 100:  # Increased minimum domain length from 50 to 100 residues
+                        regions.append((start, end))
+                    elif RANK == 0 and seq_idx < 3:
+                        print(f"    Rejected short region: length {end - start}")
+                    
+                    start = None
+        
+        # Handle case where sequence ends while in a structured region
+        if start is not None:
+            if seq_len - start >= 100:  # Increased minimum length check to 100
+                regions.append((start, seq_len))
+                if RANK == 0 and seq_idx < 3:
+                    print(f"  Region ended at sequence end: {seq_len}")
+            elif RANK == 0 and seq_idx < 3:
+                print(f"  Rejected short final region: length {seq_len - start}")
+        
+        all_regions.append(regions)
+    
+    if RANK == 0:
+        print(f"Found {len(all_regions)} sequences with domain regions.")
+        for seq_idx in range(min(3, len(all_regions))):  # Only print first 3 for debugging
+            regions = all_regions[seq_idx]
+            metadata = sequence_metadata[seq_idx] if sequence_metadata else {}
+            actual_length = metadata.get('actual_seq_length', 'unknown')
+            print(f"Sequence {seq_idx} (actual length: {actual_length}) has {len(regions)} regions: {regions}")
+
+    return all_regions
+
+# -------------------------
+# 6. MAIN USAGE
+# -------------------------
+
+
+def main(input_file):
+    """
+    Main function to run the DomainFinder script.
+    This function will be used to transform the input data into a format suitable for the model.
+    """
+
+    # Call the loader function to prepare the dataset and model
+    model, domain_boudnary_set_loader = loader(ESM_MODEL, input_file)
+
+    # Call the Predictor function to predict domain boundaries
+    all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)
+
+    
+    
+
+    
+    
+    if RANK == 0:
+        print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
+
+
+    
+
+
+    # Search for domain regions with metadata
+    all_regions = regions_search(all_preds, sequence_metadata)
+
+    if RANK == 0:
+        print("First sequence regions:", all_regions[0] if all_regions else "No regions")
+
+    # Save all_regions to file
+    output_file = "./tempTest/predicted_domain_regions.pkl"
+    with open(output_file, 'wb') as f:
+        pickle.dump(all_regions, f)
+    
+    return all_regions
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #############################################################################################################
+from main import input_file
+import pickle
 
 if __name__ == "__main__":
-    main(Final_training=False)
+
+    main(input_file)
+    dist.barrier()  # Ensure all processes reach this point before exiting
+    dist.destroy_process_group()  # Clean up the process group
+    quit()
+
+
+    main_trainer(Final_training=False)
     if RANK == 0:
         print("\nFinished running DomainFinder\n")
     dist.barrier()  # Ensure all processes reach this point before exiting
     dist.destroy_process_group()  # Clean up the process group
+
+else:
+    main(input_file)

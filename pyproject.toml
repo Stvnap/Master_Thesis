@@ -23,6 +23,7 @@ dependencies = [
     "pympler>=1.1",
     "scikit-learn>=1.7.0",
     "seaborn>=0.13.2",
+    "tbparse>=0.0.9",
     "tensorboard>=2.19.0",
     "tensorboardx>=2.6.4",
     "torch==2.6.0",

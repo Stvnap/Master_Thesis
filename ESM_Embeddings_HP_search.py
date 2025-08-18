@@ -36,7 +36,7 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
-NUM_CLASSES = 11  # classes + 1 for "other" class
+NUM_CLASSES = 1001  # classes + 1 for "other" class
 
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
@@ -48,8 +48,8 @@ PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d_THIO"
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 EPOCHS = 50
-STUDY_N_TRIALS = 30
-BATCH_SIZE = 512
+STUDY_N_TRIALS = 0
+BATCH_SIZE = 256
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 VAL_FRAC = 0.2
@@ -476,7 +476,7 @@ def objective(
 ):
     if domain_task is False:
         if RANK == 0:
-            n_neurons = trial.suggest_int("num_neurons", 128, 1024, step=64)
+            n_neurons = trial.suggest_int("num_neurons", 128, 1536, step=64)
             hidden_dims = [
                 n_neurons for _ in range(trial.suggest_int("num_hidden_layers", 1, 2, step=1))
             ]
@@ -1026,7 +1026,7 @@ def class_distribution(train_dataset, val_dataset, range_train=None, range_val=N
 # -------------------------
 
 
-def main(Final_training=False):
+def main_HP(Final_training=False):
     os.makedirs("pickle", exist_ok=True)
     os.makedirs(f"logs/FINAL/{PROJECT_NAME}", exist_ok=True)
     os.makedirs("models", exist_ok=True)
@@ -1226,14 +1226,58 @@ def main(Final_training=False):
             print(f"  Trial {trial.number}: loss={trial.values[0]:.4f}, precision={trial.values[1]:.4f}")
         
         # Choose the trial with best precision among Pareto optimal
-        best_trial = max(pareto_trials, key=lambda t: t.values[1])
-        print(f"Selected trial {best_trial.number} (highest precision): loss={best_trial.values[0]:.4f}, precision={best_trial.values[1]:.4f}")
+        if pareto_trials:
+            best_trial = max(pareto_trials, key=lambda t: t.values[1])
+            print(f"Selected trial {best_trial.number} (highest precision): loss={best_trial.values[0]:.4f}, precision={best_trial.values[1]:.4f}")
+        else:
+            # Fallback if no Pareto trials found
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            if completed_trials:
+                best_trial = max(completed_trials, key=lambda t: t.values[1] if len(t.values) > 1 else 0)
+                print(f"Fallback: Selected trial {best_trial.number}")
+            else:
+                print("No completed trials found!")
+                best_trial = None
 
+    else:
+        # For non-rank 0 processes, initialize best_trial as None
+        best_trial = None
 
+    # Broadcast the best_trial to all ranks
+    if dist.is_initialized():
+        # Create a list to broadcast the best trial information
+        best_trial_data = [None]
+        
+        if RANK == 0 and best_trial is not None:
+            # Send the trial number which can be used to reconstruct the trial
+            best_trial_data[0] = best_trial.number
+        
+        dist.broadcast_object_list(best_trial_data, src=0)
+        
+        # Reconstruct the best_trial on non-rank 0 processes
+        if RANK != 0 and best_trial_data[0] is not None:
+            trial_number = best_trial_data[0]
+            # Find the trial with the matching number
+            for trial in study.trials:
+                if trial.number == trial_number:
+                    best_trial = trial
+                    break
+        elif best_trial_data[0] is None:
+            best_trial = None
+
+    # Final fallback if best_trial is still None
     if best_trial is None:
-        best_trial = study.trials[study.best_trial.number+1]
-    if best_trial is None:
-        best_trial = study.trials[study.best_trial.number-2]
+        if len(study.trials) > 0:
+            # Use the last completed trial as fallback
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            if completed_trials:
+                best_trial = completed_trials[-1]
+                if RANK == 0:
+                    print(f"Using fallback trial {best_trial.number}")
+            else:
+                raise RuntimeError("No completed trials found in the study!")
+        else:
+            raise RuntimeError("No trials found in the study!")
 
 
 
@@ -1285,7 +1329,157 @@ def main(Final_training=False):
         dist.destroy_process_group()
 
 
+
+# -------------------------
+# 8. Helper Func for Main for usage
+# -------------------------
+
+class ClassifierDataset(torch.utils.data.Dataset):
+    def __init__(self, h5_file):
+        self.h5_file = h5_file
+
+        with h5py.File(self.h5_file, "r") as f:
+            # Get embedding keys (could be train_embeddings_ or just embeddings_)
+            self.embedding_keys = sorted([
+                k for k in f.keys() 
+                if k.startswith("embeddings_") or k.startswith("train_embeddings_")
+            ])
+            self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+            self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+            self.length = (
+                self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+            )
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        with h5py.File(self.h5_file, "r") as f:
+            chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+            local_idx = (
+                idx - self.cumulative_sizes[chunk_idx - 1] if chunk_idx > 0 else idx
+            )
+
+            embedding_key = self.embedding_keys[chunk_idx]
+            embeddings = torch.tensor(
+                f[embedding_key][local_idx], dtype=torch.float32
+            )
+
+            return embeddings  # Only return embeddings, no labels
+
+
+def loader(csv_path):
+    if not os.path.exists("tempTest/embeddings/embeddings_domain_classifier.h5"):
+        ESMDataset(
+            esm_model=ESM_MODEL,
+            FSDP_used=False,
+            domain_boundary_detection=False,
+            training=True,
+            num_classes=1001,
+            csv_path=csv_path,
+            category_col=CATEGORY_COL,
+            sequence_col=SEQUENCE_COL,
+        )
+
+
+
+
+    # Create inference dataset
+    classifier_dataset = ClassifierDataset("./tempTest/embeddings/embeddings_domain_classifier.h5")
+
+
+    # Create DataLoader for inference
+    classifier_loader = DataLoader(
+        classifier_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        persistent_workers=True,
+        num_workers=NUM_WORKERS_EMB,
+        pin_memory=True,
+        prefetch_factor=4,
+    )
+
+
+    # Load the best model
+    model = torch.load("./models/Optuna_1000d_uncut_t33.pt",weights_only=False)
+    model.to(DEVICE).eval()
+    print("Model loaded and set to eval mode")
+
+
+    return model, classifier_loader
+
+
+
+def predicter(model, classifier_loader):
+    all_predictions = []
+    all_predictions_raw = []
+
+    with torch.no_grad():
+        for batch in classifier_loader:
+            # ClassifierDataset only returns embeddings, not labels/starts/ends
+            inputs = batch
+            inputs = inputs.to(DEVICE)
+            output = model(inputs)
+
+            # Get predictions and raw scores
+            preds_raw, preds = torch.max(output, dim=1)
+
+            all_predictions.extend(preds.cpu().numpy())
+            all_predictions_raw.extend(preds_raw.cpu().numpy())
+
+    return all_predictions, all_predictions_raw
+# -------------------------
+# 9. Main for Usage
+# -------------------------
+
+def main(csv_path):
+    model, classifier_loader = loader(csv_path)
+
+    all_predictions, all_predictions_raw = predicter(model, classifier_loader)
+
+    return all_predictions, all_predictions_raw
+
+
+
+
+
+
+
+
+
+
 #############################################################################################################
 
+def parse_args():
+    """Parse command line arguments"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="ESM Embeddings HP Search")
+    parser.add_argument("--csv_path", type=str, required=True, help="Path to input CSV file")
+    
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    main(Final_training=True)
+
+    args = parse_args()
+    csv_path = args.csv_path
+    
+    all_predictions, all_predictions_raw = main(csv_path)
+    
+    # Save predictions to a file that main.py can read
+    import pandas as pd
+    
+    predictions_df = pd.DataFrame({
+        'prediction': all_predictions,
+        'raw_scores': all_predictions_raw
+    })
+    
+    os.makedirs('./tempTest', exist_ok=True)
+    predictions_df.to_csv('./tempTest/predictions.csv', index=False)
+    
+    if RANK == 0:
+        print(f"Predictions saved to ./tempTest/predictions.csv")
+        print(f"Total predictions: {len(all_predictions)}")
+
+
+    # main_HP(Final_training=True)
