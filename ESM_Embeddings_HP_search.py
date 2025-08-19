@@ -1404,7 +1404,7 @@ def loader(csv_path):
     model = torch.load("./models/Optuna_1000d_uncut_t33.pt",weights_only=False)
     model.to(DEVICE).eval()
     print("Model loaded and set to eval mode")
-
+    print(len(classifier_loader), "batches in classifier_loader")
 
     return model, classifier_loader
 

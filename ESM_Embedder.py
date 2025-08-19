@@ -385,11 +385,11 @@ class ESMDataset:
                     start_time = time.time()
 
                     if self.training is False:
-                        self.embeddings, self.labels, self.starts, self.ends = (
+                        self.embeddings, self.labels, self.starts, self.ends, self.idx_multiplied = (
                             self._embed(sequences)
                         )
                     else:
-                        self.embeddings, self.labels = self._embed(sequences)
+                        self.embeddings, self.labels, self.idx_multiplied = self._embed(sequences)
 
                     self.embeddings = self.embeddings.cpu()
                     self.labels = self.labels.cpu()
@@ -483,7 +483,6 @@ class ESMDataset:
 
 
 
-
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
                                 with h5py.File(
@@ -493,6 +492,10 @@ class ESMDataset:
                                     f.create_dataset(
                                         f"embeddings_{chunk_num}_rank{RANK}",
                                         data=self.embeddings.cpu().numpy(),
+                                    )
+                                    f.create_dataset(
+                                        f"idx_multiplied_{chunk_num}_rank{RANK}",
+                                        data=self.idx_multiplied,
                                     )
 
                             dist.barrier()  # Ensure only one rank writes at a time
@@ -604,11 +607,11 @@ class ESMDataset:
                 start_time = time.time()
 
                 if self.training is False:
-                    self.embeddings, self.labels, self.starts, self.ends = self._embed(
+                    self.embeddings, self.labels, self.starts, self.ends, self.idx_multiplied = self._embed(
                         sequences
                     )
                 else:
-                    self.embeddings, self.labels = self._embed(sequences)
+                    self.embeddings, self.labels, idx_multiplied = self._embed(sequences)
 
                 print("Done Embedding! Closing Embedder")
                 return  # Return early if domain boundary detection is enabled
@@ -677,8 +680,10 @@ class ESMDataset:
             new_seqs = []
             new_labels = []
             count = 0
+            idx_multiplied = []  # Track which original indices were windowed
+            
             if self.training is True:
-                for seq, label in zip(seq_dataset.seqs, seq_dataset.labels):
+                for idx, (seq, label) in enumerate(zip(seq_dataset.seqs, seq_dataset.labels)):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -690,9 +695,12 @@ class ESMDataset:
                             slices.append(seq[-dimension:])
                         new_seqs.extend(slices)
                         new_labels.extend([label] * len(slices))
+                        # Track that this original index was windowed
+                        idx_multiplied.extend([idx] * len(slices))
                     else:
                         new_seqs.append(seq)
                         new_labels.append(label)
+                        idx_multiplied.append(idx)
                 self.end_window = [len(seq) for seq in new_seqs]
                 print(
                     f"Rank {RANK}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
@@ -701,13 +709,12 @@ class ESMDataset:
             elif self.training is False and self.domain_boundary_detection is False:
                 new_starts = []
                 new_ends = []
-                for seq, label, start, end in zip(
+                for idx, (seq, label, start, end) in enumerate(zip(
                     seq_dataset.seqs,
                     seq_dataset.labels,
                     seq_dataset.starts,
                     seq_dataset.ends,
-                ):
-
+                )):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -721,23 +728,22 @@ class ESMDataset:
                         new_labels.extend([label] * len(slices))
                         new_starts.extend([start] * len(slices))
                         new_ends.extend([end] * len(slices))
-
+                        # Track that this original index was windowed
+                        idx_multiplied.extend([idx] * len(slices))
                     else:
                         new_seqs.append(seq)
                         new_labels.append(label)
                         new_starts.append(start)
                         new_ends.append(end)
+                        idx_multiplied.append(idx)
                 self.end_window = [len(seq) for seq in new_seqs]
                 print(
                     f"Rank {RANK}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
                 )
 
-
-
             elif self.domain_boundary_detection is True:
                 new_starts = []
                 new_ends = []
-                # print(seq_dataset.labels.shape)
 
                 # For domain boundary detection with training=False but usage_mode=True,
                 # we need dummy starts and ends since they weren't loaded from CSV
@@ -751,14 +757,12 @@ class ESMDataset:
                     starts = seq_dataset.starts
                     ends = seq_dataset.ends
 
-
-                for seq, label, start, end in zip(
+                for idx, (seq, label, start, end) in enumerate(zip(
                     seq_dataset.seqs,
                     seq_dataset.labels,
                     starts,
                     ends,
-                ):
-                    # print("LABEL:", label.shape, "SEQ:", seq, "START:", start, "END:", end)
+                )):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -796,6 +800,8 @@ class ESMDataset:
 
                         new_starts.extend([start] * len(slices))
                         new_ends.extend([end] * len(slices))
+                        # Track that this original index was windowed
+                        idx_multiplied.extend([idx] * len(slices))
                     else:
                         new_seqs.append(seq)
                         # Ensure label is padded/truncated to dimension=1000 for consistency
@@ -811,6 +817,7 @@ class ESMDataset:
                         new_labels.append(padded_label)
                         new_starts.append(start)
                         new_ends.append(end)
+                        idx_multiplied.append(idx)
 
                 self.end_window = [len(seq) for seq in new_seqs]
                 print(
@@ -839,9 +846,9 @@ class ESMDataset:
                         )
 
             if self.training is True:
-                return new_seqs, new_labels
+                return new_seqs, new_labels, idx_multiplied
             else:
-                return new_seqs, new_labels, new_starts, new_ends
+                return new_seqs, new_labels, new_starts, new_ends, idx_multiplied
 
         # Determine the correct embedding dimension from the model
         model_dims = {
@@ -892,9 +899,9 @@ class ESMDataset:
 
 
         if self.training is True:
-            new_seqs, new_labels = windower(stepsize=500, dimension=1000)
+            new_seqs, new_labels,idx_multiplied = windower(stepsize=500, dimension=1000)
         else:
-            new_seqs, new_labels, new_starts, new_ends = windower(
+            new_seqs, new_labels, new_starts, new_ends,idx_multiplied = windower(
                 stepsize=500, dimension=1000
             )
 
@@ -927,6 +934,27 @@ class ESMDataset:
             shuffle=False,
             drop_last=False,
         )
+
+
+        if self.usage_mode is True:
+            # For usage mode or domain boundary detection, we need to ensure all sequences are processed
+            # without padding, so we create a custom sampler that does not pad sequences
+            class CustomDistributedSampler(DistributedSampler):
+                def __init__(self, dataset, num_replicas=None, rank=None, shuffle=False):
+                    super().__init__(dataset, num_replicas, rank, shuffle, drop_last=False)
+                    # Recalculate num_samples to avoid padding
+                    self.total_size = len(self.dataset)
+                    self.num_samples = self.total_size // self.num_replicas
+                    if self.rank < self.total_size % self.num_replicas:
+                        self.num_samples += 1
+            sampler = CustomDistributedSampler(
+                seq_dataset,
+                num_replicas=dist.get_world_size(),
+                rank=RANK,
+                shuffle=False,
+            )
+            print("SAMPLER CUSTOM USED")
+
 
         dataloader = DataLoader(
             seq_dataset,
@@ -1270,190 +1298,196 @@ class ESMDataset:
         # NOT NEEDED FOR DOMAIN BOUDNARY TASK
 
         if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
-            # Gather embeddings and labels from all processes
-            local_size = torch.tensor(
-                [local_embeddings.size(0)], dtype=torch.int64, device="cuda"
-            )
-            all_sizes = [
-                torch.zeros_like(local_size) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(all_sizes, local_size)
+            print(len(local_embeddings), "local embeddings size")
+            final_embeddings = local_embeddings
+            final_labels = local_labels
+        #     # Gather embeddings and labels from all processes
+        #     local_size = torch.tensor(
+        #         [local_embeddings.size(0)], dtype=torch.int64, device="cuda"
+        #     )
+        #     all_sizes = [
+        #         torch.zeros_like(local_size) for _ in range(dist.get_world_size())
+        #     ]
+        #     dist.all_gather(all_sizes, local_size)
 
-            total_size = sum(size.item() for size in all_sizes)
+        #     total_size = sum(size.item() for size in all_sizes)
 
-            if RANK == 0:
-                # Initialize final_embeddings with the correct dimensions
-                final_embeddings = torch.empty(
-                    total_size, expected_dim, dtype=torch.float32
-                )
+        #     if RANK == 0:
+        #         # Initialize final_embeddings with the correct dimensions
+        #         final_embeddings = torch.empty(
+        #             total_size, expected_dim, dtype=torch.float32
+        #         )
 
-                # Initialize final_labels with the correct dimensions
-                final_labels = torch.empty(total_size, dtype=torch.long)
+        #         # Initialize final_labels with the correct dimensions
+        #         final_labels = torch.empty(total_size, dtype=torch.long)
 
-                if self.training is False:
-                    final_starts = torch.empty(total_size, dtype=torch.long)
-                    final_ends = torch.empty(total_size, dtype=torch.long)
+        #         if self.training is False:
+        #             final_starts = torch.empty(total_size, dtype=torch.long)
+        #             final_ends = torch.empty(total_size, dtype=torch.long)
 
-                current_idx = 0
-                for rank in range(dist.get_world_size()):
-                    rank_size = all_sizes[rank].item()
-                    if rank_size > 0:
-                        if rank == 0:
-                            final_embeddings[current_idx : current_idx + rank_size] = (
-                                local_embeddings
-                            )
-                            final_labels[current_idx : current_idx + rank_size] = (
-                                local_labels
-                            )
-                            if self.training is False:
-                                final_starts[current_idx : current_idx + rank_size] = (
-                                    local_starts
-                                )
-                                final_ends[current_idx : current_idx + rank_size] = (
-                                    local_ends
-                                )
-                        else:
-                            rank_embeddings = torch.empty(
-                                rank_size,
-                                expected_dim,
-                                dtype=torch.float32,
-                                device="cuda",
-                            )
-                            dist.recv(rank_embeddings, src=rank)
-                            final_embeddings[current_idx : current_idx + rank_size] = (
-                                rank_embeddings.cpu()
-                            )
+        #         current_idx = 0
+        #         for rank in range(dist.get_world_size()):
+        #             rank_size = all_sizes[rank].item()
+        #             if rank_size > 0:
+        #                 if rank == 0:
+        #                     final_embeddings[current_idx : current_idx + rank_size] = (
+        #                         local_embeddings
+        #                     )
+        #                     final_labels[current_idx : current_idx + rank_size] = (
+        #                         local_labels
+        #                     )
+        #                     if self.training is False:
+        #                         final_starts[current_idx : current_idx + rank_size] = (
+        #                             local_starts
+        #                         )
+        #                         final_ends[current_idx : current_idx + rank_size] = (
+        #                             local_ends
+        #                         )
+        #                 else:
+        #                     rank_embeddings = torch.empty(
+        #                         rank_size,
+        #                         expected_dim,
+        #                         dtype=torch.float32,
+        #                         device="cuda",
+        #                     )
+        #                     dist.recv(rank_embeddings, src=rank)
+        #                     final_embeddings[current_idx : current_idx + rank_size] = (
+        #                         rank_embeddings.cpu()
+        #                     )
 
-                            rank_labels = torch.empty(
-                                rank_size, dtype=torch.long, device="cuda"
-                            )
-                            dist.recv(rank_labels, src=rank)
-                            final_labels[current_idx : current_idx + rank_size] = (
-                                rank_labels.cpu()
-                            )
+        #                     rank_labels = torch.empty(
+        #                         rank_size, dtype=torch.long, device="cuda"
+        #                     )
+        #                     dist.recv(rank_labels, src=rank)
+        #                     final_labels[current_idx : current_idx + rank_size] = (
+        #                         rank_labels.cpu()
+        #                     )
 
-                            if self.training is False:
-                                rank_starts = torch.empty(
-                                    rank_size, dtype=torch.long, device="cuda"
-                                )
-                                dist.recv(rank_starts, src=rank)
-                                final_starts[current_idx : current_idx + rank_size] = (
-                                    rank_starts.cpu()
-                                )
+        #                     if self.training is False:
+        #                         rank_starts = torch.empty(
+        #                             rank_size, dtype=torch.long, device="cuda"
+        #                         )
+        #                         dist.recv(rank_starts, src=rank)
+        #                         final_starts[current_idx : current_idx + rank_size] = (
+        #                             rank_starts.cpu()
+        #                         )
 
-                                rank_ends = torch.empty(
-                                    rank_size, dtype=torch.long, device="cuda"
-                                )
-                                dist.recv(rank_ends, src=rank)
-                                final_ends[current_idx : current_idx + rank_size] = (
-                                    rank_ends.cpu()
-                                )
+        #                         rank_ends = torch.empty(
+        #                             rank_size, dtype=torch.long, device="cuda"
+        #                         )
+        #                         dist.recv(rank_ends, src=rank)
+        #                         final_ends[current_idx : current_idx + rank_size] = (
+        #                             rank_ends.cpu()
+        #                         )
 
-                            del rank_embeddings, rank_labels
-                            if self.training is False:
-                                del rank_starts, rank_ends
-                            torch.cuda.empty_cache()
-                        current_idx += rank_size
-            else:
-                if local_embeddings.size(0) > 0:
-                    local_embeddings_gpu = local_embeddings.cuda()
-                    dist.send(local_embeddings_gpu, dst=0)
-                    del local_embeddings_gpu
+        #                     del rank_embeddings, rank_labels
+        #                     if self.training is False:
+        #                         del rank_starts, rank_ends
+        #                     torch.cuda.empty_cache()
+        #                 current_idx += rank_size
+        #     else:
+        #         if local_embeddings.size(0) > 0:
+        #             local_embeddings_gpu = local_embeddings.cuda()
+        #             dist.send(local_embeddings_gpu, dst=0)
+        #             del local_embeddings_gpu
 
-                    local_labels_gpu = local_labels.cuda()
-                    dist.send(local_labels_gpu, dst=0)
-                    del local_labels_gpu
+        #             local_labels_gpu = local_labels.cuda()
+        #             dist.send(local_labels_gpu, dst=0)
+        #             del local_labels_gpu
 
-                    if self.training is False:
-                        local_starts_gpu = local_starts.cuda()
-                        dist.send(local_starts_gpu, dst=0)
-                        del local_starts_gpu
+        #             if self.training is False:
+        #                 local_starts_gpu = local_starts.cuda()
+        #                 dist.send(local_starts_gpu, dst=0)
+        #                 del local_starts_gpu
 
-                        local_ends_gpu = local_ends.cuda()
-                        dist.send(local_ends_gpu, dst=0)
-                        del local_ends_gpu
+        #                 local_ends_gpu = local_ends.cuda()
+        #                 dist.send(local_ends_gpu, dst=0)
+        #                 del local_ends_gpu
 
-                    torch.cuda.empty_cache()
+        #             torch.cuda.empty_cache()
 
-            # Broadcast final data from rank 0 to all ranks
-            if RANK == 0:
-                size_tensor = torch.tensor([final_embeddings.size(0)], device="cuda")
-            else:
-                size_tensor = torch.tensor([0], device="cuda")
+        #     # Broadcast final data from rank 0 to all ranks
+        #     if RANK == 0:
+        #         size_tensor = torch.tensor([final_embeddings.size(0)], device="cuda")
+        #     else:
+        #         size_tensor = torch.tensor([0], device="cuda")
 
-            dist.broadcast(size_tensor, 0)
+        #     dist.broadcast(size_tensor, 0)
 
-            total_size = size_tensor.item()
-            chunk_size = 10000
-            if self.domain_boundary_detection is True:
-                chunk_size = 1000  # Smaller chunk size for domain boundary detection
+        #     total_size = size_tensor.item()
+        #     chunk_size = 10000
+        #     if self.domain_boundary_detection is True:
+        #         chunk_size = 1000  # Smaller chunk size for domain boundary detection
 
-            if RANK != 0:
-                final_labels = torch.empty(total_size, dtype=torch.long, device="cuda")
-                final_embeddings = torch.empty(
-                    total_size, expected_dim, dtype=torch.float32
-                )
+        #     if RANK != 0:
+        #         final_labels = torch.empty(total_size, dtype=torch.long, device="cuda")
+        #         final_embeddings = torch.empty(
+        #             total_size, expected_dim, dtype=torch.float32
+        #         )
 
-                if self.training is False:
-                    final_starts = torch.empty(total_size, dtype=torch.long)
-                    final_ends = torch.empty(total_size, dtype=torch.long)
+        #         if self.training is False:
+        #             final_starts = torch.empty(total_size, dtype=torch.long)
+        #             final_ends = torch.empty(total_size, dtype=torch.long)
 
-            for start_idx in range(0, total_size, chunk_size):
-                end_idx = min(start_idx + chunk_size, total_size)
-                chunk_len = end_idx - start_idx
+        #     for start_idx in range(0, total_size, chunk_size):
+        #         end_idx = min(start_idx + chunk_size, total_size)
+        #         chunk_len = end_idx - start_idx
 
-                # Broadcast embeddings chunk
-                if RANK == 0:
-                    chunk_gpu = final_embeddings[start_idx:end_idx].cuda()
-                else:
-                    chunk_gpu = torch.empty(
-                        chunk_len, expected_dim, dtype=torch.float32, device="cuda"
-                    )
-                dist.broadcast(chunk_gpu, 0)
-                if RANK != 0:
-                    final_embeddings[start_idx:end_idx] = chunk_gpu.cpu()
-                del chunk_gpu
+        #         # Broadcast embeddings chunk
+        #         if RANK == 0:
+        #             chunk_gpu = final_embeddings[start_idx:end_idx].cuda()
+        #         else:
+        #             chunk_gpu = torch.empty(
+        #                 chunk_len, expected_dim, dtype=torch.float32, device="cuda"
+        #             )
+        #         dist.broadcast(chunk_gpu, 0)
+        #         if RANK != 0:
+        #             final_embeddings[start_idx:end_idx] = chunk_gpu.cpu()
+        #         del chunk_gpu
 
-                # Broadcast labels chunk
-                if RANK == 0:
-                    labels_chunk_gpu = final_labels[start_idx:end_idx].cuda()
-                else:
-                    labels_chunk_gpu = torch.empty(
-                        chunk_len, dtype=torch.long, device="cuda"
-                    )
-                dist.broadcast(labels_chunk_gpu, 0)
-                if RANK != 0:
-                    final_labels[start_idx:end_idx] = labels_chunk_gpu.cpu()
-                del labels_chunk_gpu
+        #         # Broadcast labels chunk
+        #         if RANK == 0:
+        #             labels_chunk_gpu = final_labels[start_idx:end_idx].cuda()
+        #         else:
+        #             labels_chunk_gpu = torch.empty(
+        #                 chunk_len, dtype=torch.long, device="cuda"
+        #             )
+        #         dist.broadcast(labels_chunk_gpu, 0)
+        #         if RANK != 0:
+        #             final_labels[start_idx:end_idx] = labels_chunk_gpu.cpu()
+        #         del labels_chunk_gpu
 
-                if self.training is False:
-                    # Broadcast starts chunk
-                    if RANK == 0:
-                        starts_chunk_gpu = final_starts[start_idx:end_idx].cuda()
-                    else:
-                        starts_chunk_gpu = torch.empty(
-                            chunk_len, dtype=torch.long, device="cuda"
-                        )
-                    dist.broadcast(starts_chunk_gpu, 0)
-                    if RANK != 0:
-                        final_starts[start_idx:end_idx] = starts_chunk_gpu.cpu()
-                    del starts_chunk_gpu
+        #         if self.training is False:
+        #             # Broadcast starts chunk
+        #             if RANK == 0:
+        #                 starts_chunk_gpu = final_starts[start_idx:end_idx].cuda()
+        #             else:
+        #                 starts_chunk_gpu = torch.empty(
+        #                     chunk_len, dtype=torch.long, device="cuda"
+        #                 )
+        #             dist.broadcast(starts_chunk_gpu, 0)
+        #             if RANK != 0:
+        #                 final_starts[start_idx:end_idx] = starts_chunk_gpu.cpu()
+        #             del starts_chunk_gpu
 
-                    # Broadcast ends chunk
-                    if RANK == 0:
-                        ends_chunk_gpu = final_ends[start_idx:end_idx].cuda()
-                    else:
-                        ends_chunk_gpu = torch.empty(
-                            chunk_len, dtype=torch.long, device="cuda"
-                        )
-                    dist.broadcast(ends_chunk_gpu, 0)
-                    if RANK != 0:
-                        final_ends[start_idx:end_idx] = ends_chunk_gpu.cpu()
-                    del ends_chunk_gpu
+        #             # Broadcast ends chunk
+        #             if RANK == 0:
+        #                 ends_chunk_gpu = final_ends[start_idx:end_idx].cuda()
+        #             else:
+        #                 ends_chunk_gpu = torch.empty(
+        #                     chunk_len, dtype=torch.long, device="cuda"
+        #                 )
+        #             dist.broadcast(ends_chunk_gpu, 0)
+        #             if RANK != 0:
+        #                 final_ends[start_idx:end_idx] = ends_chunk_gpu.cpu()
+        #             del ends_chunk_gpu
 
-                torch.cuda.empty_cache()
+        #         torch.cuda.empty_cache()
 
-        elif self.domain_boundary_detection is True:
+        elif self.domain_boundary_detection is True and self.usage_mode is True:
+            # print(len(local_embeddings), "local embeddings size")
+            # final_embeddings = local_embeddings
+            # final_labels = local_labels
             # # Counterpart for domain boundary detection, where we gather all embeddings and labels from all ranks via their .h5 files
             # # Open embeddings and labels from the single h5 file
             # all_embeddings = []
@@ -1515,11 +1549,11 @@ class ESMDataset:
 
         # At the end of _embed function, return the final embeddings and labels
         if self.training is False and self.domain_boundary_detection is False:
-            return final_embeddings, final_labels, final_starts, final_ends
+            return final_embeddings, final_labels, final_starts, final_ends, idx_multiplied
         elif self.domain_boundary_detection is True:
-            return None, None, None, None
+            return None, None, None, None, idx_multiplied
         else:
-            return final_embeddings, final_labels
+            return final_embeddings, final_labels, idx_multiplied
 
 
 if __name__ == "__main__":

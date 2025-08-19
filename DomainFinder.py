@@ -180,6 +180,21 @@ class DomainBoundaryDataset(Dataset):
             self.length = (
                 self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
             )
+            
+            # Read idx_multiplied data if available
+            self.idx_multiplied = None
+            if "idx_multiplied" in f:
+                self.idx_multiplied = list(f["idx_multiplied"][:])
+                if RANK == 0:
+                    print(f"Found idx_multiplied data: {len(self.idx_multiplied)} entries")
+                    # Show which original sequences were windowed
+                    from collections import Counter
+                    idx_counts = Counter(self.idx_multiplied)
+                    windowed_sequences = [idx for idx, count in idx_counts.items() if count > 1]
+                    print(f"Original sequences that were windowed: {windowed_sequences}")
+            else:
+                if RANK == 0:
+                    print("No idx_multiplied data found in H5 file")
 
     def __len__(self):
         return self.length
@@ -201,8 +216,6 @@ class DomainBoundaryDataset(Dataset):
             # Construct corresponding keys for other data
             key_suffix = embedding_key.replace("batch_", "")
             labels_key = f"labels_batch_{key_suffix}"
-            # starts_key = f"starts_batch_{key_suffix}"
-            # ends_key = f"ends_batch_{key_suffix}"
 
             embeddings = torch.tensor(
                 f[embedding_key][local_idx], dtype=torch.float32
@@ -210,6 +223,34 @@ class DomainBoundaryDataset(Dataset):
             labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
 
             return embeddings, labels
+    
+    def get_original_sequence_index(self, idx):
+        """Get the original sequence index for a given dataset index"""
+        if self.idx_multiplied is not None and idx < len(self.idx_multiplied):
+            return self.idx_multiplied[idx]
+        else:
+            return idx  # fallback if no mapping available
+    
+    def get_windowed_sequences_info(self):
+        """Get information about which sequences were windowed"""
+        if self.idx_multiplied is None:
+            return {}
+        
+        from collections import defaultdict, Counter
+        
+        # Count how many windows each original sequence has
+        idx_counts = Counter(self.idx_multiplied)
+        
+        # Group dataset indices by original sequence index
+        original_to_dataset_indices = defaultdict(list)
+        for dataset_idx, original_idx in enumerate(self.idx_multiplied):
+            original_to_dataset_indices[original_idx].append(dataset_idx)
+        
+        return {
+            'windowed_sequences': [idx for idx, count in idx_counts.items() if count > 1],
+            'sequence_window_counts': dict(idx_counts),
+            'original_to_dataset_mapping': dict(original_to_dataset_indices)
+        }
 
 
 
@@ -230,16 +271,25 @@ class SqueezedDataset_Usage(Dataset):
     def __init__(self, original_dataset, actual_seq_lengths):
         self.original_dataset = original_dataset
         self.actual_seq_lengths = actual_seq_lengths
+        
+        # Get windowing information if available
+        if hasattr(original_dataset, 'get_windowed_sequences_info'):
+            self.windowing_info = original_dataset.get_windowed_sequences_info()
+        else:
+            self.windowing_info = {}
 
     def __len__(self):
         return len(self.original_dataset)
 
     def __getitem__(self, idx):
-        embedding, label = self.original_dataset[idx]  # Unpack the tuple first
-        actual_length = self.actual_seq_lengths[idx]
+        embedding, label = self.original_dataset[idx]
+        actual_length = self.actual_seq_lengths[idx] if idx < len(self.actual_seq_lengths) else 1000
         
-        # Return embedding, sequence index, and ACTUAL sequence length (not padded length)
-        return embedding.squeeze(0), idx, actual_length
+        # Get original sequence index if available
+        original_seq_idx = self.original_dataset.get_original_sequence_index(idx) if hasattr(self.original_dataset, 'get_original_sequence_index') else idx
+        
+        # Return embedding, dataset index, actual length, and original sequence index
+        return embedding.squeeze(0), idx, actual_length, original_seq_idx
 # -------------------------
 # 6. MAIN TRAINER
 # -------------------------
@@ -411,9 +461,44 @@ def main_trainer(Final_training=False):
         best_trial, input_dims_sample, weights=None, domain_task=True
     )
 
+    if RANK == 0:
+        print(f"Best model loaded from trial: {best_trial.number}")
+
+    if Final_training is True:
+        early_stop = EarlyStopping(
+            monitor="val_loss", patience=5, mode="min", verbose=True
+        )
+        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+
+        if RANK == 0:
+            print("Lit model created")
+        trainer = pl.Trainer(
+            max_epochs=50,
+            accelerator="gpu",
+            devices=-1,
+            strategy="ddp",
+            enable_progress_bar=True,
+            callbacks=[early_stop, checkpoint_callback],
+            logger=TensorBoardLogger(
+                save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
+            ),
+        )
+
+        if RANK == 0:
+            print("-" * 100)
+            print("Starting training...")
+            print("-" * 100)
+
+        trainer.fit(lit_model, train_loader, val_loader)
+
+        # save the final model
+        final_model_path = f"./models/{PROJECT_NAME}.pt"
+        torch.save(lit_model, final_model_path)
+
+
     lit_model.eval()
     if RANK == 0:
-        print("Best model loaded and set to eval mode")
+        print("Set to eval mode")
 
     # Evaluate on validation set
     device = lit_model.device
@@ -481,36 +566,7 @@ def main_trainer(Final_training=False):
         )
         print(f"Average boundary detection rate: {avg_boundary_detection_rate:.4f}")
 
-    if Final_training is True:
-        early_stop = EarlyStopping(
-            monitor="val_loss", patience=5, mode="min", verbose=True
-        )
-        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
 
-        if RANK == 0:
-            print("Lit model created")
-        trainer = pl.Trainer(
-            max_epochs=50,
-            accelerator="gpu",
-            devices=-1,
-            strategy="ddp",
-            enable_progress_bar=True,
-            callbacks=[early_stop, checkpoint_callback],
-            logger=TensorBoardLogger(
-                save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
-            ),
-        )
-
-        if RANK == 0:
-            print("-" * 100)
-            print("Starting training...")
-            print("-" * 100)
-
-        trainer.fit(lit_model, train_loader, val_loader)
-
-        # save the final model
-        final_model_path = f"./models/{PROJECT_NAME}.pt"
-        torch.save(lit_model, final_model_path)
 
 
 
@@ -530,13 +586,23 @@ def loader(ESM_Model, input_file):
         )
         print("Using preembedded ESM data from scratch")
 
-    # Load the original CSV to get actual sequence lengths
-    df = pd.read_csv(input_file)
-    actual_seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
-    
     print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
     domain_boundary_dataset = DomainBoundaryDataset("./tempTest/embeddings/embeddings_domain.h5")
+
+    # Load the original CSV to get actual sequence lengths
+    df = pd.read_csv(input_file)
+    csv_seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
+    
+    # Ensure the actual_seq_lengths matches the dataset size
+    dataset_size = len(domain_boundary_dataset)
+    if len(csv_seq_lengths) != dataset_size:
+        print(f"Warning: CSV has {len(csv_seq_lengths)} sequences but dataset has {dataset_size} samples")
+        # Truncate or pad the sequence lengths to match dataset size
+        actual_seq_lengths = csv_seq_lengths[:dataset_size]
+
+    else:
+        actual_seq_lengths = csv_seq_lengths
 
     sample_embedding, sample_label = domain_boundary_dataset[0]
     print("shapes:", sample_embedding.dim(), sample_label.dim())
@@ -552,6 +618,9 @@ def loader(ESM_Model, input_file):
             print(
                 "Squeezed embeddings and labels to correct dimensions for train and val datasets."
             )
+    else:
+        # If dimensions are correct, still need to create the usage dataset
+        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
 
     # Create DataLoader for the dataset
     domain_boudnary_set_loader = DataLoader(
@@ -587,16 +656,19 @@ def Predictor(model, domain_boudnary_set_loader):
     all_sequence_preds = []
     sequence_metadata = []
 
-    # print("STARTING PREDICTION...")
     with torch.no_grad():
         for batch_data in domain_boudnary_set_loader:
             # Unpack the batch data
-            if len(batch_data) == 3:  # embedding, seq_idx, actual_seq_len
-                batch_embeddings, batch_seq_indices, batch_actual_lengths = batch_data
+            if len(batch_data) == 4:  # embedding, dataset_idx, actual_seq_len, original_seq_idx
+                batch_embeddings, batch_dataset_indices, batch_actual_lengths, batch_original_indices = batch_data
+            elif len(batch_data) == 3:  # embedding, seq_idx, actual_seq_len
+                batch_embeddings, batch_dataset_indices, batch_actual_lengths = batch_data
+                batch_original_indices = batch_dataset_indices  # fallback
             else:  # fallback for old format
                 batch_embeddings = batch_data
-                batch_seq_indices = list(range(len(batch_embeddings)))
+                batch_dataset_indices = list(range(len(batch_embeddings)))
                 batch_actual_lengths = [emb.shape[0] for emb in batch_embeddings]
+                batch_original_indices = batch_dataset_indices
             
             batch_embeddings = batch_embeddings.to(DEVICE)
             batch_logits = model(batch_embeddings)
@@ -605,7 +677,8 @@ def Predictor(model, domain_boudnary_set_loader):
             # Process each sequence in the batch separately
             for i in range(batch_preds.size(0)):
                 seq_preds_full = batch_preds[i].cpu().numpy()
-                seq_idx = batch_seq_indices[i] if hasattr(batch_seq_indices, '__iter__') else batch_seq_indices
+                dataset_idx = batch_dataset_indices[i] if hasattr(batch_dataset_indices, '__iter__') else batch_dataset_indices
+                original_idx = batch_original_indices[i] if hasattr(batch_original_indices, '__iter__') else batch_original_indices
                 actual_len = batch_actual_lengths[i] if hasattr(batch_actual_lengths, '__iter__') else batch_actual_lengths
                 
                 # IMPORTANT: Truncate predictions to actual sequence length (remove padding)
@@ -614,7 +687,8 @@ def Predictor(model, domain_boudnary_set_loader):
                 # Store predictions and metadata for this sequence
                 all_sequence_preds.append(seq_preds)
                 sequence_metadata.append({
-                    'original_seq_idx': seq_idx,
+                    'dataset_idx': dataset_idx,
+                    'original_seq_idx': original_idx,
                     'actual_seq_length': actual_len,
                     'padded_length': len(seq_preds_full),
                     'batch_idx': i
@@ -622,12 +696,25 @@ def Predictor(model, domain_boudnary_set_loader):
     
     if RANK == 0:
         print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
-        # Print some debug info
+        
+        # Show information about windowed sequences
+        original_indices = [meta['original_seq_idx'] for meta in sequence_metadata]
+        from collections import Counter
+        original_counts = Counter(original_indices)
+        windowed_originals = [idx for idx, count in original_counts.items() if count > 1]
+        
+        if windowed_originals:
+            print(f"Original sequences with multiple windows: {windowed_originals}")
+            for orig_idx in windowed_originals[:3]:  # Show first 3
+                windows = [i for i, meta in enumerate(sequence_metadata) if meta['original_seq_idx'] == orig_idx]
+                print(f"  Original sequence {orig_idx} -> dataset indices {windows}")
+        
+        # Print debug info for first few sequences
         for i in range(min(3, len(all_sequence_preds))):
             metadata = sequence_metadata[i]
-            print(f"Sequence {i}: actual_length={len(all_sequence_preds[i])}, "
-                  f"padded_length={metadata['padded_length']}, "
-                  f"actual_seq_length={metadata['actual_seq_length']}")
+            print(f"Dataset sequence {i}: original_seq={metadata['original_seq_idx']}, "
+                  f"actual_length={len(all_sequence_preds[i])}, "
+                  f"padded_length={metadata['padded_length']}")
 
     return all_sequence_preds, sequence_metadata
 
@@ -642,58 +729,78 @@ def regions_search(all_preds, sequence_metadata=None):
         regions = []
         start = None
         structured_counter = 0
+        in_structured_region = False
         
         # Get actual sequence length from metadata
-        seq_len = len(seq_preds)  # This should now be the actual length (no padding)
+        seq_len = len(seq_preds)
         if sequence_metadata and seq_idx < len(sequence_metadata):
             original_seq_idx = sequence_metadata[seq_idx]['original_seq_idx']
             actual_seq_length = sequence_metadata[seq_idx]['actual_seq_length']
-            if RANK == 0 and seq_idx < 3:  # Debug first few sequences
+            if RANK == 0 and seq_idx < 3:
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        for i, pred in enumerate(seq_preds):
-            # Update counter based on prediction - EXTREMELY HARSH
-            if pred == 1:
-                structured_counter = min(structured_counter + 1, 50)  # Higher max counter
-            else:
-                structured_counter = max(structured_counter - 10, 0)  # EXTREMELY fast decay (was -5, now -10)
+        # NEW: Check if sequence starts with structured region (handle residue 1 start)
+        initial_structured_count = 0
+        for i in range(min(10, seq_len)):  # Look at first 10 residues
+            if seq_preds[i] == 1:
+                initial_structured_count += 1
         
-            # Check if we're in a structured region - EXTREMELY HIGH THRESHOLD
-            if structured_counter > 35:  # Increased from 20 to 35 (requires 35+ consecutive predictions)
-                if start is None:  # Start of new region
-                    start = i
-                    if RANK == 0 and seq_idx < 3:
-                        print(f"  Structured region started at index {i}")
+        # If >50% of first 10 residues are structured, start region at position 0
+        if initial_structured_count >= 5:  # At least 5 out of 10
+            start = 1
+            in_structured_region = True
+            structured_counter = initial_structured_count * 2  # Give it a head start
+            if RANK == 0 and seq_idx < 3:
+                print(f"  Structured region started at sequence beginning (counter: {structured_counter})")
+        
+        for i, pred in enumerate(seq_preds):
+            # Update counter based on prediction
+            if pred == 1:
+                structured_counter = min(structured_counter + 1, 50)
+            else:
+                structured_counter = max(structured_counter - 10, 0)
+        
+            # Check if we should start a new region (skip if already started at beginning)
+            if structured_counter > 15 and not in_structured_region:
+                start = i+1
+                in_structured_region = True
+                if RANK == 0 and seq_idx < 3:
+                    print(f"  Structured region started at index {i} (counter: {structured_counter})")
+            
+            # Check if we should end the current region
+            elif structured_counter <= 5 and in_structured_region:
+                end = i+1
+                in_structured_region = False
+                if RANK == 0 and seq_idx < 3:
+                    print(f"  Structured region ended at index {i} (counter: {structured_counter})")
                 
-            else:  # structured_counter <= 35
-                if start is not None:  # End of a region
-                    end = i
+                # Only add regions that are long enough
+                region_length = end - start
+                if region_length >= 50:
+                    regions.append((start, end))
                     if RANK == 0 and seq_idx < 3:
-                        print(f"  Structured region ended at index {i}")
-                    
-                    # Only add regions that are long enough - EXTREMELY LONG MINIMUM
-                    if end - start >= 100:  # Increased minimum domain length from 50 to 100 residues
-                        regions.append((start, end))
-                    elif RANK == 0 and seq_idx < 3:
-                        print(f"    Rejected short region: length {end - start}")
-                    
-                    start = None
+                        print(f"    Added region: ({start}, {end}) length: {region_length}")
+                elif RANK == 0 and seq_idx < 3:
+                    print(f"    Rejected short region: length {region_length}")
+                
+                start = None
         
         # Handle case where sequence ends while in a structured region
-        if start is not None:
-            if seq_len - start >= 100:  # Increased minimum length check to 100
+        if in_structured_region and start is not None:
+            region_length = seq_len - start
+            if region_length >= 50:
                 regions.append((start, seq_len))
                 if RANK == 0 and seq_idx < 3:
-                    print(f"  Region ended at sequence end: {seq_len}")
+                    print(f"  Region ended at sequence end: ({start}, {seq_len}) length: {region_length}")
             elif RANK == 0 and seq_idx < 3:
-                print(f"  Rejected short final region: length {seq_len - start}")
+                print(f"  Rejected short final region: length {region_length}")
         
         all_regions.append(regions)
     
     if RANK == 0:
         print(f"Found {len(all_regions)} sequences with domain regions.")
-        for seq_idx in range(min(3, len(all_regions))):  # Only print first 3 for debugging
+        for seq_idx in range(min(3, len(all_regions))):
             regions = all_regions[seq_idx]
             metadata = sequence_metadata[seq_idx] if sequence_metadata else {}
             actual_length = metadata.get('actual_seq_length', 'unknown')
@@ -740,6 +847,7 @@ def main(input_file):
     output_file = "./tempTest/predicted_domain_regions.pkl"
     with open(output_file, 'wb') as f:
         pickle.dump(all_regions, f)
+        pickle.dump(sequence_metadata, f)
     
     return all_regions
 
