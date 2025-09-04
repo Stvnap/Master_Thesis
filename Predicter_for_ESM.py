@@ -39,7 +39,7 @@ ESM_MODEL = "esm2_t33_650M_UR50D"
 
 NUM_CLASSES = 11
 BATCH_SIZE = 10000
-EMB_BATCH = 1
+EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 

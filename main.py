@@ -6,6 +6,13 @@ All inputs and outputs are managed here.
 This file is the entry point for the program.
 """
 
+########### 
+# FIX IF MULTIPLE WINDOWS ARE USED
+# THE START AND END PREDICTIONS ARE NOT CORRECTLY MAPPED TO THE CUT OUT REGIONS
+###########
+
+
+import argparse
 import os
 import pickle
 import subprocess
@@ -26,7 +33,6 @@ def parse_args():
     Function to parse the input arguments.
     This function will be used to parse the input arguments for the program.
     """
-    import argparse
 
     parser = argparse.ArgumentParser(
         description="Main script for the ESM evaluation program."
@@ -80,7 +86,7 @@ def Transformer(input_file, ESM_Model, gpus, vram):
     This function will be used to transform the input data into a format suitable for the model.
     """
 
-    # Call the main function of DomainFinder using torchrun
+    # Call the main function of DomainBoundaryFinder using torchrun
     cmd = [
         "torchrun",
         f"--nproc-per-node={gpus}",
@@ -116,10 +122,10 @@ def Transformer(input_file, ESM_Model, gpus, vram):
     return_code = process.wait()
 
     if return_code != 0:
-        print(f"Error: DomainFinder exited with return code {return_code}")
+        print(f"Error: DomainBoundaryFinder exited with return code {return_code}")
         sys.exit(1)
 
-    print("DomainFinder completed successfully")
+    print("DomainBoundaryFinder completed successfully")
 
     # Load the predicted domain regions from pickle file
     with open("./tempTest/predicted_domain_regions.pkl", "rb") as f:
@@ -127,23 +133,14 @@ def Transformer(input_file, ESM_Model, gpus, vram):
         sequence_metadata = pickle.load(f)
 
         
-    print("sequence_metadata:",sequence_metadata)
+    # print("sequence_metadata:",sequence_metadata)
 
     return all_regions, sequence_metadata  # Return both all_regions and sequence_metadata
-
-    # Assuming DomainFinder outputs results to a file, load the results
-    # You'll need to modify this based on how DomainFinder outputs its results
-    # all_regions = []  # Replace with actual loading logic
-
-
-# QUESTION: Maybe resuse the embeddings directly and pool the per residue embeddings from the cut out sequence?
 
 
 ######################################
 # 3. Cut out the domain regions from the sequences
 ######################################
-
-##### START ENDS ARE BUGGY, NEEDS TO BE FIXED !!!! ################
 
 
 def Regions_Cutter(all_regions, input_file):
@@ -178,10 +175,10 @@ def Regions_Cutter(all_regions, input_file):
                     cut_out_regions.append(
                         {
                             "Sequence_ID": row["ID"],
-                            "Sequence": sequence,
+                            "Sequence_Length": len(sequence),
                             "Domain_Start": start,
                             "Domain_End": end,
-                            "Sequence_Length": len(sequence),
+                            "Sequence": sequence,
                         }
                     )
 
@@ -282,7 +279,7 @@ def analyze_windowing_structure(sequence_metadata, cut_df):
                 'extra_predictions': num_windows - 1  # -1 because one is expected
             })
     
-    print(f"Sequences longer than 1000 residues in cut_df:")
+    print("Sequences longer than 1000 residues in cut_df:")
     total_extra_predictions = 0
     for seq_info in long_sequences:
         print(f"  Row {seq_info['cut_df_index']}: ID={seq_info['sequence_id']}, "
@@ -341,7 +338,7 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
                             row_copy = row.copy()
                             # Optionally, you can add a suffix to indicate this is a windowed prediction
                             if window_idx > 0:  # Only add suffix for additional windows
-                                row_copy['Sequence_ID'] = f"{row_copy['Sequence_ID']}_window_{window_idx}"
+                                row_copy['Sequence_ID'] = f"{row_copy['Sequence_ID']}_{window_idx+1}"
                             expanded_rows.append(row_copy)
                             print(f"  Added window {window_idx} for sequence {row_copy.get('Sequence_ID', 'N/A')}")
                     else:
@@ -369,8 +366,14 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
     if len(all_predictions) != len(df):
         raise ValueError(f"Still have length mismatch: {len(all_predictions)} predictions vs {len(df)} DataFrame rows")
 
+
+    # convert all_predictions to the actual pfam IDs
+    with open("./temp/selected_pfam_ids_1000.txt", "r") as f:
+        pfam_ids = [line.strip() for line in f.readlines()]
+        all_predictions = [pfam_ids[pred] if pred < len(pfam_ids) else "Unknown" for pred in all_predictions]
+
     # Add predictions to DataFrame
-    df["Prediction"] = all_predictions
+    df.insert(2, "Prediction", all_predictions)
 
     # Save to CSV
     df.to_csv(output_file, index=False)

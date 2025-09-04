@@ -1,5 +1,6 @@
 import gc
 import os
+import subprocess
 import time
 
 import esm
@@ -7,10 +8,6 @@ import h5py
 import pandas as pd
 import psutil
 import torch
-
-# from pympler import asizeof
-# from pympler import summary,muppy
-# from pympler.classtracker import ClassTracker
 import torch.distributed as dist
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
@@ -27,22 +24,21 @@ use_ddp = world_size > 1
 
 if not dist.is_initialized():
     # Set up environment variables if not already set
-    if 'RANK' not in os.environ:
-        os.environ['RANK'] = '0'
-    if 'WORLD_SIZE' not in os.environ:
-        os.environ['WORLD_SIZE'] = '1'
-    if 'MASTER_ADDR' not in os.environ:
-        os.environ['MASTER_ADDR'] = 'localhost'
-    if 'MASTER_PORT' not in os.environ:
-        os.environ['MASTER_PORT'] = '12355'
-    
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+    if "WORLD_SIZE" not in os.environ:
+        os.environ["WORLD_SIZE"] = "1"
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "12355"
+
     # Initialize the process group
     dist.init_process_group(
-        backend='nccl' if torch.cuda.is_available() else 'gloo',
-        rank=int(os.environ['RANK']),
-        world_size=int(os.environ['WORLD_SIZE'])
+        backend="nccl" if torch.cuda.is_available() else "gloo",
+        rank=int(os.environ["RANK"]),
+        world_size=int(os.environ["WORLD_SIZE"]),
     )
-
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,11 +67,7 @@ TRAIN_FRAC = 0.8
 VAL_FRAC = 0.2
 
 
-EMB_BATCH = 1
-
-
-# if RANK == 0:
-#     print(f"Using device: {DEVICE} | count: {torch.cuda.device_count()}")
+EMB_BATCH = 64
 
 
 # -------------------------
@@ -115,6 +107,7 @@ class ESMDataset:
         csv_path,
         category_col,
         sequence_col,
+        emb_batch=EMB_BATCH,
         skip_df=None,
         FSDP_used=False,
         domain_boundary_detection=False,
@@ -131,7 +124,7 @@ class ESMDataset:
         self.model, self.batch_converter = self.esm_loader()
         self.all_starts = None
         self.all_ends = None
-
+        self.emb_batch = emb_batch
 
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
@@ -156,7 +149,7 @@ class ESMDataset:
             # Count samples per class
             class_counts = df["label"].value_counts()
 
-            # Subsample ALL classes to target samples each
+            # Subsample class 0  to target samples each
             target_samples_per_class = target
             subsampled_dfs = []
 
@@ -167,7 +160,7 @@ class ESMDataset:
                 class_samples = df[df["label"] == class_label]
                 current_count = len(class_samples)
 
-                if current_count > target_samples_per_class:
+                if class_label == 0 and current_count > target_samples_per_class:
                     # Subsample to target size
                     class_subsampled = class_samples.sample(
                         n=target_samples_per_class, random_state=42
@@ -205,7 +198,7 @@ class ESMDataset:
                 if self.training is True:
                     os.makedirs("./temp", exist_ok=True)
                     all_pfam = all_pfam[1:]  # Exclude "other" category
-                    open(f"./temp/selected_pfam_ids_{num_classes-1}.txt", "w").write(
+                    open(f"./temp/selected_pfam_ids_{num_classes - 1}.txt", "w").write(
                         "\n".join(all_pfam)
                     )
             return df
@@ -215,22 +208,47 @@ class ESMDataset:
                 if RANK == 0:
                     print("Loading data...")
 
+                    # Count lines using system command (fast for large files)
+                    try:
+                        if num_classes == 101:
+                            expected_chunks = 22
+                        else:
+                            result = subprocess.run(
+                                ["wc", "-l", csv_path], capture_output=True, text=True
+                            )
+                            total_lines = int(result.stdout.split()[0])
+                            total_rows = total_lines - 1  # Subtract header row
+
+                            chunk_size = 10000000
+                            expected_chunks = (
+                                total_rows + chunk_size - 1
+                            ) // chunk_size
+
+                        # print(f"Total rows (excluding header): {total_rows:,}")
+                        print(f"Expected chunks: {expected_chunks}(STATIC PRINT!)")
+
+                    except Exception as e:
+                        print(f"Could not count lines using wc command: {e}")
+                        expected_chunks = "unknown"
+
                 try:
                     chunk_iter = pd.read_csv(
                         csv_path,
                         usecols=["start", "end", "id", "Pfam_id", "Sequence"],
                         chunksize=10000000,  # Adjust chunk size as needed
                     )
-                except:
-                    chunk_iter = pd.read_csv(
-                        csv_path, chunksize=10000000
-                    )
+                except Exception as e:
+                    if RANK == 0:
+                        print(
+                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
+                        )
+                    chunk_iter = pd.read_csv(csv_path, chunksize=10000000)
                     self.usage_mode = True
 
                 for chunk_num, chunk in enumerate(chunk_iter):
                     if RANK == 0:
                         print(
-                            f"Processing chunk {chunk_num} with {len(chunk)} sequences"
+                            f"Processing chunk {chunk_num}/{expected_chunks} with {len(chunk)} sequences"
                         )
                     if "start" in chunk.columns and "end" in chunk.columns:
                         if training is True:
@@ -255,7 +273,9 @@ class ESMDataset:
                     if category_col != "Pfam_id":
                         chunk["label"] = chunk[category_col].apply(map_label)
 
-                    elif domain_boundary_detection is False and self.usage_mode is False:
+                    elif (
+                        domain_boundary_detection is False and self.usage_mode is False
+                    ):
                         # Create mapping once outside the apply function
                         unique_pfam_ids = chunk[category_col].unique()
 
@@ -272,20 +292,121 @@ class ESMDataset:
                             )
 
                         # Define the specific 10 Pfam IDs you want to use first | probably change here if thioset needed
+                        # priority_pfam_ids = [
+                        #     "PF00177",
+                        #     "PF00210",
+                        #     "PF00211",
+                        #     "PF00215",
+                        #     "PF00217",
+                        #     "PF00406",
+                        #     "PF00303",
+                        #     "PF00246",
+                        #     "PF00457",
+                        #     "PF00502",
+                        # ]
+
                         priority_pfam_ids = [
                             "PF00177",
                             "PF00210",
                             "PF00211",
                             "PF00215",
-                            "PF00217",
                             "PF00406",
                             "PF00303",
                             "PF00246",
-                            "PF00457",
-                            "PF00502",
+                            "PF00005",
+                            "PF00072",
+                            "PF00069",
+                            "PF02518",
+                            "PF07690",
+                            "PF00528",
+                            "PF00115",
+                            "PF00271",
+                            "PF00512",
+                            "PF00078",
+                            "PF00440",
+                            "PF00106",
+                            "PF03466",
+                            "PF00270",
+                            "PF00501",
+                            "PF00126",
+                            "PF13561",
+                            "PF04055",
+                            "PF00583",
+                            "PF00535",
+                            "PF04542",
+                            "PF07992",
+                            "PF12833",
+                            "PF00004",
+                            "PF00561",
+                            "PF00155",
+                            "PF00067",
+                            "PF08240",
+                            "PF07714",
+                            "PF07715",
+                            "PF00672",
+                            "PF00171",
+                            "PF00534",
+                            "PF00702",
+                            "PF13193",
+                            "PF00107",
+                            "PF00990",
+                            "PF00009",
+                            "PF00149",
+                            "PF01370",
+                            "PF00486",
+                            "PF00392",
+                            "PF00361",
+                            "PF00196",
+                            "PF00441",
+                            "PF00001",
+                            "PF02771",
+                            "PF00664",
+                            "PF00293",
+                            "PF01381",
+                            "PF02770",
+                            "PF08281",
+                            "PF00593",
+                            "PF02653",
+                            "PF00753",
+                            "PF01979",
+                            "PF12796",
+                            "PF00077",
+                            "PF00248",
+                            "PF00076",
+                            "PF00378",
+                            "PF00589",
+                            "PF00903",
+                            "PF01266",
+                            "PF01408",
+                            "PF01926",
+                            "PF00291",
+                            "PF01546",
+                            "PF13439",
+                            "PF00226",
+                            "PF08241",
+                            "PF00122",
+                            "PF00083",
+                            "PF00169",
+                            "PF01565",
+                            "PF00665",
+                            "PF00117",
+                            "PF00202",
+                            "PF00015",
+                            "PF03144",
+                            "PF07687",
+                            "PF00563",
+                            "PF00496",
+                            "PF08245",
+                            "PF00266",
+                            "PF00027",
+                            "PF13649",
+                            "PF00651",
+                            "PF00296",
+                            "PF01494",
+                            "PF00884",
+                            "PF03372",
+                            "PF00071",
                         ]
-
-
 
                         # # FOR THE THIOLASESET ONLY
                         # priority_pfam_ids = [
@@ -301,13 +422,12 @@ class ESMDataset:
                         #     "PF08540",
                         # ]
 
-
                         if self.training is False:
                             # to ensure same ids used during evaluation on prediction quality
                             if RANK == 0:
                                 print("Using fixed priority Pfam IDs for evaluation")
                             with open(
-                                f"./temp/selected_pfam_ids_{num_classes-1}.txt", "r"
+                                f"./temp/selected_pfam_ids_{num_classes - 1}.txt", "r"
                             ) as f:
                                 priority_pfam_ids = [
                                     line.strip() for line in f.readlines()
@@ -346,12 +466,11 @@ class ESMDataset:
                             if pfam_id not in pfam_to_label:
                                 pfam_to_label[pfam_id] = 0
 
-                        # Use map instead of apply for better performance
                         chunk["label"] = (
                             chunk[category_col].map(pfam_to_label).fillna(0)
                         )
 
-                        chunk = subsampler(chunk, 10000)
+                        chunk = subsampler(chunk, 1000)
 
                     if self.training is False:
                         self.all_starts = chunk["start"].tolist()
@@ -364,7 +483,7 @@ class ESMDataset:
                             columns=["start", "end", "id", "Pfam_id"], inplace=True
                         )
 
-                    print(chunk.columns)
+                    # print(chunk.columns)
 
                     chunk = chunk[
                         chunk[sequence_col].str.len() >= 10
@@ -376,7 +495,6 @@ class ESMDataset:
                     # Use sequences in original order
                     sequences = self.chunk[sequence_col].tolist()
 
-
                     if self.usage_mode is False:
                         self.labels = torch.tensor(
                             self.chunk["label"].values, dtype=torch.long
@@ -385,11 +503,17 @@ class ESMDataset:
                     start_time = time.time()
 
                     if self.training is False:
-                        self.embeddings, self.labels, self.starts, self.ends, self.idx_multiplied = (
-                            self._embed(sequences)
-                        )
+                        (
+                            self.embeddings,
+                            self.labels,
+                            self.starts,
+                            self.ends,
+                            self.idx_multiplied,
+                        ) = self._embed(sequences)
                     else:
-                        self.embeddings, self.labels, self.idx_multiplied = self._embed(sequences)
+                        self.embeddings, self.labels, self.idx_multiplied = self._embed(
+                            sequences
+                        )
 
                     self.embeddings = self.embeddings.cpu()
                     self.labels = self.labels.cpu()
@@ -474,14 +598,13 @@ class ESMDataset:
                                 f"Wrote embeddings and labels for batch {chunk_num} to file"
                             )
 
-
                     elif self.usage_mode is True:
                         if self.usage_mode is True:
-                            save_path = "./tempTest/embeddings/embeddings_domain_classifier.h5"
+                            save_path = (
+                                "./tempTest/embeddings/embeddings_domain_classifier.h5"
+                            )
                         else:
                             save_path = f"./temp/embeddings_classification_{self.num_classes - 1}d.h5"
-
-
 
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
@@ -500,8 +623,6 @@ class ESMDataset:
 
                             dist.barrier()  # Ensure only one rank writes at a time
 
-
-
                     else:
                         # Save embeddings and labels to files
                         os.makedirs("./temp", exist_ok=True)
@@ -514,7 +635,6 @@ class ESMDataset:
                             # print(
                             #     f"Starts: {self.starts.shape}, Ends: {self.ends.shape}"
                             # )
-
 
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
@@ -542,9 +662,9 @@ class ESMDataset:
                             dist.barrier()  # Ensure only one rank writes at a time
 
                         if RANK == 0:
-                            print(f"Wrote embeddings and labels for batch {chunk_num} to file")
-
-
+                            print(
+                                f"Wrote embeddings and labels for batch {chunk_num} to file"
+                            )
 
                 print("Done Embedding! Closing Embedder")
 
@@ -555,7 +675,11 @@ class ESMDataset:
                     df = pd.read_csv(
                         csv_path, usecols=["start", "end", "id", "Pfam_id", "Sequence"]
                     )
-                except:
+                except Exception as e:
+                    if RANK == 0:
+                        print(
+                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
+                        )
                     df = pd.read_csv(
                         csv_path,
                     )
@@ -607,11 +731,17 @@ class ESMDataset:
                 start_time = time.time()
 
                 if self.training is False:
-                    self.embeddings, self.labels, self.starts, self.ends, self.idx_multiplied = self._embed(
+                    (
+                        self.embeddings,
+                        self.labels,
+                        self.starts,
+                        self.ends,
+                        self.idx_multiplied,
+                    ) = self._embed(sequences)
+                else:
+                    self.embeddings, self.labels, idx_multiplied = self._embed(
                         sequences
                     )
-                else:
-                    self.embeddings, self.labels, idx_multiplied = self._embed(sequences)
 
                 print("Done Embedding! Closing Embedder")
                 return  # Return early if domain boundary detection is enabled
@@ -681,9 +811,11 @@ class ESMDataset:
             new_labels = []
             count = 0
             idx_multiplied = []  # Track which original indices were windowed
-            
+
             if self.training is True:
-                for idx, (seq, label) in enumerate(zip(seq_dataset.seqs, seq_dataset.labels)):
+                for idx, (seq, label) in enumerate(
+                    zip(seq_dataset.seqs, seq_dataset.labels)
+                ):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -709,12 +841,14 @@ class ESMDataset:
             elif self.training is False and self.domain_boundary_detection is False:
                 new_starts = []
                 new_ends = []
-                for idx, (seq, label, start, end) in enumerate(zip(
-                    seq_dataset.seqs,
-                    seq_dataset.labels,
-                    seq_dataset.starts,
-                    seq_dataset.ends,
-                )):
+                for idx, (seq, label, start, end) in enumerate(
+                    zip(
+                        seq_dataset.seqs,
+                        seq_dataset.labels,
+                        seq_dataset.starts,
+                        seq_dataset.ends,
+                    )
+                ):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -757,12 +891,14 @@ class ESMDataset:
                     starts = seq_dataset.starts
                     ends = seq_dataset.ends
 
-                for idx, (seq, label, start, end) in enumerate(zip(
-                    seq_dataset.seqs,
-                    seq_dataset.labels,
-                    starts,
-                    ends,
-                )):
+                for idx, (seq, label, start, end) in enumerate(
+                    zip(
+                        seq_dataset.seqs,
+                        seq_dataset.labels,
+                        starts,
+                        ends,
+                    )
+                ):
                     if len(seq) > 1000:
                         if RANK == 0:
                             count += 1
@@ -871,12 +1007,9 @@ class ESMDataset:
 
         start_time = time.time()
 
-
-
         if self.usage_mode is True:
             # dummy labels for usage mode - make them all the same size (1000) for consistency
             self.labels = [torch.zeros(1000, dtype=torch.long) for seq in seqs]
-        
 
         # Use the new dataset that includes labels
         if self.training is True and self.skip_df is None:
@@ -885,7 +1018,11 @@ class ESMDataset:
             seq_dataset = SeqDatasetForEval(
                 seqs, self.labels, self.all_starts, self.all_ends
             )
-        elif self.training is False and hasattr(self, 'all_starts') and hasattr(self, 'all_ends'):
+        elif (
+            self.training is False
+            and hasattr(self, "all_starts")
+            and hasattr(self, "all_ends")
+        ):
             seq_dataset = SeqDatasetForEval(
                 seqs, self.labels, self.all_starts, self.all_ends
             )
@@ -893,15 +1030,15 @@ class ESMDataset:
             # Fallback to basic dataset
             seq_dataset = SeqDataset(seqs, self.labels)
 
-
         # if RANK == 0:
-            # print(seq_dataset.labels.shape)
-
+        # print(seq_dataset.labels.shape)
 
         if self.training is True:
-            new_seqs, new_labels,idx_multiplied = windower(stepsize=500, dimension=1000)
+            new_seqs, new_labels, idx_multiplied = windower(
+                stepsize=500, dimension=1000
+            )
         else:
-            new_seqs, new_labels, new_starts, new_ends,idx_multiplied = windower(
+            new_seqs, new_labels, new_starts, new_ends, idx_multiplied = windower(
                 stepsize=500, dimension=1000
             )
 
@@ -935,18 +1072,22 @@ class ESMDataset:
             drop_last=False,
         )
 
-
         if self.usage_mode is True:
             # For usage mode or domain boundary detection, we need to ensure all sequences are processed
             # without padding, so we create a custom sampler that does not pad sequences
             class CustomDistributedSampler(DistributedSampler):
-                def __init__(self, dataset, num_replicas=None, rank=None, shuffle=False):
-                    super().__init__(dataset, num_replicas, rank, shuffle, drop_last=False)
+                def __init__(
+                    self, dataset, num_replicas=None, rank=None, shuffle=False
+                ):
+                    super().__init__(
+                        dataset, num_replicas, rank, shuffle, drop_last=False
+                    )
                     # Recalculate num_samples to avoid padding
                     self.total_size = len(self.dataset)
                     self.num_samples = self.total_size // self.num_replicas
                     if self.rank < self.total_size % self.num_replicas:
                         self.num_samples += 1
+
             sampler = CustomDistributedSampler(
                 seq_dataset,
                 num_replicas=dist.get_world_size(),
@@ -955,10 +1096,9 @@ class ESMDataset:
             )
             print("SAMPLER CUSTOM USED")
 
-
         dataloader = DataLoader(
             seq_dataset,
-            batch_size=EMB_BATCH,
+            batch_size=self.emb_batch,
             num_workers=0,
             sampler=sampler,
             pin_memory=True,
@@ -967,7 +1107,7 @@ class ESMDataset:
         if RANK == 0:
             # print(f"Expected embedding dimension: {expected_dim}")
             print(
-                f"Total sequences to process: {len(seq_dataset.seqs)} with batch size {EMB_BATCH}"
+                f"Total sequences to process: {len(seq_dataset.seqs)} with batch size {self.emb_batch}"
             )
             print(f"Each Rank will process sequences {sampler.num_samples}")
 
@@ -1173,9 +1313,16 @@ class ESMDataset:
 
             if self.domain_boundary_detection is True:
                 # Save embeddings and labels in chunks to avoid memory overflow
-                # on palma i do only 100
+                # on palma do only 100
+
+                # if batch_num % 1000:
+                #     for emb in all_embeddings:
+                #         emb = emb.cpu()
+                #     for lbl in all_labels:
+                #         lbl = lbl.cpu()
+
                 if (
-                    batch_num % 1000 == 0
+                    batch_num % 3000 == 0
                     and batch_num > 0
                     or batch_num == len(dataloader) - 1
                 ):
@@ -1549,7 +1696,13 @@ class ESMDataset:
 
         # At the end of _embed function, return the final embeddings and labels
         if self.training is False and self.domain_boundary_detection is False:
-            return final_embeddings, final_labels, final_starts, final_ends, idx_multiplied
+            return (
+                final_embeddings,
+                final_labels,
+                final_starts,
+                final_ends,
+                idx_multiplied,
+            )
         elif self.domain_boundary_detection is True:
             return None, None, None, None, idx_multiplied
         else:

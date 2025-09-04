@@ -1,6 +1,6 @@
 import math
 import os
-
+import argparse
 import h5py
 import numpy as np
 import optuna
@@ -13,7 +13,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
-
+from main import input_file
+import pickle
 from ESM_Embeddings_HP_search import (
     ESMDataset,
     load_best_model,
@@ -29,7 +30,6 @@ RANK = dist.get_rank()
 print(f"Start running basic DDP example on rank {RANK}.")
 # create model and move it to GPU with id rank
 DEVICE_ID = RANK % torch.cuda.device_count()
-
 
 # -------------------------
 # 1. Global settings
@@ -50,7 +50,7 @@ TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 
-EMB_BATCH = 1
+EMB_BATCH = 64
 NUM_WORKERS_EMB = 32
 # print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 BATCH_SIZE = 20
@@ -105,7 +105,7 @@ class Transformer(nn.Module):
             dim_feedforward=working_dim * 4,  # Standard: 4x model dimension
             dropout=dropout,
             activation=activation,
-            batch_first=True,  # Much easier to work withs
+            batch_first=True,  
         )
 
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
@@ -367,19 +367,19 @@ def main_trainer(Final_training=False):
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
     )
 
     print(f"Train set: {len(train_dataset)} samples")
@@ -389,7 +389,7 @@ def main_trainer(Final_training=False):
     # Calculate class weights by iterating through the dataset
     print("Calculating class weights for training set...")
     all_labels = []
-    for i in range(0, 100):
+    for i in range(0, 20):
         _, labels = train_dataset[i]
         all_labels.append(labels)
 
@@ -414,7 +414,7 @@ def main_trainer(Final_training=False):
         print(f"Class counts: {counts.cpu().numpy()}")
         print(f"Calculated class weights: {weights.cpu().numpy()}")
 
-    del all_labels, train_labels, counts
+    del all_labels, train_labels, counts, train_labels_flat, total
 
     if RANK == 0:
         study = optuna.create_study(
@@ -583,6 +583,7 @@ def loader(ESM_Model, input_file):
             csv_path=input_file,
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
+            emb_batch=1,
         )
         print("Using preembedded ESM data from scratch")
 
@@ -627,10 +628,10 @@ def loader(ESM_Model, input_file):
         domain_boundary_dataset_squeezed,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
     )
 
     if RANK == 0:
@@ -718,6 +719,7 @@ def Predictor(model, domain_boudnary_set_loader):
 
     return all_sequence_preds, sequence_metadata
 
+
 def regions_search(all_preds, sequence_metadata=None):
     """
     Function to search for domain regions in the predictions.
@@ -740,19 +742,20 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        # NEW: Check if sequence starts with structured region (handle residue 1 start)
-        initial_structured_count = 0
-        for i in range(min(10, seq_len)):  # Look at first 10 residues
-            if seq_preds[i] == 1:
-                initial_structured_count += 1
+        # Find first occurrence of 2 consecutive 1's to start structured region
+        consecutive_ones_start = None
+        for i in range(seq_len - 2):
+            if seq_preds[i] == 1 and seq_preds[i + 1] == 1 and seq_preds[i + 2] == 1:
+                consecutive_ones_start = i + 1  # 1-indexed position
+                break
         
-        # If >50% of first 10 residues are structured, start region at position 0
-        if initial_structured_count >= 5:  # At least 5 out of 10
-            start = 1
+        # If we found 2 consecutive 1's at the beginning, start region there
+        if consecutive_ones_start is not None:
+            start = consecutive_ones_start
             in_structured_region = True
-            structured_counter = initial_structured_count * 2  # Give it a head start
+            structured_counter = 20  # Give it a head start
             if RANK == 0 and seq_idx < 3:
-                print(f"  Structured region started at sequence beginning (counter: {structured_counter})")
+                print(f"  Structured region started at first consecutive 1's at position {consecutive_ones_start} (counter: {structured_counter})")
         
         for i, pred in enumerate(seq_preds):
             # Update counter based on prediction
@@ -761,7 +764,7 @@ def regions_search(all_preds, sequence_metadata=None):
             else:
                 structured_counter = max(structured_counter - 10, 0)
         
-            # Check if we should start a new region (skip if already started at beginning)
+            # Check if we should start a new region (only if we haven't started from consecutive 1's)
             if structured_counter > 15 and not in_structured_region:
                 start = i+1
                 in_structured_region = True
@@ -775,9 +778,9 @@ def regions_search(all_preds, sequence_metadata=None):
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Structured region ended at index {i} (counter: {structured_counter})")
                 
-                # Only add regions that are long enough
+                # Only add regions that are long enough, 30 aa
                 region_length = end - start
-                if region_length >= 50:
+                if region_length >=30:
                     regions.append((start, end))
                     if RANK == 0 and seq_idx < 3:
                         print(f"    Added region: ({start}, {end}) length: {region_length}")
@@ -852,45 +855,41 @@ def main(input_file):
     return all_regions
 
     
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Domain Finder Script")
+    parser.add_argument("--input", type=str, required=True, help="Input file path")
+    parser.add_argument("--output", type=str, default="./tempTest/predicted_domain_regions.pkl", help="Output file path")
+    parser.add_argument("--model", type=str, required=True, help="ESM model name")
+    parser.add_argument("--vram", type=int, default=8, help="VRAM amount")
+    parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
+    return parser.parse_args()
 
+# Parse arguments at the beginning
+args = parse_arguments()
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Convert TrainerMode string to boolean
+TRAINER_MODE = args.TrainerMode.lower() == "true"
 
 #############################################################################################################
-from main import input_file
-import pickle
 
 if __name__ == "__main__":
+    if TRAINER_MODE is True:
+        main_trainer(Final_training=False)
+    
+        if RANK == 0:
+            print("\nFinished running DomainFinder\n")
+        dist.barrier()  # Ensure all processes reach this point before exiting
+        dist.destroy_process_group()  # Clean up the process group
+        quit()
 
     main(input_file)
+
     dist.barrier()  # Ensure all processes reach this point before exiting
     dist.destroy_process_group()  # Clean up the process group
     quit()
 
 
-    main_trainer(Final_training=False)
-    if RANK == 0:
-        print("\nFinished running DomainFinder\n")
-    dist.barrier()  # Ensure all processes reach this point before exiting
-    dist.destroy_process_group()  # Clean up the process group
+
 
 else:
     main(input_file)

@@ -42,13 +42,13 @@ NUM_CLASSES = 1001  # classes + 1 for "other" class
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d_THIO.h5"
-PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d_THIO"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d.h5"
+PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
 EPOCHS = 50
-STUDY_N_TRIALS = 0
+STUDY_N_TRIALS = 15
 BATCH_SIZE = 256
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
@@ -1375,7 +1375,7 @@ def loader(csv_path):
             FSDP_used=False,
             domain_boundary_detection=False,
             training=True,
-            num_classes=1001,
+            num_classes=NUM_CLASSES,
             csv_path=csv_path,
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
@@ -1428,6 +1428,8 @@ def predicter(model, classifier_loader):
             all_predictions_raw.extend(preds_raw.cpu().numpy())
 
     return all_predictions, all_predictions_raw
+
+
 # -------------------------
 # 9. Main for Usage
 # -------------------------
@@ -1440,30 +1442,30 @@ def main(csv_path):
     return all_predictions, all_predictions_raw
 
 
-
-
-
-
-
-
-
-
-#############################################################################################################
-
 def parse_args():
     """Parse command line arguments"""
     import argparse
     
     parser = argparse.ArgumentParser(description="ESM Embeddings HP Search")
-    parser.add_argument("--csv_path", type=str, required=True, help="Path to input CSV file")
+    parser.add_argument("--csv_path", type=str, default="./Dataframes/v3/RemainingEntriesCompleteProteins.csv", help="Path to input CSV file")
+    parser.add_argument("--HP_mode", action="store_true", help="Use to run hyperparameter optimization")
     
     return parser.parse_args()
+
+
+#############################################################################################################
 
 if __name__ == "__main__":
 
     args = parse_args()
+
+    # early exit if in HP mode, starting just HP search
+    if args.HP_mode is True:
+        main_HP(Final_training=True)
+        exit(0)
+
+    # continue with normal execution for usage
     csv_path = args.csv_path
-    
     all_predictions, all_predictions_raw = main(csv_path)
     
     # Save predictions to a file that main.py can read
@@ -1478,8 +1480,5 @@ if __name__ == "__main__":
     predictions_df.to_csv('./tempTest/predictions.csv', index=False)
     
     if RANK == 0:
-        print(f"Predictions saved to ./tempTest/predictions.csv")
+        print("Predictions saved to ./tempTest/predictions.csv")
         print(f"Total predictions: {len(all_predictions)}")
-
-
-    # main_HP(Final_training=True)
