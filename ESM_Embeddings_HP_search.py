@@ -3,7 +3,7 @@
 # -------------------------
 import glob
 import os
-
+from tqdm.auto import tqdm
 import h5py
 import numpy as np
 import optuna
@@ -37,7 +37,8 @@ pd.set_option("display.max_rows", None)
 # 1. GLOBALS
 # -------------------------
 NUM_CLASSES = 1001  # classes + 1 for "other" class
-
+if RANK == 0:
+    print("USING n CLASSES:",NUM_CLASSES)
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
@@ -116,17 +117,8 @@ class LitClassifier(pl.LightningModule):
         domain_task=False,
         num_heads=8,
         num_layers=None,
-        cosine_T_max=20,
-        cosine_eta_min=1e-6,
-        use_grad_clip=False,
-        grad_clip_value=1.0,
-        beta1=0.9,
-        beta2=0.999,
-        eps=1e-8,
-        momentum=0.9,
-        nesterov=True,  
-        rmsprop_alpha=0.99,
-        rmsprop_momentum=0.9,
+
+
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -137,18 +129,7 @@ class LitClassifier(pl.LightningModule):
         self.domain_task = domain_task
         self.class_weights = class_weights
         self.num_classes = num_classes
-        self.cosine_T_max = cosine_T_max
-        self.cosine_eta_min = cosine_eta_min
-        self.use_grad_clip = use_grad_clip
-        self.grad_clip_value = grad_clip_value
 
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.momentum = momentum
-        self.nesterov = nesterov
-        self.rmsprop_alpha = rmsprop_alpha
-        self.rmsprop_momentum = rmsprop_momentum
 
         # base model
         if domain_task is False:
@@ -200,33 +181,70 @@ class LitClassifier(pl.LightningModule):
             return 0.0
         return (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
 
-    def differentiable_fbeta_loss(self, logits, labels, beta=1.5, epsilon=1e-8):
+    def distance_aware_boundary_loss(self, logits, labels, alpha=2.0, beta=1.0, gamma=0.5, fbeta_weight=1.5, epsilon=1e-8):
         """
-        Differentiable F-beta loss using soft predictions.
+        Custom loss that heavily penalizes boundary predictions far from true boundaries.
+        
+        Args:
+            logits: Model predictions [seq_len, num_classes]
+            labels: True labels [seq_len] (0 for non-boundary, 1 for boundary)
+            alpha: Weight for distance penalty (higher = more penalty for far predictions)
+            beta: Weight for base classification loss
+            epsilon: Small value for numerical stability
         """
         # Apply softmax to get probabilities
         probs = torch.softmax(logits, dim=-1)
+        boundary_probs = probs[:, 1]  # Probabilities for boundary class
+        binary_labels = labels.float()
         
-        if self.domain_task:
-            # Binary classification - focus on boundary class (class 1)
-            # Convert labels to one-hot
-            labels_onehot = torch.zeros_like(probs)
-            labels_onehot.scatter_(1, labels.unsqueeze(-1), 1)
+        # Base classification loss (cross-entropy)
+        ce_loss = -binary_labels * torch.log(boundary_probs + epsilon) - (1 - binary_labels) * torch.log(1 - boundary_probs + epsilon)
+        
+        # Find positions of true boundaries
+        true_boundary_positions = torch.where(binary_labels == 1)[0]
+                
+        # Calculate distance penalty for false positive predictions
+        false_positive_mask = (binary_labels == 0) & (boundary_probs > 0.5)
+        
+        # Only calculate distance penalty if there are both false positives AND true boundaries
+        if false_positive_mask.any() and len(true_boundary_positions) > 0:
+            fp_positions = torch.where(false_positive_mask)[0]
             
-            # Calculate soft TP, FP, FN for boundary class
-            boundary_probs = probs[:, 1]  # Probabilities for boundary class
-            boundary_labels = labels_onehot[:, 1]  # True boundary labels
+            # For each false positive, find distance to nearest true boundary
+            distance_penalties = []
+            for fp_pos in fp_positions:
+                # Calculate distances to all true boundaries
+                distances = torch.abs(fp_pos - true_boundary_positions.float())
+                min_distance = torch.min(distances)
+                
+                # Distance penalty: exponential decay based on distance
+                # Closer false positives get higher penalties
+                distance_penalty = torch.exp(-min_distance / 10.0)  # Adjust denominator to control decay rate
+                
+                # Weight by prediction confidence
+                fp_confidence = boundary_probs[fp_pos]
+                weighted_penalty = distance_penalty * fp_confidence * alpha
+                
+                distance_penalties.append(weighted_penalty)
             
-            tp = (boundary_probs * boundary_labels).sum()
-            fp = (boundary_probs * (1 - boundary_labels)).sum()
-            fn = ((1 - boundary_probs) * boundary_labels).sum()
-            
-            precision = tp / (tp + fp + epsilon)
-            recall = tp / (tp + fn + epsilon)
-            
-            fbeta = (1 + beta**2) * precision * recall / (beta**2 * precision + recall + epsilon)
-            return 1.0 - fbeta  # Convert to loss
-
+            distance_penalty_term = torch.stack(distance_penalties).mean()
+        else:
+            distance_penalty_term = torch.tensor(0.0, device=logits.device)
+        
+        tp_soft = (boundary_probs * binary_labels).sum()
+        fp_soft = (boundary_probs * (1 - binary_labels)).sum() 
+        fn_soft = ((1 - boundary_probs) * binary_labels).sum()
+        
+        precision_soft = tp_soft / (tp_soft + fp_soft + epsilon)
+        recall_soft = tp_soft / (tp_soft + fn_soft + epsilon)
+        
+        fbeta_score_soft = (1 + fbeta_weight**2) * precision_soft * recall_soft / (fbeta_weight**2 * precision_soft + recall_soft + epsilon)
+        fbeta_loss = 1.0 - fbeta_score_soft
+        
+        # 4. Properly combine with defined gamma
+        total_loss = beta * ce_loss.mean() + distance_penalty_term + gamma * fbeta_loss
+        return total_loss
+        
     def forward(self, x):
         return self.model(x)
 
@@ -251,7 +269,7 @@ class LitClassifier(pl.LightningModule):
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
                 seq_labels = y[i]  # [seq_len]
-                seq_loss = self.differentiable_fbeta_loss(seq_logits, seq_labels)
+                seq_loss = self.distance_aware_boundary_loss(seq_logits, seq_labels)
                 losses.append(seq_loss)
 
             loss = torch.stack(losses).mean()
@@ -285,7 +303,7 @@ class LitClassifier(pl.LightningModule):
             for i in range(batch_size):
                 seq_logits = logits[i]  # [seq_len, num_classes]
                 seq_labels = y[i]  # [seq_len]
-                seq_loss = self.differentiable_fbeta_loss(seq_logits, seq_labels)
+                seq_loss = self.distance_aware_boundary_loss(seq_logits, seq_labels)
                 losses.append(seq_loss)
 
                 seq_preds = torch.argmax(seq_logits, dim=-1)  # [seq_len]
@@ -416,25 +434,21 @@ class LitClassifier(pl.LightningModule):
             optimizer = self.optimizer_class(
                 self.parameters(),
                 lr=self.lr,
-                momentum=self.momentum,
-                weight_decay=self.weight_decay,
-                nesterov=self.nesterov,
+                nesterov=True,
             )
         elif self.optimizer_class in [torch.optim.Adam, torch.optim.AdamW, torch.optim.NAdam]:
             optimizer = self.optimizer_class(
                 self.parameters(),
                 lr=self.lr,
                 weight_decay=self.weight_decay,
-                betas=(self.beta1, self.beta2),
-                eps=self.eps,
+
             )
         elif self.optimizer_class == torch.optim.RMSprop:
             optimizer = self.optimizer_class(
                 self.parameters(),
                 lr=self.lr,
                 weight_decay=self.weight_decay,
-                alpha=self.rmsprop_alpha,
-                momentum=self.rmsprop_momentum,
+
             )
         else:
             optimizer = self.optimizer_class(
@@ -443,17 +457,18 @@ class LitClassifier(pl.LightningModule):
                 weight_decay=self.weight_decay,
             )
         
-        # CosineAnnealingLR scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.cosine_T_max,
-            eta_min=self.cosine_eta_min
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            factor=0.5, 
+            patience=3, 
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": scheduler,
+                "scheduler": scheduler,  
+                "monitor": "val_loss",   
                 "interval": "epoch",
                 "frequency": 1,
             }
@@ -485,11 +500,9 @@ def objective(
             lr = trial.suggest_float("lr", 1e-6, 1e-1, log=True)  
             wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)  
 
-            cosine_T_max = trial.suggest_int("cosine_T_max", 10, 30)
-            cosine_eta_min = trial.suggest_float("cosine_eta_min", 1e-7, 1e-5, log=True)
 
-            use_grad_clip = trial.suggest_categorical("use_grad_clip", [True, False])
-            grad_clip_value = trial.suggest_float("grad_clip_value", 0.5, 2.0)
+
+
 
 
             optimizer = trial.suggest_categorical(
@@ -498,9 +511,6 @@ def objective(
             
             # Tune optimizer-specific parameters
             if optimizer in ["adam", "adamw", "nadam"]:
-                beta1 = trial.suggest_float("beta1", 0.85, 0.95)
-                beta2 = trial.suggest_float("beta2", 0.99, 0.999)
-                eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
                 
                 if optimizer == "adam":
                     optimizer_class = torch.optim.Adam
@@ -510,12 +520,8 @@ def objective(
                     optimizer_class = torch.optim.NAdam
                     
             elif optimizer == "sgd":
-                momentum = trial.suggest_float("momentum", 0.8, 0.95)
-                nesterov = trial.suggest_categorical("nesterov", [True, False])
                 optimizer_class = torch.optim.SGD
             else:  # rmsprop
-                momentum = trial.suggest_float("rmsprop_momentum", 0.8, 0.95)
-                alpha = trial.suggest_float("rmsprop_alpha", 0.9, 0.99)
                 optimizer_class = torch.optim.RMSprop
 
             activation = trial.suggest_categorical(
@@ -539,11 +545,6 @@ def objective(
                 f"Hidden layers: {len(hidden_dims)}, Neurons: {n_neurons}\n"
                 f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
                 f"Optimizer: {optimizer}, Activation: {activation.__class__.__name__}\n"
-                f"Cosine T_max: {cosine_T_max}, Cosine eta_min: {cosine_eta_min}\n"
-                f"Use grad clip: {use_grad_clip}, Grad clip value: {grad_clip_value}\n"
-                f"Beta1: {locals().get('beta1', 0.9)}, Beta2: {locals().get('beta2', 0.999)}\n"
-                f"Momentum: {locals().get('momentum', 0.9)}, Nesterov: {locals().get('nesterov', True)}\n"
-                f"RMSprop alpha: {locals().get('alpha', 0.99)}, RMSprop momentum: {locals().get('rmsprop_momentum', 0.9)}\n"
                 f"========================\n"
             )
 
@@ -557,16 +558,6 @@ def objective(
                 "kernel_init": kernel_init,
                 "drop": drop,
                 "weights": weights,
-                "cosine_T_max": cosine_T_max,
-                "cosine_eta_min": cosine_eta_min,
-                "use_grad_clip": use_grad_clip,
-                "grad_clip_value": grad_clip_value,
-                "beta1": locals().get("beta1", 0.9),
-                "beta2": locals().get("beta2", 0.999),
-                "eps": locals().get("eps", 1e-8),
-                "momentum": locals().get("momentum", 0.9),
-                "nesterov": locals().get("nesterov", True),
-                "rmsprop_alpha": locals().get("alpha", 0.99),
             }
 
         else:
@@ -590,17 +581,6 @@ def objective(
             weight_decay=params["weight_decay"],
             dropout=params["drop"],
             class_weights=params["weights"],
-            cosine_T_max=params["cosine_T_max"],
-            cosine_eta_min=params["cosine_eta_min"],
-            use_grad_clip=params["use_grad_clip"],
-            grad_clip_value=params["grad_clip_value"],
-            beta1=params["beta1"],
-            beta2=params["beta2"],
-            eps=params["eps"],
-            momentum=params["momentum"],
-            nesterov=params["nesterov"],
-            rmsprop_alpha=params["rmsprop_alpha"],
-            rmsprop_momentum=params.get("rmsprop_momentum", 0.9),  # Add this if missing
             domain_task=False,
         )
 
@@ -764,12 +744,8 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
         n_layers = p["num_hidden_layers"]
         hidden_dims = [n_neurons] * n_layers
 
-        cosine_T_max = p.get("cosine_T_max", 20)        # Default fallback
-        cosine_eta_min = p.get("cosine_eta_min", 1e-6)  # Default fallback
 
-        # FIX: Don't use trial.suggest_* here, just get from params
-        use_grad_clip = p.get("use_grad_clip", False)      # Get from existing params
-        grad_clip_value = p.get("grad_clip_value", 1.0)    # Get from existing params
+
 
         opt_name = p["optimizer"]
         if opt_name == "adam":
@@ -798,14 +774,6 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
         lr = p["lr"]
         wd = p["weight_decay"]
         
-        # Extract optimizer-specific parameters from trial params
-        beta1 = p.get("beta1", 0.9)
-        beta2 = p.get("beta2", 0.999)
-        eps = p.get("eps", 1e-8)
-        momentum = p.get("momentum", 0.9)
-        nesterov = p.get("nesterov", True)
-        rmsprop_alpha = p.get("rmsprop_alpha", 0.99)
-        rmsprop_momentum = p.get("rmsprop_momentum", 0.9)
 
         model = LitClassifier(
             input_dim=input_dim,
@@ -818,18 +786,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             weight_decay=wd,
             dropout=drop,
             class_weights=weights,
-            cosine_T_max=cosine_T_max,
-            cosine_eta_min=cosine_eta_min,
-            use_grad_clip=use_grad_clip,
-            grad_clip_value=grad_clip_value,
-            # Add optimizer-specific parameters
-            beta1=beta1,
-            beta2=beta2,
-            eps=eps,
-            momentum=momentum,
-            nesterov=nesterov,
-            rmsprop_alpha=rmsprop_alpha,
-            rmsprop_momentum=rmsprop_momentum,
+
             domain_task=False,
         )
 
@@ -838,11 +795,6 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
             f"Hidden layers: {n_layers}, Neurons: {n_neurons}\n"
             f"Dropout: {drop:.3f}, LR: {lr:.6f}, WD: {wd:.6f}\n"
             f"Optimizer: {optimizer_class.__name__}, Activation: {activation_fn.__class__.__name__}\n"
-            f"Cosine T_max: {cosine_T_max}, Cosine eta_min: {cosine_eta_min}\n"
-            f"Use grad clip: {use_grad_clip}, Grad clip value: {grad_clip_value}\n"
-            f"Beta1: {beta1}, Beta2: {beta2}, Eps: {eps}\n"
-            f"Momentum: {momentum}, Nesterov: {nesterov}\n"
-            f"RMSprop alpha: {rmsprop_alpha}, RMSprop momentum: {rmsprop_momentum}\n"
             f"========================\n"
         )
 
@@ -1368,7 +1320,7 @@ class ClassifierDataset(torch.utils.data.Dataset):
             return embeddings  # Only return embeddings, no labels
 
 
-def loader(csv_path):
+def loader(csv_path,HP_mode=False):
     if not os.path.exists("tempTest/embeddings/embeddings_domain_classifier.h5"):
         ESMDataset(
             esm_model=ESM_MODEL,
@@ -1391,7 +1343,7 @@ def loader(csv_path):
     # Create DataLoader for inference
     classifier_loader = DataLoader(
         classifier_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=BATCH_SIZE/2,
         shuffle=False,
         persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,
@@ -1410,12 +1362,12 @@ def loader(csv_path):
 
 
 
-def predicter(model, classifier_loader):
+def predicter(model, classifier_loader,):
     all_predictions = []
     all_predictions_raw = []
 
     with torch.no_grad():
-        for batch in classifier_loader:
+        for batch in tqdm(classifier_loader, desc="Predicting Domain Classes", disable=RANK != 0,unit="Batch",position=0, leave=True):
             # ClassifierDataset only returns embeddings, not labels/starts/ends
             inputs = batch
             inputs = inputs.to(DEVICE)

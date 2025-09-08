@@ -13,7 +13,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
-from main import input_file
+from tqdm import tqdm
+# from main import input_file
 import pickle
 from ESM_Embeddings_HP_search import (
     ESMDataset,
@@ -639,7 +640,7 @@ def loader(ESM_Model, input_file):
         print("Datasets and DataLoaders for domain boundary detection created.")
         print("\nLoading Model...\n")
 
-    model = torch.load("./models/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
+    model = torch.load("./models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
     model = model.to(DEVICE)
     model.eval()
 
@@ -658,7 +659,8 @@ def Predictor(model, domain_boudnary_set_loader):
     sequence_metadata = []
 
     with torch.no_grad():
-        for batch_data in domain_boudnary_set_loader:
+        # Create progress bar that only shows on rank 0
+        for batch_data in tqdm(domain_boudnary_set_loader, desc="Predicting domain boundaries", disable=RANK != 0,unit="Batches", position=0, leave=True):
             # Unpack the batch data
             if len(batch_data) == 4:  # embedding, dataset_idx, actual_seq_len, original_seq_idx
                 batch_embeddings, batch_dataset_indices, batch_actual_lengths, batch_original_indices = batch_data
@@ -745,7 +747,7 @@ def regions_search(all_preds, sequence_metadata=None):
         # Find first occurrence of 2 consecutive 1's to start structured region
         consecutive_ones_start = None
         for i in range(seq_len - 2):
-            if seq_preds[i] == 1 and seq_preds[i + 1] == 1 and seq_preds[i + 2] == 1:
+            if seq_preds[i] == 1 and seq_preds[i + 1] == 1 and seq_preds[i + 2] and seq_preds[i+3] == 1:
                 consecutive_ones_start = i + 1  # 1-indexed position
                 break
         
@@ -760,12 +762,12 @@ def regions_search(all_preds, sequence_metadata=None):
         for i, pred in enumerate(seq_preds):
             # Update counter based on prediction
             if pred == 1:
-                structured_counter = min(structured_counter + 1, 50)
+                structured_counter = min(structured_counter + 1, 50)    # Add 1 for each 1, max 50
             else:
-                structured_counter = max(structured_counter - 10, 0)
+                structured_counter = max(structured_counter - 20, 0)    # Subtract 20 for each 0, min 0
         
             # Check if we should start a new region (only if we haven't started from consecutive 1's)
-            if structured_counter > 15 and not in_structured_region:
+            if structured_counter > 15 and not in_structured_region:    # 15 is the threshold to start
                 start = i+1
                 in_structured_region = True
                 if RANK == 0 and seq_idx < 3:
@@ -826,18 +828,12 @@ def main(input_file):
     model, domain_boudnary_set_loader = loader(ESM_MODEL, input_file)
 
     # Call the Predictor function to predict domain boundaries
-    all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)
-
-    
-    
-
-    
-    
+    all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)  
+     
+   
     if RANK == 0:
         print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
-
-
-    
+   
 
 
     # Search for domain regions with metadata
@@ -869,27 +865,18 @@ args = parse_arguments()
 
 # Convert TrainerMode string to boolean
 TRAINER_MODE = args.TrainerMode.lower() == "true"
-
+input_file = args.input
 #############################################################################################################
 
 if __name__ == "__main__":
     if TRAINER_MODE is True:
         main_trainer(Final_training=False)
     
+    else:
+        main(input_file)
+
         if RANK == 0:
             print("\nFinished running DomainFinder\n")
         dist.barrier()  # Ensure all processes reach this point before exiting
         dist.destroy_process_group()  # Clean up the process group
         quit()
-
-    main(input_file)
-
-    dist.barrier()  # Ensure all processes reach this point before exiting
-    dist.destroy_process_group()  # Clean up the process group
-    quit()
-
-
-
-
-else:
-    main(input_file)

@@ -86,6 +86,13 @@ def Transformer(input_file, ESM_Model, gpus, vram):
     This function will be used to transform the input data into a format suitable for the model.
     """
 
+    if os.path.exists("./tempTest/predicted_domain_regions.pkl"):
+        print("Found existing predicted_domain_regions.pkl, loading it directly.")
+        with open("./tempTest/predicted_domain_regions.pkl", "rb") as f:
+            all_regions = pickle.load(f)
+            sequence_metadata = pickle.load(f)
+        return all_regions, sequence_metadata
+
     # Call the main function of DomainBoundaryFinder using torchrun
     cmd = [
         "torchrun",
@@ -101,7 +108,7 @@ def Transformer(input_file, ESM_Model, gpus, vram):
         ESM_Model,
         "--vram",
         str(vram),
-    ]
+            ]
 
     print(f"Running command: {' '.join(cmd)}")
 
@@ -223,6 +230,7 @@ def classifier(gpus):
         stderr=subprocess.STDOUT,
         universal_newlines=True,
         bufsize=1,
+        env={**os.environ, 'PYTHONUNBUFFERED': '1'},  # Force Python to be unbuffered
     )
 
     # Print output in real-time

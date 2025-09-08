@@ -67,7 +67,7 @@ TRAIN_FRAC = 0.8
 VAL_FRAC = 0.2
 
 
-EMB_BATCH = 64
+EMB_BATCH = 64//4
 
 
 # -------------------------
@@ -115,6 +115,7 @@ class ESMDataset:
     ):
         self.esm_model = esm_model
         self.training = training
+        # print(f"Training mode: {self.training}")
         self.skip_df = skip_df
         self.domain_boundary_detection = domain_boundary_detection
         self.sequence_col = sequence_col
@@ -248,7 +249,7 @@ class ESMDataset:
                 for chunk_num, chunk in enumerate(chunk_iter):
                     if RANK == 0:
                         print(
-                            f"Processing chunk {chunk_num}/{expected_chunks} with {len(chunk)} sequences"
+                            f"Processing chunk {chunk_num+1}/{expected_chunks} with {len(chunk)} sequences"
                         )
                     if "start" in chunk.columns and "end" in chunk.columns:
                         if training is True:
@@ -470,7 +471,7 @@ class ESMDataset:
                             chunk[category_col].map(pfam_to_label).fillna(0)
                         )
 
-                        chunk = subsampler(chunk, 1000)
+                        chunk = subsampler(chunk, 100000)
 
                     if self.training is False:
                         self.all_starts = chunk["start"].tolist()
@@ -504,41 +505,41 @@ class ESMDataset:
 
                     if self.training is False:
                         (
-                            self.embeddings,
-                            self.labels,
-                            self.starts,
-                            self.ends,
-                            self.idx_multiplied,
+                            embeddings,
+                            labels,
+                            starts,
+                            ends,
+                            idx_multiplied,
                         ) = self._embed(sequences)
                     else:
-                        self.embeddings, self.labels, self.idx_multiplied = self._embed(
+                        embeddings, labels, idx_multiplied= self._embed(
                             sequences
                         )
 
-                    self.embeddings = self.embeddings.cpu()
-                    self.labels = self.labels.cpu()
+                    embeddings = embeddings.cpu()
+                    labels = labels.cpu()
                     if self.training is False:
-                        self.starts = self.starts.cpu()
-                        self.ends = self.ends.cpu()
+                        starts = starts.cpu()
+                        ends = ends.cpu()
 
-                    if len(self.embeddings) != len(self.labels):
+                    if len(embeddings) != len(labels):
                         if RANK == 0:
                             print(
-                                f"WARNING: Number of embeddings does not match number of labels! {len(self.embeddings)} != {len(self.labels)}"
+                                f"WARNING: Number of embeddings does not match number of labels! {len(embeddings)} != {len(labels)}"
                             )
-                        if len(self.embeddings) > len(self.labels):
-                            self.embeddings = self.embeddings[
-                                : len(self.labels)
+                        if len(embeddings) > len(labels):
+                            embeddings = embeddings[
+                                : len(labels)
                             ]  # Discarding last embedding, due to being a duplicate
                             if self.training is False:
-                                self.starts = self.starts[: len(self.labels)]
-                                self.ends = self.ends[: len(self.labels)]
+                                starts = starts[: len(labels)]
+                                ends = ends[: len(labels)]
                             print(
-                                f"After fix length: {len(self.embeddings)} == {len(self.labels)}"
+                                f"After fix length: {len(embeddings)} == {len(labels)}"
                             )
                         else:
                             raise ValueError(
-                                f"Number of embeddings is less than number of labels! {len(self.embeddings)} < {len(self.labels)}, check your data!"
+                                f"Number of embeddings is less than number of labels! {len(embeddings)} < {len(labels)}, check your data!"
                             )
 
                     end_time = time.time()
@@ -552,20 +553,22 @@ class ESMDataset:
                             f"Sequences per second: {len(sequences) / embedding_time:.2f}"
                         )
 
+
+
                     if self.training is True and self.usage_mode is False:
                         # print("Creating stratified train/val split...")
                         X_train, X_val, y_train, y_val = train_test_split(
-                            self.embeddings,
-                            self.labels,
+                            embeddings,
+                            labels,
                             test_size=VAL_FRAC,
-                            stratify=self.labels,
+                            stratify=labels,
                             random_state=42,
                         )
 
-                        self.train_embeddings = X_train
-                        self.train_labels = y_train
-                        self.val_embeddings = X_val
-                        self.val_labels = y_val
+                        train_embeddings = X_train
+                        train_labels = y_train
+                        val_embeddings = X_val
+                        val_labels = y_val
 
                         # Save datasets to files
                         os.makedirs("./temp", exist_ok=True)
@@ -577,19 +580,19 @@ class ESMDataset:
                                 ) as f:
                                     f.create_dataset(
                                         f"train_embeddings_chunk{chunk_num}_rank{RANK}",
-                                        data=self.train_embeddings.cpu().numpy(),
+                                        data=train_embeddings.cpu().numpy(),
                                     )
                                     f.create_dataset(
                                         f"train_labels_chunk{chunk_num}_rank{RANK}",
-                                        data=self.train_labels.cpu().numpy(),
+                                        data=train_labels.cpu().numpy(),
                                     )
                                     f.create_dataset(
                                         f"val_embeddings_chunk{chunk_num}_rank{RANK}",
-                                        data=self.val_embeddings.cpu().numpy(),
+                                        data=val_embeddings.cpu().numpy(),
                                     )
                                     f.create_dataset(
                                         f"val_labels_chunk{chunk_num}_rank{RANK}",
-                                        data=self.val_labels.cpu().numpy(),
+                                        data=val_labels.cpu().numpy(),
                                     )
                             dist.barrier()  # Ensure only one rank writes at a time
 
@@ -614,11 +617,11 @@ class ESMDataset:
                                 ) as f:
                                     f.create_dataset(
                                         f"embeddings_{chunk_num}_rank{RANK}",
-                                        data=self.embeddings.cpu().numpy(),
+                                        data=embeddings.cpu().numpy(),
                                     )
                                     f.create_dataset(
                                         f"idx_multiplied_{chunk_num}_rank{RANK}",
-                                        data=self.idx_multiplied,
+                                        data=idx_multiplied,
                                     )
 
                             dist.barrier()  # Ensure only one rank writes at a time
@@ -630,10 +633,10 @@ class ESMDataset:
                         if RANK == 0:
                             print("SHAPES")
                             print(
-                                f"Embeddings: {self.embeddings.shape}, Labels: {self.labels.shape}"
+                                f"Embeddings: {embeddings.shape}, Labels: {labels.shape}"
                             )
                             # print(
-                            #     f"Starts: {self.starts.shape}, Ends: {self.ends.shape}"
+                            #     f"Starts: {starts.shape}, Ends: {ends.shape}"
                             # )
 
                         for rank_id in range(dist.get_world_size()):
@@ -644,20 +647,20 @@ class ESMDataset:
                                 ) as f:
                                     f.create_dataset(
                                         f"embeddings_chunk{chunk_num}_rank{RANK}",
-                                        data=self.embeddings.cpu().numpy(),
+                                        data=embeddings.cpu().numpy(),
                                     )
                                     f.create_dataset(
                                         f"labels_chunk{chunk_num}_rank{RANK}",
-                                        data=self.labels.cpu().numpy(),
+                                        data=labels.cpu().numpy(),
                                     )
                                     if self.training is False:
                                         f.create_dataset(
                                             f"starts_chunk{chunk_num}_rank{RANK}",
-                                            data=self.starts.cpu().numpy(),
+                                            data=starts.cpu().numpy(),
                                         )
                                         f.create_dataset(
                                             f"ends_chunk{chunk_num}_rank{RANK}",
-                                            data=self.ends.cpu().numpy(),
+                                            data=ends.cpu().numpy(),
                                         )
                             dist.barrier()  # Ensure only one rank writes at a time
 
@@ -665,7 +668,19 @@ class ESMDataset:
                             print(
                                 f"Wrote embeddings and labels for batch {chunk_num} to file"
                             )
-
+                    # Add cleanup after each chunk
+                    if self.training is True:
+                        del embeddings, labels, idx_multiplied
+                    else:
+                        del embeddings, labels, starts, ends, idx_multiplied
+                    del sequences, chunk
+                    if hasattr(self, 'chunk'):
+                        del self.chunk
+                    
+                    # Force garbage collection after each chunk
+                    import gc
+                    gc.collect()
+    
                 print("Done Embedding! Closing Embedder")
 
             if self.domain_boundary_detection is True:
@@ -1211,6 +1226,7 @@ class ESMDataset:
                 if (
                     batch_num % 100 == 0
                     or batch_num == len(dataloader) - 1
+                    or batch_num == 0
                     and RANK == 0
                 ):
                     elapsed_time = time.time() - start_time
@@ -1247,7 +1263,7 @@ class ESMDataset:
                 # Handle exceptions during batch processing, if vram blows up, we will try to process each sequence individually
                 # kind of unnecessary, cuz emb_batch is already 1 is the fastes (no padding the batch to same length needed, due to 1 sequence only), but was already implemented
                 # can be ignored because it never triggers during ram oom
-                print(f"\nRank {RANK}: Error processing batch {batch_num + 1}: {e}")
+                print(f"\nRank {RANK}: Error processing batch {batch_num + 1}: {e}\n")
                 # Handle individual sequences...
                 for seq, label in zip(batch_seqs, batch_labels):
                     try:
@@ -1299,7 +1315,7 @@ class ESMDataset:
                         # last fallback, empty embedding, if something goes wrong
                         # never triggers, at least never seen it trigger
                         print(
-                            f"Rank {RANK}: Error processing individual sequence: {single_e}"
+                            f"\nRank {RANK}: Error processing individual sequence: {single_e}\n"
                         )
                         zero_embedding = torch.zeros(1, expected_dim)
                         all_embeddings.append(zero_embedding)
@@ -1397,16 +1413,12 @@ class ESMDataset:
                 # basic way for ID classification, just store the embeddings and labels
 
                 # Concatenate local embeddings and labels
-                local_embeddings = (
-                    torch.cat(all_embeddings, dim=0)
-                    if all_embeddings
-                    else torch.empty(0, expected_dim)
-                )
-                local_labels = (
-                    torch.cat(all_labels, dim=0)
-                    if all_labels
-                    else torch.empty(0, dtype=torch.long)
-                )
+                local_embeddings = torch.cat(all_embeddings, dim=0)
+                local_labels = torch.cat(all_labels, dim=0)
+
+                
+
+
             if self.training is False:
                 local_starts = (
                     torch.cat(all_starts, dim=0)
@@ -1418,6 +1430,7 @@ class ESMDataset:
                     if all_ends
                     else torch.empty(0, dtype=torch.long)
                 )
+                
 
         #     # Print the shapes of the gathered data
         #     print(
@@ -1445,6 +1458,9 @@ class ESMDataset:
         # NOT NEEDED FOR DOMAIN BOUDNARY TASK
 
         if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
+
+            all_embeddings.clear()
+            all_labels.clear()
             print(len(local_embeddings), "local embeddings size")
             final_embeddings = local_embeddings
             final_labels = local_labels
