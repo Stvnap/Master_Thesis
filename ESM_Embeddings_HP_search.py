@@ -3,6 +3,7 @@
 # -------------------------
 import glob
 import os
+import psutil
 from tqdm.auto import tqdm
 import h5py
 import numpy as np
@@ -50,7 +51,9 @@ ESM_MODEL = "esm2_t33_650M_UR50D"
 
 EPOCHS = 50
 STUDY_N_TRIALS = 15
-BATCH_SIZE = 256
+
+VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
+BATCH_SIZE = 512 if VRAM >= 24 else 256 if VRAM >= 16 else 128 if VRAM >= 8 else 64
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 VAL_FRAC = 0.2
@@ -1232,8 +1235,6 @@ def main_HP(Final_training=False):
             raise RuntimeError("No trials found in the study!")
 
 
-
-
     lit_model = load_best_model(best_trial, input_dim, weights)
 
     lit_model.eval()
@@ -1343,7 +1344,7 @@ def loader(csv_path,HP_mode=False):
     # Create DataLoader for inference
     classifier_loader = DataLoader(
         classifier_dataset,
-        batch_size=BATCH_SIZE/2,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         persistent_workers=True,
         num_workers=NUM_WORKERS_EMB,

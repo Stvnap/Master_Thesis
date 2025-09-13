@@ -12,6 +12,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+import psutil
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
@@ -26,22 +27,21 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 # -------------------------
 
 GLOBAL_RUN = 0  # keep 0
+NUM_CLASSES = 101
 
 CSV_PATH = "./Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 MODEL_PATH = "./models/FINAL/t33_ALL_10d_THIO.pt"
-CACHE_PATH = "./temp/embeddings_classification_10d_THIO_EVAL.h5"
-TENSBORBOARD_LOG_DIR = "./models/10d_uncut_ALL_THIO"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES-1}d_EVAL.h5"
+TENSBORBOARD_LOG_DIR = f"./models/{NUM_CLASSES-1}d_uncut_ALL"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-
-NUM_CLASSES = 11
-BATCH_SIZE = 10000
+VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
+BATCH_SIZE = 20000 if VRAM >= 24 else 10000 if VRAM >= 16 else 5000 if VRAM >= 8 else 2000
 EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
-NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 THRESHOLD = 5  # Number of consecutive drops to trigger exclusion
 if RANK == 0:
@@ -141,15 +141,12 @@ def opener():
         batch_size=BATCH_SIZE,
         shuffle=True,
         persistent_workers=True,
-        num_workers=NUM_WORKERS_EMB,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
         prefetch_factor=4,
     )
 
-
-
-    
-
+ 
     # print(eval_loader)
 
     if RANK == 0:
@@ -180,7 +177,6 @@ def predict(modelpath, loader, firstrun=False):
     #     print(f"Using {torch.cuda.device_count()} GPUs for prediction")
     #     model = nn.DataParallel(model)
     model.eval()
-
 
 
     # print(model)

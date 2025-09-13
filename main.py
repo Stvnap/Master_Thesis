@@ -53,13 +53,10 @@ def parse_args():
     parser.add_argument(
         "--gpus", type=int, default=1, help="Number of GPUs to use for evaluation."
     )
-    parser.add_argument(
-        "--vram", type=int, default=8056, help="VRAM available for evaluation."
-    )
 
     args = parser.parse_args()
 
-    return args.input, args.output, args.model, args.gpus, args.vram
+    return args.input, args.output, args.model, args.gpus
 
 
 ######################################
@@ -80,7 +77,7 @@ def Inputter(filepath):
 ######################################
 
 
-def Transformer(input_file, ESM_Model, gpus, vram):
+def Transformer(input_file, ESM_Model, gpus):
     """
     Function to call the Transformer script.
     This function will be used to transform the input data into a format suitable for the model.
@@ -106,8 +103,6 @@ def Transformer(input_file, ESM_Model, gpus, vram):
         "./tempTest/regions.csv",
         "--model",
         ESM_Model,
-        "--vram",
-        str(vram),
             ]
 
     print(f"Running command: {' '.join(cmd)}")
@@ -395,7 +390,7 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
 #######################################################################
 
 
-def main(input_file, output_file, ESM_Model, gpus, vram):
+def main(input_file, output_file, ESM_Model, gpus):
 
     # Call the Inputter function to convert fasta to csv if input is a fasta file
     if input_file.endswith(".fa") or input_file.endswith(".fasta"):
@@ -413,7 +408,7 @@ def main(input_file, output_file, ESM_Model, gpus, vram):
 
     print("Starting the Transformer script...")
 
-    all_regions,sequence_metadata = Transformer(input_file, ESM_Model, gpus, vram)
+    all_regions,sequence_metadata = Transformer(input_file, ESM_Model, gpus)
 
     print("Transformer script completed. Regions found:", all_regions,"\n")
 
@@ -465,6 +460,6 @@ def main(input_file, output_file, ESM_Model, gpus, vram):
 
 
 ####################################################################
-input_file, output_file, ESM_Model, gpus, vram = parse_args()
+input_file, output_file, ESM_Model, gpus = parse_args()
 if __name__ == "__main__":
-    main(input_file, output_file, ESM_Model, gpus, vram)
+    main(input_file, output_file, ESM_Model, gpus)

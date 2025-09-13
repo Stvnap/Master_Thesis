@@ -4,6 +4,7 @@ import argparse
 import h5py
 import numpy as np
 import optuna
+import psutil
 import pytorch_lightning as pl
 import torch
 import torch.distributed as dist
@@ -22,7 +23,8 @@ from ESM_Embeddings_HP_search import (
     objective,
 )
 
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))# BATCH_SIZE = 10000
+
 if not dist.is_initialized():
     dist.init_process_group("nccl")
     if dist.get_rank() == 0:
@@ -52,9 +54,10 @@ VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 
 EMB_BATCH = 64
-NUM_WORKERS_EMB = 32
+NUM_WORKERS = min(16, os.cpu_count())
 # print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
-BATCH_SIZE = 20
+VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
+BATCH_SIZE = 40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 50
@@ -368,7 +371,7 @@ def main_trainer(Final_training=False):
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
@@ -377,7 +380,7 @@ def main_trainer(Final_training=False):
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
@@ -486,9 +489,11 @@ def main_trainer(Final_training=False):
         )
 
         if RANK == 0:
+            print()
             print("-" * 100)
             print("Starting training...")
             print("-" * 100)
+            print()
 
         trainer.fit(lit_model, train_loader, val_loader)
 
@@ -629,7 +634,7 @@ def loader(ESM_Model, input_file):
         domain_boundary_dataset_squeezed,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
@@ -744,45 +749,45 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        # Find first occurrence of 2 consecutive 1's to start structured region
+        # Find first occurrence of just 2 consecutive 1's to start structured region (more liberal)
         consecutive_ones_start = None
-        for i in range(seq_len - 2):
-            if seq_preds[i] == 1 and seq_preds[i + 1] == 1 and seq_preds[i + 2] and seq_preds[i+3] == 1:
-                consecutive_ones_start = i + 1  # 1-indexed position
+        for i in range(seq_len - 1):  # Changed from seq_len - 2 to seq_len - 1
+            if seq_preds[i] == 1 and seq_preds[i + 1] == 1:  # Changed from 3 consecutive to 2 consecutive
+                consecutive_ones_start = i + 1  
                 break
         
         # If we found 2 consecutive 1's at the beginning, start region there
         if consecutive_ones_start is not None:
             start = consecutive_ones_start
             in_structured_region = True
-            structured_counter = 20  # Give it a head start
+            structured_counter = 20  # Increased from 15 to 20 for more stability
             if RANK == 0 and seq_idx < 3:
                 print(f"  Structured region started at first consecutive 1's at position {consecutive_ones_start} (counter: {structured_counter})")
         
         for i, pred in enumerate(seq_preds):
-            # Update counter based on prediction
+            # Update counter based on prediction (even more generous)
             if pred == 1:
-                structured_counter = min(structured_counter + 1, 50)    # Add 1 for each 1, max 50
+                structured_counter = min(structured_counter + 3, 60)  # Changed from +2 to +3, max from 50 to 60
             else:
-                structured_counter = max(structured_counter - 20, 0)    # Subtract 20 for each 0, min 0
+                structured_counter = max(structured_counter - 5, 0)   # Changed from -10 to -5 (much less penalty)
         
-            # Check if we should start a new region (only if we haven't started from consecutive 1's)
-            if structured_counter > 15 and not in_structured_region:    # 15 is the threshold to start
+            # Check if we should start a new region (much more liberal threshold)
+            if structured_counter > 5 and not in_structured_region:   # Changed from 8 to 5
                 start = i+1
                 in_structured_region = True
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Structured region started at index {i} (counter: {structured_counter})")
             
-            # Check if we should end the current region
-            elif structured_counter <= 5 and in_structured_region:
+            # Check if we should end the current region (very liberal ending)
+            elif structured_counter <= 1 and in_structured_region:  # Changed from 2 to 1
                 end = i+1
                 in_structured_region = False
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Structured region ended at index {i} (counter: {structured_counter})")
                 
-                # Only add regions that are long enough, 30 aa
+                # Only add regions that are long enough (very liberal minimum length)
                 region_length = end - start
-                if region_length >=30:
+                if region_length >= 15:  # Changed from 20 to 15 amino acids
                     regions.append((start, end))
                     if RANK == 0 and seq_idx < 3:
                         print(f"    Added region: ({start}, {end}) length: {region_length}")
@@ -791,10 +796,10 @@ def regions_search(all_preds, sequence_metadata=None):
                 
                 start = None
         
-        # Handle case where sequence ends while in a structured region
+        # Handle case where sequence ends while in a structured region (very liberal)
         if in_structured_region and start is not None:
             region_length = seq_len - start
-            if region_length >= 50:
+            if region_length >= 10:  # Changed from 20 to 10 (very short regions allowed at end)
                 regions.append((start, seq_len))
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Region ended at sequence end: ({start}, {seq_len}) length: {region_length}")
@@ -856,7 +861,6 @@ def parse_arguments():
     parser.add_argument("--input", type=str, required=True, help="Input file path")
     parser.add_argument("--output", type=str, default="./tempTest/predicted_domain_regions.pkl", help="Output file path")
     parser.add_argument("--model", type=str, required=True, help="ESM model name")
-    parser.add_argument("--vram", type=int, default=8, help="VRAM amount")
     parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
     return parser.parse_args()
 

@@ -1,3 +1,4 @@
+import datetime
 import gc
 import os
 import subprocess
@@ -38,6 +39,7 @@ if not dist.is_initialized():
         backend="nccl" if torch.cuda.is_available() else "gloo",
         rank=int(os.environ["RANK"]),
         world_size=int(os.environ["WORLD_SIZE"]),
+        timeout=datetime.timedelta(seconds=6000),
     )
 
 
@@ -67,7 +69,8 @@ TRAIN_FRAC = 0.8
 VAL_FRAC = 0.2
 
 
-EMB_BATCH = 64//4
+VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
+EMB_BATCH = 32 if VRAM >= 24 else 16 if VRAM >= 16 else 8 if VRAM >= 8 else 4
 
 
 # -------------------------
@@ -143,7 +146,7 @@ class ESMDataset:
             end = int(row["end"])
             return sequence[start:end]
 
-        def subsampler(df, target):
+        def subsampler(df, target, first_subsampler):
             if target is None:
                 return df
 
@@ -190,9 +193,10 @@ class ESMDataset:
                             if i > 0 and i <= len(selected_ids)
                             else "other"
                         )
-                        print(
-                            f"Class {i} with ID {pfam_id}: {final_counts[i]} from samples | avg length {df[df['label'] == i][sequence_col].str.len().mean():.2f}"
-                        )
+                        if first_subsampler is True:
+                            print(
+                                f"Class {i} with ID {pfam_id}: {final_counts[i]} from samples | avg length {df[df['label'] == i][sequence_col].str.len().mean():.2f}"
+                            )
 
                         all_pfam.append(pfam_id)
 
@@ -246,10 +250,12 @@ class ESMDataset:
                     chunk_iter = pd.read_csv(csv_path, chunksize=10000000)
                     self.usage_mode = True
 
+                first_subsampler = True
+
                 for chunk_num, chunk in enumerate(chunk_iter):
                     if RANK == 0:
                         print(
-                            f"Processing chunk {chunk_num+1}/{expected_chunks} with {len(chunk)} sequences"
+                            f"Processing chunk {chunk_num + 1}/{expected_chunks} with {len(chunk)} sequences"
                         )
                     if "start" in chunk.columns and "end" in chunk.columns:
                         if training is True:
@@ -274,10 +280,9 @@ class ESMDataset:
                     if category_col != "Pfam_id":
                         chunk["label"] = chunk[category_col].apply(map_label)
 
-                    elif (
-                        domain_boundary_detection is False and self.usage_mode is False
-                    ):
+                    elif domain_boundary_detection is False and self.usage_mode is False:
                         # Create mapping once outside the apply function
+
                         unique_pfam_ids = chunk[category_col].unique()
 
                         # Count occurrences of each Pfam ID
@@ -471,7 +476,7 @@ class ESMDataset:
                             chunk[category_col].map(pfam_to_label).fillna(0)
                         )
 
-                        chunk = subsampler(chunk, 100000)
+                        chunk = subsampler(chunk, 100000, first_subsampler)
 
                     if self.training is False:
                         self.all_starts = chunk["start"].tolist()
@@ -512,7 +517,7 @@ class ESMDataset:
                             idx_multiplied,
                         ) = self._embed(sequences)
                     else:
-                        embeddings, labels, idx_multiplied= self._embed(
+                        embeddings, labels, _, _, idx_multiplied = self._embed(
                             sequences
                         )
 
@@ -552,8 +557,6 @@ class ESMDataset:
                             f"Time per sequence: {embedding_time / len(sequences):.4f} seconds | "
                             f"Sequences per second: {len(sequences) / embedding_time:.2f}"
                         )
-
-
 
                     if self.training is True and self.usage_mode is False:
                         # print("Creating stratified train/val split...")
@@ -606,8 +609,11 @@ class ESMDataset:
                             save_path = (
                                 "./tempTest/embeddings/embeddings_domain_classifier.h5"
                             )
+                            os.makedirs("./tempTest/embeddings", exist_ok=True)
+
                         else:
                             save_path = f"./temp/embeddings_classification_{self.num_classes - 1}d.h5"
+                            os.makedirs("./temp", exist_ok=True)
 
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
@@ -674,13 +680,16 @@ class ESMDataset:
                     else:
                         del embeddings, labels, starts, ends, idx_multiplied
                     del sequences, chunk
-                    if hasattr(self, 'chunk'):
+                    if hasattr(self, "chunk"):
                         del self.chunk
-                    
+
                     # Force garbage collection after each chunk
                     import gc
+
                     gc.collect()
-    
+
+                    first_subsampler = False    
+
                 print("Done Embedding! Closing Embedder")
 
             if self.domain_boundary_detection is True:
@@ -754,7 +763,7 @@ class ESMDataset:
                         self.idx_multiplied,
                     ) = self._embed(sequences)
                 else:
-                    self.embeddings, self.labels, idx_multiplied = self._embed(
+                    self.embeddings, self.labels, _, _, idx_multiplied = self._embed(
                         sequences
                     )
 
@@ -784,9 +793,9 @@ class ESMDataset:
             fsdp_params = dict(
                 mixed_precision=True,
                 flatten_parameters=True,
-                state_dict_device=torch.device("cpu"),  # reduce GPU mem usage
-                cpu_offload=True,  # enable cpu offloading
-            )
+                state_dict_device=torch.device("cpu"),
+                cpu_offload=True,)
+
             with enable_wrap(wrapper_cls=FSDP, **fsdp_params):
                 model, vocab = esm.pretrained.load_model_and_alphabet_core(
                     model_name, model_data, regression_data
@@ -1084,7 +1093,7 @@ class ESMDataset:
             num_replicas=dist.get_world_size(),
             rank=RANK,
             shuffle=False,
-            drop_last=False,
+            drop_last=True,
         )
 
         if self.usage_mode is True:
@@ -1114,7 +1123,7 @@ class ESMDataset:
         dataloader = DataLoader(
             seq_dataset,
             batch_size=self.emb_batch,
-            num_workers=0,
+            num_workers=min(16, os.cpu_count()),
             sampler=sampler,
             pin_memory=True,
         )
@@ -1416,9 +1425,6 @@ class ESMDataset:
                 local_embeddings = torch.cat(all_embeddings, dim=0)
                 local_labels = torch.cat(all_labels, dim=0)
 
-                
-
-
             if self.training is False:
                 local_starts = (
                     torch.cat(all_starts, dim=0)
@@ -1430,7 +1436,6 @@ class ESMDataset:
                     if all_ends
                     else torch.empty(0, dtype=torch.long)
                 )
-                
 
         #     # Print the shapes of the gathered data
         #     print(
@@ -1458,12 +1463,14 @@ class ESMDataset:
         # NOT NEEDED FOR DOMAIN BOUDNARY TASK
 
         if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
-
             all_embeddings.clear()
             all_labels.clear()
             print(len(local_embeddings), "local embeddings size")
             final_embeddings = local_embeddings
             final_labels = local_labels
+            if self.training is False:
+                final_starts = local_starts
+                final_ends = local_ends
         #     # Gather embeddings and labels from all processes
         #     local_size = torch.tensor(
         #         [local_embeddings.size(0)], dtype=torch.int64, device="cuda"
@@ -1717,12 +1724,12 @@ class ESMDataset:
                 final_labels,
                 final_starts,
                 final_ends,
-                idx_multiplied,
-            )
+                idx_multiplied
+                ) 
         elif self.domain_boundary_detection is True:
             return None, None, None, None, idx_multiplied
         else:
-            return final_embeddings, final_labels, idx_multiplied
+            return final_embeddings, final_labels, None, None, idx_multiplied
 
 
 if __name__ == "__main__":
