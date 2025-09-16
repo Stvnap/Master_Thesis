@@ -16,7 +16,9 @@ from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-
+os.environ["NCCL_TIMEOUT"] = "36000000"  # 10 hours in milliseconds
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 world_size = int(os.environ.get("WORLD_SIZE", 1))
 use_ddp = world_size > 1
 
@@ -39,7 +41,7 @@ if not dist.is_initialized():
         backend="nccl" if torch.cuda.is_available() else "gloo",
         rank=int(os.environ["RANK"]),
         world_size=int(os.environ["WORLD_SIZE"]),
-        timeout=datetime.timedelta(seconds=6000),
+        timeout=datetime.timedelta(seconds=36000),
     )
 
 
@@ -841,8 +843,7 @@ class ESMDataset:
                     zip(seq_dataset.seqs, seq_dataset.labels)
                 ):
                     if len(seq) > 1000:
-                        if RANK == 0:
-                            count += 1
+                        count += 1
                         slices = [
                             seq[i : i + dimension]
                             for i in range(0, len(seq) - dimension + 1, stepsize)
@@ -874,8 +875,7 @@ class ESMDataset:
                     )
                 ):
                     if len(seq) > 1000:
-                        if RANK == 0:
-                            count += 1
+                        count += 1
                         slices = [
                             seq[i : i + dimension]
                             for i in range(0, len(seq) - dimension + 1, stepsize)
@@ -1108,9 +1108,13 @@ class ESMDataset:
                     )
                     # Recalculate num_samples to avoid padding
                     self.total_size = len(self.dataset)
-                    self.num_samples = self.total_size // self.num_replicas
-                    if self.rank < self.total_size % self.num_replicas:
-                        self.num_samples += 1
+                    samples_per_rank = self.total_size // self.num_replicas
+                    remainder = self.total_size % self.num_replicas
+                    
+                    if self.rank < remainder:
+                        self.num_samples = samples_per_rank + 1
+                    else:
+                        self.num_samples = samples_per_rank
 
             sampler = CustomDistributedSampler(
                 seq_dataset,
@@ -1417,6 +1421,7 @@ class ESMDataset:
                     gc.collect()
                     torch.cuda.empty_cache()
                     chunk = 1
+                    dist.barrier()  # Synchronize all ranks before continuing
 
             else:
                 # basic way for ID classification, just store the embeddings and labels

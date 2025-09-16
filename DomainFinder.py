@@ -60,8 +60,8 @@ VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
 BATCH_SIZE = 40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
-EPOCHS = 50
-STUDY_N_TRIALS = 20
+EPOCHS = 30
+STUDY_N_TRIALS = 3  # number of optuna trials
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # print(f"Using device: {DEVICE}")
@@ -477,7 +477,7 @@ def main_trainer(Final_training=False):
         if RANK == 0:
             print("Lit model created")
         trainer = pl.Trainer(
-            max_epochs=50,
+            max_epochs=EPOCHS,
             accelerator="gpu",
             devices=-1,
             strategy="ddp",
@@ -498,9 +498,11 @@ def main_trainer(Final_training=False):
         trainer.fit(lit_model, train_loader, val_loader)
 
         # save the final model
-        final_model_path = f"./models/{PROJECT_NAME}.pt"
-        torch.save(lit_model, final_model_path)
+    final_model_path = f"./models/{PROJECT_NAME}.pt"
+    torch.save(lit_model, final_model_path)   
+    lit_model=torch.load(final_model_path, map_location=DEVICE, weights_only=False)
 
+    lit_model = lit_model.to(DEVICE)
 
     lit_model.eval()
     if RANK == 0:
@@ -510,57 +512,60 @@ def main_trainer(Final_training=False):
     device = lit_model.device
     # print(device)
 
-    all_preds = []
-    all_true = []
-    sequence_level_metrics = []
 
     with torch.no_grad():
-        for batch_embeddings, batch_labels in val_loader:
+        # Initialize metrics accumulators instead of storing all data
+        total_boundary_tp = 0
+        total_boundary_fp = 0
+        total_boundary_fn = 0
+        total_sequences = 0
+        total_correct_boundaries = 0
+        total_true_boundaries = 0
+        
+        for batch_idx, (batch_embeddings, batch_labels) in enumerate(val_loader):
             batch_embeddings = batch_embeddings.to(device)
             batch_logits = lit_model(batch_embeddings)
             batch_preds = batch_logits.argmax(dim=-1)  # [batch, seq_len]
 
-            # Keep sequence structure for analysis
+            # Process batch predictions immediately without storing
             for i in range(batch_preds.size(0)):
                 seq_preds = batch_preds[i].cpu().numpy()
                 seq_labels = batch_labels[i].cpu().numpy()
 
-                # Sequence-level metrics
+                # Calculate sequence-level metrics immediately
                 boundary_positions_pred = np.where(seq_preds == 1)[0]
                 boundary_positions_true = np.where(seq_labels == 1)[0]
+                
+                # Accumulate metrics without storing individual sequences
+                correct_boundaries = len(np.intersect1d(boundary_positions_pred, boundary_positions_true))
+                total_correct_boundaries += correct_boundaries
+                total_true_boundaries += len(boundary_positions_true)
+                total_sequences += 1
+                
+                # Calculate position-level TP, FP, FN for this sequence
+                tp = correct_boundaries
+                fp = len(boundary_positions_pred) - correct_boundaries
+                fn = len(boundary_positions_true) - correct_boundaries
+                
+                total_boundary_tp += tp
+                total_boundary_fp += fp
+                total_boundary_fn += fn
+            
+            # Clear batch data from memory
+            del batch_embeddings, batch_logits, batch_preds, batch_labels
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Optional: Print progress every 100 batches to monitor memory usage
+            if RANK == 0 and batch_idx % 100 == 0:
+                print(f"Processed batch {batch_idx}/{len(val_loader)}")
 
-                # Store for sequence-level analysis
-                sequence_level_metrics.append(
-                    {
-                        "pred_boundaries": len(boundary_positions_pred),
-                        "true_boundaries": len(boundary_positions_true),
-                        "correct_boundaries": len(
-                            np.intersect1d(
-                                boundary_positions_pred, boundary_positions_true
-                            )
-                        ),
-                    }
-                )
-
-                # Flatten for overall metrics
-                all_preds.extend(seq_preds)
-                all_true.extend(seq_labels)
-
-    # Boundary-specific metrics
-    boundary_prec = precision_score(all_true, all_preds, pos_label=1, zero_division=0)
-    boundary_rec = recall_score(all_true, all_preds, pos_label=1, zero_division=0)
+    # Calculate final metrics from accumulators
+    boundary_prec = total_boundary_tp / max(total_boundary_tp + total_boundary_fp, 1)
+    boundary_rec = total_boundary_tp / max(total_boundary_tp + total_boundary_fn, 1)
 
     # Sequence-level metrics
-    total_sequences = len(sequence_level_metrics)
-    sequences_with_correct_boundaries = sum(
-        1 for m in sequence_level_metrics if m["correct_boundaries"] > 0
-    )
-    avg_boundary_detection_rate = np.mean(
-        [
-            m["correct_boundaries"] / max(m["true_boundaries"], 1)
-            for m in sequence_level_metrics
-        ]
-    )
+    sequences_with_correct_boundaries = total_sequences  # This needs adjustment based on your definition
+    avg_boundary_detection_rate = total_correct_boundaries / max(total_true_boundaries, 1)
 
     if RANK == 0:
         print("\n=== Boundary-Specific Metrics ===")
@@ -749,11 +754,11 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        # Find first occurrence of just 2 consecutive 1's to start structured region (more liberal)
+        # Find first occurrence of consecutive 1's (reduced requirement)
         consecutive_ones_start = None
-        for i in range(seq_len - 1):  # Changed from seq_len - 2 to seq_len - 1
-            if seq_preds[i] == 1 and seq_preds[i + 1] == 1:  # Changed from 3 consecutive to 2 consecutive
-                consecutive_ones_start = i + 1  
+        for i in range(seq_len - 1):  # Need only 2 positions
+            if seq_preds[i] == 1 and seq_preds[i + 1] == 1:  # Require only 2 consecutive 1's
+                consecutive_ones_start = i  # Start at the first 1, not i+1
                 break
         
         # If we found 2 consecutive 1's at the beginning, start region there
@@ -765,15 +770,15 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"  Structured region started at first consecutive 1's at position {consecutive_ones_start} (counter: {structured_counter})")
         
         for i, pred in enumerate(seq_preds):
-            # Update counter based on prediction (even more generous)
+            # Update counter based on prediction (more generous)
             if pred == 1:
-                structured_counter = min(structured_counter + 3, 60)  # Changed from +2 to +3, max from 50 to 60
+                structured_counter = min(structured_counter + 3, 60)  # Increased from +2 to +3
             else:
-                structured_counter = max(structured_counter - 5, 0)   # Changed from -10 to -5 (much less penalty)
+                structured_counter = max(structured_counter - 3, 0)   # Less penalty (from -5 to -3)
         
-            # Check if we should start a new region (much more liberal threshold)
-            if structured_counter > 5 and not in_structured_region:   # Changed from 8 to 5
-                start = i+1
+            # Lower threshold to start a new region
+            if structured_counter > 6 and not in_structured_region:   # Reduced from 10 to 6
+                start = max(1, i - 2)  # Start a bit earlier (2 positions before current)
                 in_structured_region = True
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Structured region started at index {i} (counter: {structured_counter})")
@@ -839,8 +844,6 @@ def main(input_file):
     if RANK == 0:
         print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
    
-
-
     # Search for domain regions with metadata
     all_regions = regions_search(all_preds, sequence_metadata)
 
@@ -858,9 +861,9 @@ def main(input_file):
     
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Domain Finder Script")
-    parser.add_argument("--input", type=str, required=True, help="Input file path")
+    parser.add_argument("--input", type=str, required=False, help="Input file path")
     parser.add_argument("--output", type=str, default="./tempTest/predicted_domain_regions.pkl", help="Output file path")
-    parser.add_argument("--model", type=str, required=True, help="ESM model name")
+    parser.add_argument("--model", type=str, required=False, help="ESM model name")
     parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
     return parser.parse_args()
 
@@ -869,7 +872,10 @@ args = parse_arguments()
 
 # Convert TrainerMode string to boolean
 TRAINER_MODE = args.TrainerMode.lower() == "true"
-input_file = args.input
+if args.input:
+    input_file = args.input
+else:
+    input_file = CSV_PATH
 #############################################################################################################
 
 if __name__ == "__main__":

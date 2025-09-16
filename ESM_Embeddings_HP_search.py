@@ -438,6 +438,8 @@ class LitClassifier(pl.LightningModule):
                 self.parameters(),
                 lr=self.lr,
                 nesterov=True,
+                momentum=0.9,  # Add momentum for SGD
+                dampening=0,   # Set dampening to 0 for Nesterov
             )
         elif self.optimizer_class in [torch.optim.Adam, torch.optim.AdamW, torch.optim.NAdam]:
             optimizer = self.optimizer_class(
