@@ -1028,6 +1028,7 @@ class ESMDataset:
             all_ends = []
 
         seqs = list(seqs)
+        # print(len(seqs))
 
         start_time = time.time()
 
@@ -1055,7 +1056,7 @@ class ESMDataset:
             seq_dataset = SeqDataset(seqs, self.labels)
 
         # if RANK == 0:
-        # print(seq_dataset.labels.shape)
+        print(len(seq_dataset))
 
         if self.training is True:
             new_seqs, new_labels, idx_multiplied = windower(
@@ -1066,8 +1067,13 @@ class ESMDataset:
                 stepsize=500, dimension=1000
             )
 
+
         seq_dataset.seqs = new_seqs
         seq_dataset.labels = new_labels
+
+        # print("AFTER",len(seq_dataset))
+
+
         if self.training is False:
             seq_dataset.starts = new_starts
             seq_dataset.ends = new_ends
@@ -1095,6 +1101,8 @@ class ESMDataset:
             shuffle=False,
             drop_last=True,
         )
+
+        # print(len(seq_dataset))
 
         if self.usage_mode is True:
             # For usage mode or domain boundary detection, we need to ensure all sequences are processed
@@ -1235,42 +1243,37 @@ class ESMDataset:
                     all_starts.append(batch_start)
                     all_ends.append(batch_end)
 
-                # Progress reporting, nothing special here
-                if (
-                    batch_num % 100 == 0
-                    or batch_num == len(dataloader) - 1
-                    or batch_num == 0
-                    and RANK == 0
-                ):
-                    elapsed_time = time.time() - start_time
-                    if batch_num > 0:
-                        avg_time_per_batch = elapsed_time / (batch_num + 1)
-                        remaining_batches = len(dataloader) - batch_num - 1
-                        eta_seconds = remaining_batches * avg_time_per_batch
+                from tqdm import tqdm
 
-                        eta_hours = int(eta_seconds // 3600)
-                        eta_minutes = int((eta_seconds % 3600) // 60)
-                        eta_seconds_remainder = int(eta_seconds % 60)
-                        if RANK == 0:
-                            # summary.print_(sum1)
+                # Then replace your print statement with this tqdm implementation:
+                if batch_num == 0 and RANK == 0:
+                    # Initialize progress bar only once at the beginning
+                    progress_bar = tqdm(
+                        total=len(dataloader),
+                        desc="Embedding Data",
+                        position=0,
+                        leave=True,
+                        ncols=150  # Set a wider display for more info
+                    )
 
-                            # Add RAM monitoring
-                            process = psutil.Process(os.getpid())
-                            memory_info = process.memory_info()
-                            memory_gb = memory_info.rss / 1024 / 1024 / 1024
-
-                            system_memory = psutil.virtual_memory()
-                            total_gb = system_memory.total / 1024 / 1024 / 1024
-                            available_gb = system_memory.available / 1024 / 1024 / 1024
-                            used_percent = system_memory.percent
-
-                            print(
-                                f"R{RANK}: {batch_num + 1}/{len(dataloader)} | "
-                                f"{eta_hours:02d}:{eta_minutes:02d}:{eta_seconds_remainder:02d} | "
-                                f"RAM: {memory_gb:.1f}GB ({used_percent:.0f}%, {available_gb:.1f}GB free) total {total_gb:.1f}GB | ",
-                                end="\r",
-                                flush=True,
-                            )
+                # Inside your loop, replace the current print statement with:
+                if (batch_num % 1 == 0 or batch_num == len(dataloader) - 1 or batch_num == 0) and RANK == 0:
+                    # Get memory stats
+                    process = psutil.Process(os.getpid())
+                    memory_info = process.memory_info()
+                    memory_gb = memory_info.rss / 1024 / 1024 / 1024
+                    
+                    system_memory = psutil.virtual_memory()
+                    total_gb = system_memory.total / 1024 / 1024 / 1024
+                    available_gb = system_memory.available / 1024 / 1024 / 1024
+                    used_percent = system_memory.percent
+                                        
+                    # Update progress bar with all information
+                    progress_bar.update(1 if batch_num == 0 else min(100, batch_num - progress_bar.n))
+                    progress_bar.set_postfix({
+                        'RAM': f"{memory_gb:.1f}GB ({used_percent:.0f}%, {available_gb:.1f}GB free)",
+                        'Total': f"{total_gb:.1f}GB"
+                    })
 
             except Exception as e:
                 # Handle exceptions during batch processing, if vram blows up, we will try to process each sequence individually

@@ -1297,8 +1297,7 @@ class ClassifierDataset(torch.utils.data.Dataset):
             # Get embedding keys (could be train_embeddings_ or just embeddings_)
             self.embedding_keys = sorted([
                 k for k in f.keys() 
-                if k.startswith("embeddings_") or k.startswith("train_embeddings_")
-            ])
+                if k.startswith("embeddings_") ])
             self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
             self.cumulative_sizes = np.cumsum(self.chunk_sizes)
             self.length = (

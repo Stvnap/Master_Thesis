@@ -731,7 +731,6 @@ def Predictor(model, domain_boudnary_set_loader):
 
     return all_sequence_preds, sequence_metadata
 
-
 def regions_search(all_preds, sequence_metadata=None):
     """
     Function to search for domain regions in the predictions.
@@ -744,6 +743,7 @@ def regions_search(all_preds, sequence_metadata=None):
         start = None
         structured_counter = 0
         in_structured_region = False
+        last_region_end = -1  # Track the end of the last region
         
         # Get actual sequence length from metadata
         seq_len = len(seq_preds)
@@ -754,46 +754,53 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        # Find first occurrence of consecutive 1's (reduced requirement)
-        consecutive_ones_start = None
-        for i in range(seq_len - 1):  # Need only 2 positions
-            if seq_preds[i] == 1 and seq_preds[i + 1] == 1:  # Require only 2 consecutive 1's
-                consecutive_ones_start = i  # Start at the first 1, not i+1
+        # Find FIRST occurrence of ANY 1 (not just consecutive)
+        first_positive = None
+        for i in range(seq_len):
+            if seq_preds[i] == 1:
+                first_positive = i
                 break
         
-        # If we found 2 consecutive 1's at the beginning, start region there
-        if consecutive_ones_start is not None:
-            start = consecutive_ones_start
+        # If we found ANY 1, start region MUCH earlier before it
+        if first_positive is not None:
+            # Start 15 positions before first positive (reduced from 25)
+            start = max(0, first_positive - 15)  
             in_structured_region = True
-            structured_counter = 20  # Increased from 15 to 20 for more stability
+            structured_counter = 35  # Keep initial counter
             if RANK == 0 and seq_idx < 3:
-                print(f"  Structured region started at first consecutive 1's at position {consecutive_ones_start} (counter: {structured_counter})")
+                print(f"  Structured region started at position {start} (15 before first positive at {first_positive})")
         
         for i, pred in enumerate(seq_preds):
-            # Update counter based on prediction (more generous)
+            # Update counter based on prediction
             if pred == 1:
-                structured_counter = min(structured_counter + 3, 60)  # Increased from +2 to +3
+                structured_counter = min(structured_counter + 6, 60)  # Keep same increment
             else:
-                structured_counter = max(structured_counter - 3, 0)   # Less penalty (from -5 to -3)
+                structured_counter = max(structured_counter - 2, 0)   # Increase penalty from -1 to -2
         
-            # Lower threshold to start a new region
-            if structured_counter > 6 and not in_structured_region:   # Reduced from 10 to 6
-                start = max(1, i - 2)  # Start a bit earlier (2 positions before current)
-                in_structured_region = True
-                if RANK == 0 and seq_idx < 3:
-                    print(f"  Structured region started at index {i} (counter: {structured_counter})")
+            # Even lower threshold to start a new region
+            if structured_counter > 6 and not in_structured_region:  # Increased from 2 to 6
+                # Start with smaller offset - 15 positions before current (reduced from 25)
+                potential_start = max(0, i - 15)
+                
+                # Ensure we don't overlap with the previous region
+                if potential_start > last_region_end:
+                    start = potential_start
+                    in_structured_region = True
+                    if RANK == 0 and seq_idx < 3:
+                        print(f"  Structured region started at index {start} (15 before trigger at {i})")
             
-            # Check if we should end the current region (very liberal ending)
-            elif structured_counter <= 1 and in_structured_region:  # Changed from 2 to 1
-                end = i+1
+            # Higher threshold to end current region (from 3 to 2)
+            elif structured_counter <= 2 and in_structured_region:  # Decreased from 3 to 2
+                end = i  # End at current position
                 in_structured_region = False
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Structured region ended at index {i} (counter: {structured_counter})")
                 
-                # Only add regions that are long enough (very liberal minimum length)
+                # Only add regions that are long enough
                 region_length = end - start
-                if region_length >= 15:  # Changed from 20 to 15 amino acids
+                if region_length >= 20:
                     regions.append((start, end))
+                    last_region_end = end  # Update the last region end
                     if RANK == 0 and seq_idx < 3:
                         print(f"    Added region: ({start}, {end}) length: {region_length}")
                 elif RANK == 0 and seq_idx < 3:
@@ -801,10 +808,10 @@ def regions_search(all_preds, sequence_metadata=None):
                 
                 start = None
         
-        # Handle case where sequence ends while in a structured region (very liberal)
+        # Handle case where sequence ends while in a structured region
         if in_structured_region and start is not None:
             region_length = seq_len - start
-            if region_length >= 10:  # Changed from 20 to 10 (very short regions allowed at end)
+            if region_length >= 20:
                 regions.append((start, seq_len))
                 if RANK == 0 and seq_idx < 3:
                     print(f"  Region ended at sequence end: ({start}, {seq_len}) length: {region_length}")

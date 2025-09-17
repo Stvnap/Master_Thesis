@@ -299,12 +299,6 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
     Function to create a final DataFrame with the results.
     This function will take the predictions and create a final DataFrame with the results.
     """
-
-    # print(f"\n=== Dataframer Debug Info ===")
-    # print(f"Number of predictions: {len(all_predictions)}")
-    # print(f"Number of DataFrame rows: {len(cut_df)}")
-
-    # Verify lengths match
     if len(all_predictions) != len(cut_df):
         print(f"Length mismatch: {len(all_predictions)} predictions vs {len(cut_df)} DataFrame rows")
         
@@ -323,7 +317,7 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
             if total_extra_needed == actual_extra:
                 print("✓ The mismatch is explained by sequence windowing!")
                 
-                # Create the expanded DataFrame by duplicating rows for windowed sequences
+                # Create the expanded DataFrame by creating windows from sequences
                 expanded_rows = []
                 
                 for idx, row in cut_df.iterrows():
@@ -335,18 +329,52 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
                             break
                     
                     if matching_long_seq:
-                        # This sequence was windowed, duplicate the row
-                        num_windows = matching_long_seq['num_windows']
-                        for window_idx in range(num_windows):
+                        # This sequence needs to be windowed
+                        sequence = row['Sequence']
+                        seq_length = len(sequence)
+                        dimension = 1000  # Window size
+                        stepsize = 500    # Step size
+                        
+                        # Create sliding windows
+                        window_start_positions = list(range(0, seq_length - dimension + 1, stepsize))
+                        
+                        # Add the last window if needed
+                        if seq_length % dimension != 0 and seq_length > dimension:
+                            window_start_positions.append(seq_length - dimension)
+                        
+                        # Create a row for each window
+                        # Create a row for each window - MODIFIED VERSION
+                        for window_idx, start_pos in enumerate(window_start_positions):
+                            end_pos = start_pos + dimension
+                            window_seq = sequence[start_pos:end_pos]
+                            
+                            # Create a copy of the row for this window
                             row_copy = row.copy()
-                            # Optionally, you can add a suffix to indicate this is a windowed prediction
-                            if window_idx > 0:  # Only add suffix for additional windows
-                                row_copy['Sequence_ID'] = f"{row_copy['Sequence_ID']}_{window_idx+1}"
+                            row_copy['Sequence'] = window_seq
+                            row_copy['Sequence_ID'] = f"{row_copy['Sequence_ID']}_{window_idx+1}"
+                            row_copy['Window_Start_Pos'] = int(start_pos)
+                            row_copy['Window_End_Pos'] = int(end_pos)
+                            
+                            # Adjust domain coordinates for this window
+                            domain_start = row['Domain_Start']
+                            domain_end = row['Domain_End']
+                            
+                            # Calculate domain positions relative to window
+                            window_domain_start = max(0, domain_start - start_pos)
+                            window_domain_end = min(dimension, domain_end - start_pos)
+                            
+                            # Set domain coordinates even if not overlapping
+                            row_copy['Domain_Start'] = window_domain_start if window_domain_end > 0 and window_domain_start < dimension else -1
+                            row_copy['Domain_End'] = window_domain_end if window_domain_end > 0 and window_domain_start < dimension else -1
+                            
+                            # Add EVERY window, not just those with domain overlap
                             expanded_rows.append(row_copy)
-                            print(f"  Added window {window_idx} for sequence {row_copy.get('Sequence_ID', 'N/A')}")
+                            print(f"  Added window {window_idx} for sequence {row_copy['Sequence_ID']}: positions {start_pos}-{end_pos}")
                     else:
                         # Normal sequence, add as-is
                         expanded_rows.append(row)
+                        row['Window_Start_Pos'] = 0
+                        row['Window_End_Pos'] = len(row['Sequence'])
                 
                 # Create new DataFrame with expanded rows
                 df = pd.DataFrame(expanded_rows).reset_index(drop=True)
@@ -373,10 +401,35 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
     # convert all_predictions to the actual pfam IDs
     with open("./temp/selected_pfam_ids_1000.txt", "r") as f:
         pfam_ids = [line.strip() for line in f.readlines()]
-        all_predictions = [pfam_ids[pred] if pred < len(pfam_ids) else "Unknown" for pred in all_predictions]
+        all_predictions = [pfam_ids[pred] if pred > 0 and pred < len(pfam_ids) else "Unknown" for pred in all_predictions]
 
     # Add predictions to DataFrame
     df.insert(2, "Prediction", all_predictions)
+    
+
+    
+    # Reorder columns to put Window_Start_Pos and Window_End_Pos after Sequence_Length
+    if 'Window_Start_Pos' in df.columns and 'Window_End_Pos' in df.columns:
+
+        df["Window_Start_Pos"] =  df["Window_Start_Pos"].astype(int)
+        df["Window_End_Pos"] =  df["Window_End_Pos"].astype(int)
+
+        # Get all column names
+        cols = df.columns.tolist()
+        
+        # Remove Window position columns from current positions
+        cols.remove('Window_Start_Pos')
+        cols.remove('Window_End_Pos')
+        
+        # Find position of Sequence_Length
+        seq_length_pos = cols.index('Sequence_Length')
+        
+        # Insert Window position columns after Sequence_Length
+        cols.insert(seq_length_pos + 1, 'Window_Start_Pos')
+        cols.insert(seq_length_pos + 2, 'Window_End_Pos')
+        
+        # Reorder DataFrame columns
+        df = df[cols]
 
     # Save to CSV
     df.to_csv(output_file, index=False)
