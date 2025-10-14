@@ -23,6 +23,7 @@ from ESM_Embeddings_HP_search import (
     objective,
 )
 
+    
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))# BATCH_SIZE = 10000
 
 if not dist.is_initialized():
@@ -586,6 +587,8 @@ def loader(ESM_Model, input_file):
 
     os.makedirs("tempTest/embeddings", exist_ok=True)
     if not os.path.exists("./tempTest/embeddings/embeddings_domain.h5"):
+        if RANK == 0:
+            print("Generating embeddings with ESM model...")
         ESMDataset(
             FSDP_used=False,
             domain_boundary_detection=True,
@@ -596,9 +599,14 @@ def loader(ESM_Model, input_file):
             sequence_col=SEQUENCE_COL,
             emb_batch=1,
         )
-        print("Using preembedded ESM data from scratch")
+        if RANK == 0:
+            print("Embeddings generated and saved.")
+    else:
+        if RANK == 0:
+            print("Using preembedded ESM data from scratch")
 
-    print("Creating DomainBoundaryDataset from embeddings in H5 file...")
+    if RANK == 0:
+        print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
     domain_boundary_dataset = DomainBoundaryDataset("./tempTest/embeddings/embeddings_domain.h5")
 
@@ -609,7 +617,8 @@ def loader(ESM_Model, input_file):
     # Ensure the actual_seq_lengths matches the dataset size
     dataset_size = len(domain_boundary_dataset)
     if len(csv_seq_lengths) != dataset_size:
-        print(f"Warning: CSV has {len(csv_seq_lengths)} sequences but dataset has {dataset_size} samples")
+        if RANK == 0:
+            print(f"Warning: CSV has {len(csv_seq_lengths)} sequences but dataset has {dataset_size} samples")
         # Truncate or pad the sequence lengths to match dataset size
         actual_seq_lengths = csv_seq_lengths[:dataset_size]
 
@@ -617,12 +626,14 @@ def loader(ESM_Model, input_file):
         actual_seq_lengths = csv_seq_lengths
 
     sample_embedding, sample_label = domain_boundary_dataset[0]
-    print("shapes:", sample_embedding.dim(), sample_label.dim())
+    if RANK == 0:
+        print("shapes:", sample_embedding.dim(), sample_label.dim())
 
     if sample_embedding.dim() == 3 and sample_label.dim() == 2:
-        print(
-            "Squeezing dimensions of embeddings and labels in train and val datasets."
-        )
+        if RANK == 0:
+            print(
+                "Squeezing dimensions of embeddings and labels in train and val datasets."
+            )
         # Create new datasets with squeezed tensors
         domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
 

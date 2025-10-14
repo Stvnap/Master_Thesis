@@ -37,7 +37,7 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
-NUM_CLASSES = 1001  # classes + 1 for "other" class
+NUM_CLASSES = 101  # classes + 1 for "other" class
 if RANK == 0:
     print("USING n CLASSES:",NUM_CLASSES)
 
@@ -884,68 +884,19 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
 # -------------------------
 
 
-def class_distribution(train_dataset, val_dataset, range_train=None, range_val=None):
-    # Set defaults inside the function
-    if range_train is None:
-        range_train = len(train_dataset)
-    if range_val is None:
-        range_val = len(val_dataset)
+def class_distribution(val_dataset):
+    # Fast bulk read for train labels
+    with h5py.File(CACHE_PATH, "r") as f:
+        train_labels = np.concatenate([f[key][:] for key in f.keys() if key.startswith("train_labels_")])
+        val_labels = np.concatenate([f[key][:] for key in f.keys() if key.startswith("val_labels_")])
 
-    if range_val and range_train is not None:
-        if RANK == 0:
-            print("NOT USING FULL SET!")
+    train_class_counts = np.bincount(train_labels, minlength=NUM_CLASSES)
+    val_class_counts = np.bincount(val_labels, minlength=NUM_CLASSES)
 
-
-
-
-    train_labels_all = []
-    for i in range(range_train):
-        _, labels = train_dataset[i]
-        train_labels_all.append(labels.item())
-
-    train_labels_array = np.array(train_labels_all)
-    train_class_counts = np.bincount(train_labels_array, minlength=NUM_CLASSES)
-
-    if RANK == 0:
-        print("Training set label distribution:")
-        for i in range(NUM_CLASSES):
-            print(
-                f"  Class {i}: {train_class_counts[i]} samples ({train_class_counts[i] / range_train * 100:.2f}%)"
-            )
-        print(f"  Total training samples: {range_train}")
-
-    # Count ALL validation labels
-    if RANK == 0:
-        print("Extracting all validation labels for complete class distribution...")
-    val_labels_all = []
-    for i in range(range_val):
-        _, labels = val_dataset[i]
-        val_labels_all.append(labels.item())
-
-    val_labels_array = np.array(val_labels_all)
-    val_class_counts = np.bincount(val_labels_array, minlength=NUM_CLASSES)
-
-    if RANK == 0:
-        print("Validation set label distribution:")
-        for i in range(NUM_CLASSES):
-            print(
-                f"  Class {i}: {val_class_counts[i]} samples ({val_class_counts[i] / range_val * 100:.2f}%)"
-            )
-        print(f"  Total validation samples: {range_val}")
-
-    # Combined statistics
     total_class_counts = train_class_counts + val_class_counts
-    total_samples = range_train + range_val
+    total_samples = len(train_labels) + len(val_labels)
 
-    if RANK == 0:
-        print("Combined dataset label distribution:")
-        for i in range(NUM_CLASSES):
-            print(
-                f"  Class {i}: {total_class_counts[i]} samples ({total_class_counts[i] / total_samples * 100:.2f}%)"
-            )
-        print(f"  Total combined samples: {total_samples}")
-
-    # Calculate class weights based on training set
+    # Calculate class weights
     total_count = train_class_counts.sum()
     weights = torch.tensor(
         [
@@ -953,29 +904,43 @@ def class_distribution(train_dataset, val_dataset, range_train=None, range_val=N
             for count in train_class_counts
         ],
         dtype=torch.float32,
-    )
+    ).to(DEVICE)
+
+
+
+
+ 
+    # # soften weights
+    # alpha = 0.5
+    # weights = weights ** alpha
+    # weights = weights / weights.sum() * NUM_CLASSES  # Normalize to keep mean weight = 1
+
+
+
+    # Optionally print distributions
     if RANK == 0:
-        print("Class weights calculated:", weights.numpy())
-    weights = weights.to(DEVICE)
+        print("Training set label distribution:")
+        for i in range(NUM_CLASSES):
+            print(f"  Class {i}: {train_class_counts[i]} samples ({train_class_counts[i] / len(train_labels) * 100:.2f}%)")
+        print(f"  Total training samples: {len(train_labels)}")
+        print("Validation set label distribution:")
+        for i in range(NUM_CLASSES):
+            print(f"  Class {i}: {val_class_counts[i]} samples ({val_class_counts[i] / len(val_labels) * 100:.2f}%)")
+        print(f"  Total validation samples: {len(val_labels)}")
+        print("Combined dataset label distribution:")
+        for i in range(NUM_CLASSES):
+            print(f"  Class {i}: {total_class_counts[i]} samples ({total_class_counts[i] / total_samples * 100:.2f}%)")
+        print(f"  Total combined samples: {total_samples}")
+        print("Class weights calculated:", weights.cpu().numpy())
+        
 
-    # Create the validation tensors for final evaluation
-    val_embeddings = []
-    val_labels = []
-    if RANK == 0:
-        print("Creating validation tensors for final evaluation...")
-    for i in range(range_val):
-        emb, label = val_dataset[i]
-        val_embeddings.append(emb)
-        val_labels.append(label.item())
+    #with h5py.File(CACHE_PATH, "r") as f:
+    #    val_embeddings = np.concatenate([f[key][:] for key in f.keys() if key.startswith("val_embeddings_")])
+    #val_embeddings = torch.tensor(val_embeddings)
 
-    val_embeddings = torch.stack(val_embeddings)
-    val_labels = torch.tensor(val_labels)
+    val_embeddings=None
 
-    # Clean up intermediate variables
-    del train_labels_all, val_labels_all, train_labels_array, val_labels_array
-
-    # Return the computed values
-    return weights, val_embeddings, val_labels
+    return weights, val_embeddings, val_labels, train_labels
 
 
 # -------------------------
@@ -1080,15 +1045,10 @@ def main_HP(Final_training=False):
     # print("shapes:", sample_embedding.dim(), sample_label.dim())
     # print(sample_embedding, sample_label)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        persistent_workers=True,
-        num_workers=NUM_WORKERS_EMB,
-        pin_memory=True,
-        prefetch_factor=4,
-    )
+
+
+
+
 
     val_loader = DataLoader(
         val_dataset,
@@ -1109,8 +1069,35 @@ def main_HP(Final_training=False):
         print("Calculating class weights and label distributions...")
         print("Extracting all training labels for complete class distribution...")
 
-    weights, val_embeddings, val_labels = class_distribution(
+    weights, val_embeddings, val_labels, train_labels = class_distribution(
         train_dataset, val_dataset, 10000, 10000
+    )
+
+
+    class_counts = torch.bincount(torch.tensor(train_labels))
+    num_samples_per_class = int(class_counts.min().item() * 2)  # Or whatever ratio you want
+    num_samples = num_samples_per_class * NUM_CLASSES
+    # Create sample weights inversely proportional to class frequency
+    sample_weights = [1.0/class_counts[label] for label in train_labels]
+
+
+
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights, 
+        num_samples=min(num_samples, len(train_dataset)),  # Make sure not to sample more than available
+        replacement=False
+    )
+
+
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=sampler,
+        batch_size=BATCH_SIZE,
+        # shuffle=True,
+        persistent_workers=True,
+        num_workers=NUM_WORKERS_EMB,
+        pin_memory=True,
+        prefetch_factor=4,
     )
 
     if RANK == 0:

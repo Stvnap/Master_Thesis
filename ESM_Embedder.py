@@ -3,7 +3,7 @@ import gc
 import os
 import subprocess
 import time
-
+from tqdm import tqdm
 import esm
 import h5py
 import pandas as pd
@@ -132,6 +132,7 @@ class ESMDataset:
         self.all_ends = None
         self.emb_batch = emb_batch
 
+
         def map_label(cat):
             # Adaptive mapping based on NUM_CLASSES
             # Classes 0-9 get mapped to 1-10
@@ -216,49 +217,86 @@ class ESMDataset:
                     print("Loading data...")
 
                     # Count lines using system command (fast for large files)
-                    try:
-                        if num_classes == 101:
-                            expected_chunks = 22
-                        else:
-                            result = subprocess.run(
-                                ["wc", "-l", csv_path], capture_output=True, text=True
-                            )
-                            total_lines = int(result.stdout.split()[0])
-                            total_rows = total_lines - 1  # Subtract header row
+                    # try:
+                        # if num_classes == 101:
+                    expected_chunks = 22
+                    #     else:
+                    #         result = subprocess.run(
+                    #             ["wc", "-l", csv_path], capture_output=True, text=True
+                    #         )
+                    #         total_lines = int(result.stdout.split()[0])
+                    #         total_rows = total_lines - 1  # Subtract header row
 
-                            chunk_size = 10000000
-                            expected_chunks = (
-                                total_rows + chunk_size - 1
-                            ) // chunk_size
+                    #         chunk_size = 10000000
+                    #         expected_chunks = (
+                    #             total_rows + chunk_size - 1
+                    #         ) // chunk_size
 
-                        # print(f"Total rows (excluding header): {total_rows:,}")
-                        print(f"Expected chunks: {expected_chunks}(STATIC PRINT!)")
+                    #     # print(f"Total rows (excluding header): {total_rows:,}")
+                    #     print(f"Expected chunks: {expected_chunks}(STATIC PRINT!)")
 
-                    except Exception as e:
-                        print(f"Could not count lines using wc command: {e}")
-                        expected_chunks = "unknown"
+                    # except Exception as e:
+                    #     print(f"Could not count lines using wc command: {e}")
+                    #     expected_chunks = "unknown"
 
+
+                first_subsampler = True
+
+                # Check for existing progress and resume
+                start_chunk = 0
+                del_key = False
+                if os.path.exists(f"./temp/progress_{num_classes}.txt"):
+                    with open(f"./temp/progress_{num_classes}.txt", "r") as status_file:
+                        lines = status_file.readlines()
+                        if lines:
+                            last_line = lines[-1].strip()
+                            if "Completed chunk" in last_line:  # Look for completed chunks
+                                start_chunk = int(last_line.split(" ")[2]) + 1  # Start from NEXT chunk
+                            else:
+                                start_chunk = int(last_line.split(" ")[2])  # Start from last incomplete chunk
+                                del_key = True
+                            if RANK == 0:
+                                print(f"Resuming from chunk {start_chunk}")
+
+                # Create iterator once and skip processed chunks
                 try:
                     chunk_iter = pd.read_csv(
                         csv_path,
                         usecols=["start", "end", "id", "Pfam_id", "Sequence"],
-                        chunksize=10000000,  # Adjust chunk size as needed
+                        chunksize=1000,
                     )
                 except Exception as e:
                     if RANK == 0:
-                        print(
-                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
-                        )
-                    chunk_iter = pd.read_csv(csv_path, chunksize=10000000)
+                        print(f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}")
+                    chunk_iter = pd.read_csv(csv_path, chunksize=1000) #10000000
                     self.usage_mode = True
 
-                first_subsampler = True
+                # Skip processed chunks
+                for _ in range(start_chunk):
+                    try:
+                        next(chunk_iter)
+                    except StopIteration:
+                        if RANK == 0:
+                            print("All chunks processed. No more chunks to process.")
+                            with open(f"./temp/progress_{num_classes}.txt", "a") as status_file:
+                                if RANK == 0:
+                                    status_file.write("All chunks processed. Exiting.\n")
+                        return
 
-                for chunk_num, chunk in enumerate(chunk_iter):
+
+
+
+
+                # Process remaining chunks
+                for chunk_num, chunk in enumerate(chunk_iter, start=start_chunk):
                     if RANK == 0:
-                        print(
-                            f"Processing chunk {chunk_num + 1}/{expected_chunks} with {len(chunk)} sequences"
-                        )
+                        print(f"Processing chunk {chunk_num}/{expected_chunks} with {len(chunk)} sequences")
+                    
+                    # Write processing status (before processing)
+                    with open(f"./temp/progress_{num_classes}.txt", "a") as status_file:
+                        if RANK == 0:
+                            status_file.write(f"Processing chunk {chunk_num}\n")
+                    
                     if "start" in chunk.columns and "end" in chunk.columns:
                         if training is True:
                             if RANK == 0 and chunk_num == 0:
@@ -285,194 +323,211 @@ class ESMDataset:
                     elif domain_boundary_detection is False and self.usage_mode is False:
                         # Create mapping once outside the apply function
 
-                        unique_pfam_ids = chunk[category_col].unique()
+                        if num_classes != 24381:
 
-                        # Count occurrences of each Pfam ID
-                        pfam_counts = chunk[category_col].value_counts()
+                            unique_pfam_ids = chunk[category_col].unique()
 
-                        # Filter to only IDs with more than 100 occurrences
-                        frequent_pfam_ids = pfam_counts[
-                            pfam_counts > 100
-                        ].index.tolist()
-                        if RANK == 0:
-                            print(
-                                f"Found {len(frequent_pfam_ids)} Pfam IDs with more than 100 occurrences"
-                            )
+                            # Count occurrences of each Pfam ID
+                            pfam_counts = chunk[category_col].value_counts()
 
-                        # Define the specific 10 Pfam IDs you want to use first | probably change here if thioset needed
-                        # priority_pfam_ids = [
-                        #     "PF00177",
-                        #     "PF00210",
-                        #     "PF00211",
-                        #     "PF00215",
-                        #     "PF00217",
-                        #     "PF00406",
-                        #     "PF00303",
-                        #     "PF00246",
-                        #     "PF00457",
-                        #     "PF00502",
-                        # ]
-
-                        priority_pfam_ids = [
-                            "PF00177",
-                            "PF00210",
-                            "PF00211",
-                            "PF00215",
-                            "PF00406",
-                            "PF00303",
-                            "PF00246",
-                            "PF00005",
-                            "PF00072",
-                            "PF00069",
-                            "PF02518",
-                            "PF07690",
-                            "PF00528",
-                            "PF00115",
-                            "PF00271",
-                            "PF00512",
-                            "PF00078",
-                            "PF00440",
-                            "PF00106",
-                            "PF03466",
-                            "PF00270",
-                            "PF00501",
-                            "PF00126",
-                            "PF13561",
-                            "PF04055",
-                            "PF00583",
-                            "PF00535",
-                            "PF04542",
-                            "PF07992",
-                            "PF12833",
-                            "PF00004",
-                            "PF00561",
-                            "PF00155",
-                            "PF00067",
-                            "PF08240",
-                            "PF07714",
-                            "PF07715",
-                            "PF00672",
-                            "PF00171",
-                            "PF00534",
-                            "PF00702",
-                            "PF13193",
-                            "PF00107",
-                            "PF00990",
-                            "PF00009",
-                            "PF00149",
-                            "PF01370",
-                            "PF00486",
-                            "PF00392",
-                            "PF00361",
-                            "PF00196",
-                            "PF00441",
-                            "PF00001",
-                            "PF02771",
-                            "PF00664",
-                            "PF00293",
-                            "PF01381",
-                            "PF02770",
-                            "PF08281",
-                            "PF00593",
-                            "PF02653",
-                            "PF00753",
-                            "PF01979",
-                            "PF12796",
-                            "PF00077",
-                            "PF00248",
-                            "PF00076",
-                            "PF00378",
-                            "PF00589",
-                            "PF00903",
-                            "PF01266",
-                            "PF01408",
-                            "PF01926",
-                            "PF00291",
-                            "PF01546",
-                            "PF13439",
-                            "PF00226",
-                            "PF08241",
-                            "PF00122",
-                            "PF00083",
-                            "PF00169",
-                            "PF01565",
-                            "PF00665",
-                            "PF00117",
-                            "PF00202",
-                            "PF00015",
-                            "PF03144",
-                            "PF07687",
-                            "PF00563",
-                            "PF00496",
-                            "PF08245",
-                            "PF00266",
-                            "PF00027",
-                            "PF13649",
-                            "PF00651",
-                            "PF00296",
-                            "PF01494",
-                            "PF00884",
-                            "PF03372",
-                            "PF00071",
-                        ]
-
-                        # # FOR THE THIOLASESET ONLY
-                        # priority_pfam_ids = [
-                        #     "PF00108",
-                        #     "PF00109",
-                        #     "PF00195",
-                        #     "PF01154",
-                        #     "PF02797",
-                        #     "PF02801",
-                        #     "PF02803",
-                        #     "PF07451",
-                        #     "PF08392",
-                        #     "PF08540",
-                        # ]
-
-                        if self.training is False:
-                            # to ensure same ids used during evaluation on prediction quality
+                            # Filter to only IDs with more than 100 occurrences
+                            frequent_pfam_ids = pfam_counts[
+                                pfam_counts > 100
+                            ].index.tolist()
                             if RANK == 0:
-                                print("Using fixed priority Pfam IDs for evaluation")
-                            with open(
-                                f"./temp/selected_pfam_ids_{num_classes - 1}.txt", "r"
-                            ) as f:
-                                priority_pfam_ids = [
-                                    line.strip() for line in f.readlines()
-                                ]
+                                print(
+                                    f"Found {len(frequent_pfam_ids)} Pfam IDs with more than 100 occurrences"
+                                )
 
-                        # Filter priority IDs that actually exist in the dataset AND have >100 occurrences
-                        available_priority_ids = [
-                            pid for pid in priority_pfam_ids if pid in frequent_pfam_ids
-                        ]
+                            # Define the specific 10 Pfam IDs you want to use first | probably change here if thioset needed
+                            # priority_pfam_ids = [
+                            #     "PF00177",
+                            #     "PF00210",
+                            #     "PF00211",
+                            #     "PF00215",
+                            #     "PF00217",
+                            #     "PF00406",
+                            #     "PF00303",
+                            #     "PF00246",
+                            #     "PF00457",
+                            #     "PF00502",
+                            # ]
 
-                        # Only use up to num_classes-1 total IDs
-                        if len(available_priority_ids) >= num_classes - 1:
-                            selected_ids = available_priority_ids[: num_classes - 1]
-                        else:
-                            # Get remaining frequent IDs (excluding the priority ones)
-                            remaining_ids = [
-                                pid
-                                for pid in frequent_pfam_ids
-                                if pid not in priority_pfam_ids
+                            priority_pfam_ids = [
+                                "PF00177",
+                                "PF00210",
+                                "PF00211",
+                                "PF00215",
+                                "PF00406",
+                                "PF00303",
+                                "PF00246",
+                                "PF00005",
+                                "PF00072",
+                                "PF00069",
+                                "PF02518",
+                                "PF07690",
+                                "PF00528",
+                                "PF00115",
+                                "PF00271",
+                                "PF00512",
+                                "PF00078",
+                                "PF00440",
+                                "PF00106",
+                                "PF03466",
+                                "PF00270",
+                                "PF00501",
+                                "PF00126",
+                                "PF13561",
+                                "PF04055",
+                                "PF00583",
+                                "PF00535",
+                                "PF04542",
+                                "PF07992",
+                                "PF12833",
+                                "PF00004",
+                                "PF00561",
+                                "PF00155",
+                                "PF00067",
+                                "PF08240",
+                                "PF07714",
+                                "PF07715",
+                                "PF00672",
+                                "PF00171",
+                                "PF00534",
+                                "PF00702",
+                                "PF13193",
+                                "PF00107",
+                                "PF00990",
+                                "PF00009",
+                                "PF00149",
+                                "PF01370",
+                                "PF00486",
+                                "PF00392",
+                                "PF00361",
+                                "PF00196",
+                                "PF00441",
+                                "PF00001",
+                                "PF02771",
+                                "PF00664",
+                                "PF00293",
+                                "PF01381",
+                                "PF02770",
+                                "PF08281",
+                                "PF00593",
+                                "PF02653",
+                                "PF00753",
+                                "PF01979",
+                                "PF12796",
+                                "PF00077",
+                                "PF00248",
+                                "PF00076",
+                                "PF00378",
+                                "PF00589",
+                                "PF00903",
+                                "PF01266",
+                                "PF01408",
+                                "PF01926",
+                                "PF00291",
+                                "PF01546",
+                                "PF13439",
+                                "PF00226",
+                                "PF08241",
+                                "PF00122",
+                                "PF00083",
+                                "PF00169",
+                                "PF01565",
+                                "PF00665",
+                                "PF00117",
+                                "PF00202",
+                                "PF00015",
+                                "PF03144",
+                                "PF07687",
+                                "PF00563",
+                                "PF00496",
+                                "PF08245",
+                                "PF00266",
+                                "PF00027",
+                                "PF13649",
+                                "PF00651",
+                                "PF00296",
+                                "PF01494",
+                                "PF00884",
+                                "PF03372",
+                                "PF00071",
                             ]
-                            max_additional_ids = (
-                                num_classes - 1 - len(available_priority_ids)
-                            )
-                            selected_remaining_ids = remaining_ids[:max_additional_ids]
-                            selected_ids = (
-                                available_priority_ids + selected_remaining_ids
-                            )
+
+                            # # FOR THE THIOLASESET ONLY
+                            # priority_pfam_ids = [
+                            #     "PF00108",
+                            #     "PF00109",
+                            #     "PF00195",
+                            #     "PF01154",
+                            #     "PF02797",
+                            #     "PF02801",
+                            #     "PF02803",
+                            #     "PF07451",
+                            #     "PF08392",
+                            #     "PF08540",
+                            # ]
+
+                            if self.training is False:
+                                # to ensure same ids used during evaluation on prediction quality
+                                if RANK == 0:
+                                    print("Using fixed priority Pfam IDs for evaluation")
+                                with open(
+                                    f"./temp/selected_pfam_ids_{num_classes - 1}.txt", "r"
+                                ) as f:
+                                    priority_pfam_ids = [
+                                        line.strip() for line in f.readlines()
+                                    ]
+
+                            # Filter priority IDs that actually exist in the dataset AND have >100 occurrences
+                            available_priority_ids = [
+                                pid for pid in priority_pfam_ids if pid in frequent_pfam_ids
+                            ]
+
+                            # Only use up to num_classes-1 total IDs
+                            if len(available_priority_ids) >= num_classes - 1:
+                                selected_ids = available_priority_ids[: num_classes - 1]
+                            else:
+                                # Get remaining frequent IDs (excluding the priority ones)
+                                remaining_ids = [
+                                    pid
+                                    for pid in frequent_pfam_ids
+                                    if pid not in priority_pfam_ids
+                                ]
+                                max_additional_ids = (
+                                    num_classes - 1 - len(available_priority_ids)
+                                )
+                                selected_remaining_ids = remaining_ids[:max_additional_ids]
+                                selected_ids = (
+                                    available_priority_ids + selected_remaining_ids
+                                )
+
+
+                        else: # For 24381 classes, use all Pfam IDs
+                            
+                            
+                            with open(
+                                    "./Dataframes/v3/all_pfamIDs.txt", "r"
+                                ) as f:
+                                    selected_ids = [
+                                        line.strip() for line in f.readlines()
+                                    ]
+                            
+
+
 
                         pfam_to_label = {}
                         # Map the selected IDs to labels 1 through len(selected_ids)
                         for i, pfam_id in enumerate(selected_ids):
                             pfam_to_label[pfam_id] = i + 1
 
-                        # Map all other IDs to label 0
-                        for pfam_id in unique_pfam_ids:
-                            if pfam_id not in pfam_to_label:
-                                pfam_to_label[pfam_id] = 0
+                        if num_classes != 24381:
+                           # Map all other IDs to label 0
+                            for pfam_id in unique_pfam_ids:
+                                if pfam_id not in pfam_to_label:
+                                    pfam_to_label[pfam_id] = 0
 
                         chunk["label"] = (
                             chunk[category_col].map(pfam_to_label).fillna(0)
@@ -562,13 +617,23 @@ class ESMDataset:
 
                     if self.training is True and self.usage_mode is False:
                         # print("Creating stratified train/val split...")
-                        X_train, X_val, y_train, y_val = train_test_split(
-                            embeddings,
-                            labels,
-                            test_size=VAL_FRAC,
-                            stratify=labels,
-                            random_state=42,
-                        )
+
+                        if num_classes != 24381:
+                            X_train, X_val, y_train, y_val = train_test_split(
+                                embeddings,
+                                labels,
+                                test_size=VAL_FRAC,
+                                stratify=labels,
+                                random_state=42,
+                            )
+                        else:
+                            X_train, X_val, y_train, y_val = train_test_split(
+                                embeddings,
+                                labels,
+                                test_size=VAL_FRAC,
+                                random_state=42,
+                            )
+
 
                         train_embeddings = X_train
                         train_labels = y_train
@@ -577,12 +642,27 @@ class ESMDataset:
 
                         # Save datasets to files
                         os.makedirs("./temp", exist_ok=True)
+                        if RANK == 0:
+                            print("Writing embeddings to file...")
                         for rank_id in range(dist.get_world_size()):
                             if RANK == rank_id:
                                 with h5py.File(
                                     f"./temp/embeddings_classification_{self.num_classes - 1}d.h5",
                                     "a",
                                 ) as f:
+                                    if del_key is True:
+                                        if f"train_embeddings_chunk{chunk_num}_rank{RANK}" in f:
+                                            del f[f"train_embeddings_chunk{chunk_num}_rank{RANK}"]
+                                        if f"train_labels_chunk{chunk_num}_rank{RANK}" in f:
+                                            del f[f"train_labels_chunk{chunk_num}_rank{RANK}"]
+                                        if f"val_embeddings_chunk{chunk_num}_rank{RANK}" in f:
+                                            del f[f"val_embeddings_chunk{chunk_num}_rank{RANK}"]
+                                        if f"val_labels_chunk{chunk_num}_rank{RANK}" in f:
+                                            del f[f"val_labels_chunk{chunk_num}_rank{RANK}"]
+                                        del_key = False
+                                        if RANK == 0:
+                                            print(f"Deleted existing datasets for chunk {chunk_num}")
+
                                     f.create_dataset(
                                         f"train_embeddings_chunk{chunk_num}_rank{RANK}",
                                         data=train_embeddings.cpu().numpy(),
@@ -591,6 +671,7 @@ class ESMDataset:
                                         f"train_labels_chunk{chunk_num}_rank{RANK}",
                                         data=train_labels.cpu().numpy(),
                                     )
+                                    # exit(0)
                                     f.create_dataset(
                                         f"val_embeddings_chunk{chunk_num}_rank{RANK}",
                                         data=val_embeddings.cpu().numpy(),
@@ -676,6 +757,12 @@ class ESMDataset:
                             print(
                                 f"Wrote embeddings and labels for batch {chunk_num} to file"
                             )
+
+
+                    with open(f"./temp/progress_{num_classes}.txt", "a") as status_file:
+                        if RANK == 0:
+                            status_file.write(f"Completed chunk {chunk_num}\n")
+
                     # Add cleanup after each chunk
                     if self.training is True:
                         del embeddings, labels, idx_multiplied
@@ -691,6 +778,11 @@ class ESMDataset:
                     gc.collect()
 
                     first_subsampler = False    
+
+                    
+                    if RANK == 0:
+                        print(f"Successfully completed chunk {chunk_num}")
+                    # exit(0)
 
                 print("Done Embedding! Closing Embedder")
 
@@ -823,6 +915,7 @@ class ESMDataset:
             model = model.half()
 
             model = DDP(model, device_ids=[DEVICE_ID])
+
 
         return model, batch_converter
 
@@ -1243,7 +1336,6 @@ class ESMDataset:
                     all_starts.append(batch_start)
                     all_ends.append(batch_end)
 
-                from tqdm import tqdm
 
                 # Then replace your print statement with this tqdm implementation:
                 if batch_num == 0 and RANK == 0:

@@ -62,3 +62,5 @@ tf.dataset_to_csv.py
 test*
 train*
 val*
+
+*Palma*

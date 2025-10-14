@@ -105,7 +105,7 @@ def Transformer(input_file, ESM_Model, gpus):
         ESM_Model,
             ]
 
-    print(f"Running command: {' '.join(cmd)}")
+    print(f"\n\nRunning command: {' '.join(cmd)}\n\n")
 
     # Run the command and stream output in real-time
     process = subprocess.Popen(
@@ -216,7 +216,7 @@ def classifier(gpus):
         "./tempTest/cut_out_regions.csv",
     ]
 
-    print(f"Running ESM embeddings command: {' '.join(cmd)}")
+    print(f"\n\nRunning ESM embeddings command: {' '.join(cmd)}\n\n")
 
     # Run the command and stream output in real-time
     process = subprocess.Popen(
@@ -367,6 +367,8 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
                             row_copy['Domain_Start'] = window_domain_start if window_domain_end > 0 and window_domain_start < dimension else -1
                             row_copy['Domain_End'] = window_domain_end if window_domain_end > 0 and window_domain_start < dimension else -1
                             
+
+
                             # Add EVERY window, not just those with domain overlap
                             expanded_rows.append(row_copy)
                             print(f"  Added window {window_idx} for sequence {row_copy['Sequence_ID']}: positions {start_pos}-{end_pos}")
@@ -401,12 +403,17 @@ def dataframer(all_predictions, cut_df, output_file, sequence_metadata):
     # convert all_predictions to the actual pfam IDs
     with open("./temp/selected_pfam_ids_1000.txt", "r") as f:
         pfam_ids = [line.strip() for line in f.readlines()]
-        all_predictions = [pfam_ids[pred] if pred > 0 and pred < len(pfam_ids) else "Unknown" for pred in all_predictions]
+        all_predictions = [pfam_ids[pred-1] if pred > 0 and pred < len(pfam_ids) else "Unknown" for pred in all_predictions]
 
     # Add predictions to DataFrame
     df.insert(2, "Prediction", all_predictions)
-    
 
+    for idx, row_copy in df.iterrows():
+
+        if row_copy['Domain_Start'] == -1 and row_copy['Domain_End'] == -1:
+            #print(f"  Note: Window {window_idx} for sequence {row_copy['Sequence_ID']} has no domain overlap.")
+            df.at[idx, "Prediction"] = "No Domain"  
+    
     
     # Reorder columns to put Window_Start_Pos and Window_End_Pos after Sequence_Length
     if 'Window_Start_Pos' in df.columns and 'Window_End_Pos' in df.columns:
