@@ -17,7 +17,8 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from torchmetrics import Precision, Recall
-
+import tempfile
+import numpy as np
 from ESM_Embedder import DEVICE, RANK, ESMDataset
 
 torch.set_printoptions(threshold=float("inf"))  # Show full tensor
@@ -1074,16 +1075,24 @@ def main_HP(Final_training=False):
     )
 
 
-    class_counts = torch.bincount(torch.tensor(train_labels))
-    num_samples_per_class = int(class_counts.min().item() * 2)  # Or whatever ratio you want
-    num_samples = num_samples_per_class * NUM_CLASSES
-    # Create sample weights inversely proportional to class frequency
-    sample_weights = [1.0/class_counts[label] for label in train_labels]
+    class_counts = np.bincount(train_labels, minlength=NUM_CLASSES)
 
+    # Calculate number of samples per class for balanced sampling
+    num_samples_per_class = int(class_counts.min() * 2)  # Or whatever ratio you want
+    num_samples = num_samples_per_class * NUM_CLASSES
+
+    # Create a mapping of inverse class frequencies
+    inverse_freq_map = np.zeros(NUM_CLASSES, dtype=np.float32)
+    for i in range(NUM_CLASSES):
+        inverse_freq_map[i] = 1.0/class_counts[i] if class_counts[i] > 0 else 0.0
+
+    # Use vectorized operation to create sample weights
+    sample_weights = inverse_freq_map[train_labels]
+    del train_labels  # Close the memmap
 
 
     sampler = torch.utils.data.WeightedRandomSampler(
-        weights=sample_weights, 
+        weights=torch.from_numpy(sample_weights), 
         num_samples=min(num_samples, len(train_dataset)),  # Make sure not to sample more than available
         replacement=False
     )
@@ -1344,8 +1353,8 @@ def loader(csv_path,HP_mode=False):
     # Load the best model
     model = torch.load("./models/Optuna_1000d_uncut_t33.pt",weights_only=False)
     model.to(DEVICE).eval()
-    print("Model loaded and set to eval mode")
-    print(len(classifier_loader), "batches in classifier_loader")
+    # print("Model loaded and set to eval mode")
+    # print(len(classifier_loader), "batches in classifier_loader")
 
     return model, classifier_loader
 
@@ -1356,7 +1365,7 @@ def predicter(model, classifier_loader,):
     all_predictions_raw = []
 
     with torch.no_grad():
-        for batch in tqdm(classifier_loader, desc="Predicting Domain Classes", disable=RANK != 0,unit="Batch",position=0, leave=True):
+        for batch in tqdm(classifier_loader, desc="Predicting Domain Classes", disable=RANK != 0,unit="Batch", leave=True):
             # ClassifierDataset only returns embeddings, not labels/starts/ends
             inputs = batch
             inputs = inputs.to(DEVICE)
@@ -1421,5 +1430,5 @@ if __name__ == "__main__":
     predictions_df.to_csv('./tempTest/predictions.csv', index=False)
     
     if RANK == 0:
-        print("Predictions saved to ./tempTest/predictions.csv")
+        # print("Predictions saved to ./tempTest/predictions.csv")
         print(f"Total predictions: {len(all_predictions)}")

@@ -23,7 +23,7 @@ from ESM_Embeddings_HP_search import (
     objective,
 )
 
-    
+
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))# BATCH_SIZE = 10000
 
 if not dist.is_initialized():
@@ -31,7 +31,7 @@ if not dist.is_initialized():
     if dist.get_rank() == 0:
         print("Initializing process group for DDP")
 RANK = dist.get_rank()
-print(f"Start running basic DDP example on rank {RANK}.")
+# print(f"Start running basic DDP example on rank {RANK}.")
 # create model and move it to GPU with id rank
 DEVICE_ID = RANK % torch.cuda.device_count()
 
@@ -626,14 +626,14 @@ def loader(ESM_Model, input_file):
         actual_seq_lengths = csv_seq_lengths
 
     sample_embedding, sample_label = domain_boundary_dataset[0]
-    if RANK == 0:
-        print("shapes:", sample_embedding.dim(), sample_label.dim())
+    # if RANK == 0:
+    #     print("shapes:", sample_embedding.dim(), sample_label.dim())
 
     if sample_embedding.dim() == 3 and sample_label.dim() == 2:
-        if RANK == 0:
-            print(
-                "Squeezing dimensions of embeddings and labels in train and val datasets."
-            )
+        # if RANK == 0:
+        #     print(
+        #         "Squeezing dimensions of embeddings and labels in train and val datasets."
+        #     )
         # Create new datasets with squeezed tensors
         domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
 
@@ -657,7 +657,7 @@ def loader(ESM_Model, input_file):
     )
 
     if RANK == 0:
-        print(f"Dataset: {len(domain_boudnary_set_loader)} samples")
+        # print(f"Dataset: {len(domain_boudnary_set_loader)} samples")
         print("Datasets and DataLoaders for domain boundary detection created.")
         print("\nLoading Model...\n")
 
@@ -718,8 +718,8 @@ def Predictor(model, domain_boudnary_set_loader):
                     'batch_idx': i
                 })
     
-    if RANK == 0:
-        print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
+    # if RANK == 0:
+    #     print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
         
         # Show information about windowed sequences
         original_indices = [meta['original_seq_idx'] for meta in sequence_metadata]
@@ -734,11 +734,11 @@ def Predictor(model, domain_boudnary_set_loader):
                 print(f"  Original sequence {orig_idx} -> dataset indices {windows}")
         
         # Print debug info for first few sequences
-        for i in range(min(3, len(all_sequence_preds))):
-            metadata = sequence_metadata[i]
-            print(f"Dataset sequence {i}: original_seq={metadata['original_seq_idx']}, "
-                  f"actual_length={len(all_sequence_preds[i])}, "
-                  f"padded_length={metadata['padded_length']}")
+        # for i in range(min(3, len(all_sequence_preds))):
+        #     metadata = sequence_metadata[i]
+        #     print(f"Dataset sequence {i}: original_seq={metadata['original_seq_idx']}, "
+        #           f"actual_length={len(all_sequence_preds[i])}, "
+        #           f"padded_length={metadata['padded_length']}")
 
     return all_sequence_preds, sequence_metadata
 
@@ -765,17 +765,17 @@ def regions_search(all_preds, sequence_metadata=None):
                 print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
                       f"actual length: {actual_seq_length}, predictions length: {seq_len}")
         
-        # Find FIRST occurrence of ANY 1 (not just consecutive)
+        # Find FIRST 2 occurrence of 1s
         first_positive = None
         for i in range(seq_len):
-            if seq_preds[i] == 1:
+            if seq_preds[i] and seq_preds[i-1] == 1:
                 first_positive = i
                 break
         
         # If we found ANY 1, start region MUCH earlier before it
         if first_positive is not None:
             # Start 15 positions before first positive (reduced from 25)
-            start = max(0, first_positive - 15)  
+            start = max(0, first_positive)  
             in_structured_region = True
             structured_counter = 35  # Keep initial counter
             if RANK == 0 and seq_idx < 3:
@@ -791,7 +791,7 @@ def regions_search(all_preds, sequence_metadata=None):
             # Even lower threshold to start a new region
             if structured_counter > 6 and not in_structured_region:  # Increased from 2 to 6
                 # Start with smaller offset - 15 positions before current (reduced from 25)
-                potential_start = max(0, i - 15)
+                potential_start = max(0, i)
                 
                 # Ensure we don't overlap with the previous region
                 if potential_start > last_region_end:
@@ -833,11 +833,11 @@ def regions_search(all_preds, sequence_metadata=None):
     
     if RANK == 0:
         print(f"Found {len(all_regions)} sequences with domain regions.")
-        for seq_idx in range(min(3, len(all_regions))):
-            regions = all_regions[seq_idx]
-            metadata = sequence_metadata[seq_idx] if sequence_metadata else {}
-            actual_length = metadata.get('actual_seq_length', 'unknown')
-            print(f"Sequence {seq_idx} (actual length: {actual_length}) has {len(regions)} regions: {regions}")
+        # for seq_idx in range(min(3, len(all_regions))):
+        #     regions = all_regions[seq_idx]
+        #     metadata = sequence_metadata[seq_idx] if sequence_metadata else {}
+        #     actual_length = metadata.get('actual_seq_length', 'unknown')
+        #     print(f"Sequence {seq_idx} (actual length: {actual_length}) has {len(regions)} regions: {regions}")
 
     return all_regions
 
@@ -859,14 +859,14 @@ def main(input_file):
     all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)  
      
    
-    if RANK == 0:
-        print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
+    # if RANK == 0:
+    #     print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
    
     # Search for domain regions with metadata
     all_regions = regions_search(all_preds, sequence_metadata)
 
-    if RANK == 0:
-        print("First sequence regions:", all_regions[0] if all_regions else "No regions")
+    # if RANK == 0:
+    #     print("First sequence regions:", all_regions[0][1] if all_regions else "No regions")
 
     # Save all_regions to file
     output_file = "./tempTest/predicted_domain_regions.pkl"

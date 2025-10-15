@@ -56,7 +56,7 @@ if use_ddp and torch.cuda.is_available():
     RANK = dist.get_rank()
     if RANK == 0:
         print(
-            f"Start running basic DDP example with worldsize {dist.get_world_size()}."
+            f"\nStart running basic DDP example with worldsize {dist.get_world_size()}."
         )
     # create model and move it to GPU with id rank
     DEVICE_ID = RANK % torch.cuda.device_count()
@@ -243,20 +243,7 @@ class ESMDataset:
                 first_subsampler = True
 
                 # Check for existing progress and resume
-                start_chunk = 0
-                del_key = False
-                if os.path.exists(f"./temp/progress_{num_classes}.txt"):
-                    with open(f"./temp/progress_{num_classes}.txt", "r") as status_file:
-                        lines = status_file.readlines()
-                        if lines:
-                            last_line = lines[-1].strip()
-                            if "Completed chunk" in last_line:  # Look for completed chunks
-                                start_chunk = int(last_line.split(" ")[2]) + 1  # Start from NEXT chunk
-                            else:
-                                start_chunk = int(last_line.split(" ")[2])  # Start from last incomplete chunk
-                                del_key = True
-                            if RANK == 0:
-                                print(f"Resuming from chunk {start_chunk}")
+
 
                 # Create iterator once and skip processed chunks
                 try:
@@ -267,11 +254,37 @@ class ESMDataset:
                     )
                 except Exception as e:
                     if RANK == 0:
-                        print(f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}")
+                        print(f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}. Starting Usage Mode")
                     chunk_iter = pd.read_csv(csv_path, chunksize=1000) #10000000
                     self.usage_mode = True
 
-                # Skip processed chunks
+
+                def read_progress(file_path):
+                    """ Skip possible already processed chunks """
+
+                    start_chunk = 0
+                    del_key = False
+
+                    if os.path.exists(file_path):
+                        with open(file_path, "r") as status_file:
+                            lines = status_file.readlines()
+                            if lines:
+                                last_line = lines[-1].strip()
+                                if "Completed chunk" in last_line:  # Look for completed chunks
+                                    start_chunk = int(last_line.split(" ")[2]) + 1  # Start from NEXT chunk
+                                else:
+                                    start_chunk = int(last_line.split(" ")[2])  # Start from last incomplete chunk
+                                    del_key = True
+                                if RANK == 0:
+                                    print(f"Resuming from chunk {start_chunk}")
+
+                    return start_chunk, del_key
+
+
+                progress_file = f"./{'tempTest' if self.usage_mode else 'temp'}/progress_{num_classes}.txt"
+                start_chunk, del_key = read_progress(progress_file)
+
+
                 for _ in range(start_chunk):
                     try:
                         next(chunk_iter)
@@ -285,11 +298,9 @@ class ESMDataset:
 
 
 
-
-
                 # Process remaining chunks
                 for chunk_num, chunk in enumerate(chunk_iter, start=start_chunk):
-                    if RANK == 0:
+                    if RANK == 0 and self.usage_mode is False:
                         print(f"Processing chunk {chunk_num}/{expected_chunks} with {len(chunk)} sequences")
                     
                     # Write processing status (before processing)
@@ -784,7 +795,8 @@ class ESMDataset:
                         print(f"Successfully completed chunk {chunk_num}")
                     # exit(0)
 
-                print("Done Embedding! Closing Embedder")
+                if RANK == 0:
+                    print("Done Embedding! Closing Embedder")
 
             if self.domain_boundary_detection is True:
                 if RANK == 0:
@@ -796,7 +808,7 @@ class ESMDataset:
                 except Exception as e:
                     if RANK == 0:
                         print(
-                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
+                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}. Starting Usage Mode"
                         )
                     df = pd.read_csv(
                         csv_path,
@@ -821,8 +833,7 @@ class ESMDataset:
                     df[sequence_col].str.len() >= 10
                 ]  # 10 for biological reasonings
                 self.df = df
-                if RANK == 0:
-                    print("Data loaded")
+
 
                 # Use sequences in original order
                 sequences = self.df[sequence_col].tolist()
@@ -1074,8 +1085,9 @@ class ESMDataset:
 
                 self.end_window = [len(seq) for seq in new_seqs]
                 print(
-                    f"Warning: {count} sequences were longer than 1000 characters and slided into windows"
+                    f"Rank: {RANK}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
                 )
+                dist.barrier()
 
                 # Update the dataframe with the new sequences and labels
                 if len(new_seqs) != len(seq_dataset.seqs):
@@ -1149,7 +1161,7 @@ class ESMDataset:
             seq_dataset = SeqDataset(seqs, self.labels)
 
         # if RANK == 0:
-        print(len(seq_dataset))
+        # print(len(seq_dataset))
 
         if self.training is True:
             new_seqs, new_labels, idx_multiplied = windower(
@@ -1181,7 +1193,7 @@ class ESMDataset:
                         seq_dataset.labels, dtype=torch.long
                     )
 
-            print(seq_dataset.labels.shape)
+            # print(seq_dataset.labels.shape)
 
         # if RANK == 0:
         #     print( f"Seq: {seq_dataset.seqs[0:5]}, Label: {seq_dataset.labels[0:5]}")
@@ -1223,7 +1235,8 @@ class ESMDataset:
                 rank=RANK,
                 shuffle=False,
             )
-            print("SAMPLER CUSTOM USED")
+            # if RANK == 0:
+            #     print("SAMPLER CUSTOM USED")
 
         dataloader = DataLoader(
             seq_dataset,
@@ -1343,7 +1356,7 @@ class ESMDataset:
                     progress_bar = tqdm(
                         total=len(dataloader),
                         desc="Embedding Data",
-                        position=0,
+                        # position=0,
                         leave=True,
                         ncols=150  # Set a wider display for more info
                     )
