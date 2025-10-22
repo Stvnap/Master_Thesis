@@ -1,7 +1,7 @@
 import os
 import pickle
 import tqdm
-
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -12,39 +12,39 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.utils.tensorboard import SummaryWriter
-
 from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
-import torch.distributed as dist    
+from ESM_Embedder import DEVICE, RANK
+import torch.distributed as dist
 torch.set_float32_matmul_precision("high")
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
+
 # -------------------------
 # 1. Global settings
 # -------------------------
 
 GLOBAL_RUN = 0  # keep 0
+NUM_CLASSES = 1001
 
-CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins_Eval.csv"
+CSV_PATH = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-MODEL_PATH = "./models/Optuna_1000d_uncut_t33.pt"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_1000d_predicter.pkl"
-TENSBORBOARD_LOG_DIR = "./models/1000d_uncut_logs"
+MODEL_PATH = "/scratch/tmp/sapelt/Master_Thesis/models/FINAL/t33_ALL_1000d.pt"
+CACHE_PATH = f"/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_classification_{NUM_CLASSES-1}d_EVAL.h5"
+TENSBORBOARD_LOG_DIR = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{NUM_CLASSES-1}d_uncut_ALL"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-
-NUM_CLASSES = 1001
-BATCH_SIZE = 128
-EMB_BATCH = 1
-NUM_WORKERS = 0
-NUM_WORKERS_EMB = -0.1
+BATCH_SIZE = 4012
+EMB_BATCH = 64
+NUM_WORKERS = min(16, os.cpu_count())
+NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 THRESHOLD = 5  # Number of consecutive drops to trigger exclusion
-THRESHOLD_K = 0.0  # Threshold for topk probabilities to be considered close and therefore multiclass prediction
-print("Treshold:", THRESHOLD)
+if RANK == 0:
+    print("Treshold:", THRESHOLD)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -52,54 +52,18 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 2. Opener Function
 # -------------------------
 
-
 def opener():
     """
     Opens the ESM model, loads the embeddings and labels from cache or computes them if not cached.
     """
-    print("Opening data...")
+    if RANK == 0:
+        print("Opening data...")
     
-    os.makedirs("pickle", exist_ok=True)
+    if not os.path.exists(CACHE_PATH):
+        if RANK == 0:
+            print(f"Cache file {CACHE_PATH} not found. Running the embedding script first.")
 
-    if os.path.exists(CACHE_PATH):
-        # Get file size for progress tracking
-        file_size = os.path.getsize(CACHE_PATH)
-        if dist.get_rank() == 0:
-            print(f"Loading pickle file ({file_size / (1024**3):.2f} GB)...")
-        
-        with open(CACHE_PATH, "rb") as f:
-            # Wrap the file object with tqdm for progress
-
-            if dist.get_rank() == 0:
-                print("Loaded cached embeddings & labels from disk.")
-                with tqdm.tqdm(total=file_size, unit='B', unit_scale=True, desc="Loading pickle") as pbar:
-                    class ProgressFile:
-                        def __init__(self, file_obj, progress_bar):
-                            self.file_obj = file_obj
-                            self.progress_bar = progress_bar
-                            self.bytes_read = 0
-                        
-                        def read(self, size=-1):
-                            data = self.file_obj.read(size)
-                            if data:
-                                self.bytes_read += len(data)
-                                self.progress_bar.update(len(data))
-                            return data
-                        
-                        def __getattr__(self, name):
-                            return getattr(self.file_obj, name)
-                    
-                    progress_file = ProgressFile(f, pbar)
-                    df_embeddings, df_labels= pickle.load(progress_file)
-
-        
-            else:
-                df_embeddings, df_labels= pickle.load(f)
-
-        return df_embeddings, df_labels, None, None, None
-
-    else:
-        esm_data = ESMDataset(
+        ESMDataset(
             esm_model=ESM_MODEL,
             FSDP_used=False,
             training=False,
@@ -109,37 +73,98 @@ def opener():
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
         )
-        df_embeddings = esm_data.embeddings
-        df_labels = esm_data.labels
-        df_starts = esm_data.starts
-        df_ends = esm_data.ends
-        df = esm_data.df
-
-        # print(df_embeddings[0][0].shape)
-        # print(df_labels[0])
 
 
-        df_embeddings = TensorDataset(df_embeddings, df_labels)
+    class EvalDataset(Dataset):
+        def __init__(self, h5_file):
+            self.h5_file = h5_file
 
-        df_embeddings = DataLoader(
-            df_embeddings,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=NUM_WORKERS,
-            pin_memory=False,
-        )
+            with h5py.File(self.h5_file, "r") as f:
+                # Get all embedding keys
+                self.embedding_keys = sorted(
+                    [k for k in f.keys() if k.startswith("embeddings_")]
+                )
+                
+                # Debug: Print all keys and their shapes
+                if len(self.embedding_keys) == 0:
+                    print("No embedding keys found. Available keys:")
+                    for key in f.keys():
+                        print(f"  {key}: shape {f[key].shape}")
+                
+                self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                self.length = (
+                    self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+                )
+
+        def __len__(self):
+            return self.length
+
+        def __getitem__(self, idx):
+            with h5py.File(self.h5_file, "r") as f:
+                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+                local_idx = (
+                    idx - self.cumulative_sizes[chunk_idx - 1] if chunk_idx > 0 else idx
+                )
+
+                embedding_key = self.embedding_keys[chunk_idx]
+                labels_key = embedding_key.replace("embeddings_", "labels_")
+                starts_key = embedding_key.replace("embeddings_", "starts_")
+                ends_key = embedding_key.replace("embeddings_", "ends_")
+
+                # Get embeddings (2D array -> 1D vector)
+                embeddings = torch.tensor(
+                    f[embedding_key][local_idx], dtype=torch.float32
+                )
+                
+                # Get labels, starts, ends (1D arrays -> scalars)
+                labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
+                starts = torch.tensor(f[starts_key][local_idx], dtype=torch.long)
+                ends = torch.tensor(f[ends_key][local_idx], dtype=torch.long)
+
+                # Debug print for first few items only
+                # if RANK == 0:
+                #     if idx < 10:
+                #         print(f"Item {idx}: embeddings.shape={embeddings.shape}, labels={labels.item()}, starts={starts.item()}, ends={ends.item()}")
+
+                return embeddings, labels, starts, ends
 
 
-        with open(CACHE_PATH, "wb") as f:
-            pickle.dump(
-                (df_embeddings, df_labels),
-                f,
-            )
+    # Load the dataset from the HDF5 file
+    evaldataset = EvalDataset(CACHE_PATH)
+    
+    # print(evaldataset)
 
-        if dist.get_rank()  == 0:
-            print("Computed embeddings & labels, then wrote them to cache.")
+    # Shuffle the dataset by creating random indices
+    indices = torch.randperm(len(evaldataset))
+    evaldataset = torch.utils.data.Subset(evaldataset, indices.tolist())
 
-        return df_embeddings, df_labels, df_starts, df_ends,df
+
+    evaldataset = torch.utils.data.Subset(evaldataset, list(range(100*5005)))
+
+
+
+
+    eval_loader = DataLoader(
+        evaldataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        persistent_workers=True,
+        num_workers=NUM_WORKERS_EMB,
+        pin_memory=True,
+        prefetch_factor=4,
+    )
+
+
+
+    
+
+    # print(eval_loader)
+
+    if RANK == 0:
+        print(f"Loaded {len(evaldataset)} sequences from {CACHE_PATH}")
+
+    return eval_loader
 
 
 # -------------------------
@@ -153,15 +178,20 @@ def opener():
 # -------------------------
 
 
-def predict(modelpath, loader, df_labels, firstrun=False):
-    model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
-    model = model.to(DEVICE)
+def predict(modelpath, loader, firstrun=False):
+
+    if isinstance(modelpath, str):
+        model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
+        model = model.to(DEVICE)
+    else:
+        model = modelpath.to(DEVICE)
     # if torch.cuda.device_count() > 1:
     #     print(f"Using {torch.cuda.device_count()} GPUs for prediction")
     #     model = nn.DataParallel(model)
     model.eval()
 
-    # print(model)
+
+    print(model)
     # print("Model loaded successfully.\n")
 
     # sd = model.state_dict()
@@ -170,11 +200,25 @@ def predict(modelpath, loader, df_labels, firstrun=False):
     # print("First key:", first_key)
     # print("First-weight tensor:\n", sd[first_key])
 
-    predictions = []
-    predictions_raw = []
+    all_predictions = []
+    all_predictions_raw = []
+    all_accuracies = []
+
+    all_precisions_per_class = {i: [] for i in range(1, NUM_CLASSES)}
+    all_recalls_per_class = {i: [] for i in range(1, NUM_CLASSES)}
+
+
+
+
+
     with torch.no_grad():
-        for batch in loader:
-            inputs, _ = batch
+        for batch in tqdm.tqdm(loader, desc="Predicting batches"):
+            predictions = []
+            predictions_raw = []
+            try:
+                inputs, labels, starts, ends = batch
+            except:
+                input = batch
             # if len(predictions) == 0:
                 # print("\nTENSORS IN PREDICT():",inputs[0])
             inputs = inputs.to(DEVICE)
@@ -193,81 +237,104 @@ def predict(modelpath, loader, df_labels, firstrun=False):
             predictions_raw.extend(preds_raw.cpu().numpy())
 
 
-    true_labels = df_labels
+            true_labels = labels
 
     # print("TRUE:",true_labels[:30],print(len(true_labels)))
     # print("PRED:",predictions[:30],print(len(predictions)))
     # print("PRED RAW:",predictions_raw[:30],print(len(predictions_raw)))
 
-    if firstrun is True:
-        # Initialize TensorBoard writer
+            if firstrun is True:
+                # Initialize TensorBoard writer
 
-        os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
-        writer = SummaryWriter(TENSBORBOARD_LOG_DIR)
+                os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
+                writer = SummaryWriter(TENSBORBOARD_LOG_DIR)
 
-        # Overall metrics
-        accuracy = accuracy_score(true_labels, predictions)
-        weighted_precision = precision_score(
-            true_labels, predictions, average="weighted"
-        )
-        # confusion = confusion_matrix(true_labels, predictions, normalize="true")
+                # Overall metrics
+                accuracy = accuracy_score(true_labels, predictions)
+                weighted_precision = precision_score(
+                    true_labels, predictions, average="weighted"
+                )
+                # confusion = confusion_matrix(true_labels, predictions, normalize="true")
 
-        # Class‐specific precision & recall
-        prec_per_class = precision_score(
-            true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
-        )
-        rec_per_class = recall_score(
-            true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
-        )
+                # Class‐specific precision & recall
+                prec_per_class = precision_score(
+                    true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
+                )
+                rec_per_class = recall_score(
+                    true_labels, predictions, labels=list(range(1, NUM_CLASSES)), average=None
+                )
 
-        # Log overall metrics to TensorBoard
-        writer.add_scalar("Metrics/Accuracy", accuracy, 0)
-        writer.add_scalar("Metrics/Weighted_Precision", weighted_precision, 0)
-        writer.add_scalar("Metrics/AvgPrecision", prec_per_class.mean(), 0)
-        writer.add_scalar("Metrics/AvgRecall", rec_per_class.mean(), 0)
+                # Log overall metrics to TensorBoard
+                writer.add_scalar("Metrics/Accuracy", accuracy, 0)
+                writer.add_scalar("Metrics/Weighted_Precision", weighted_precision, 0)
+                writer.add_scalar("Metrics/AvgPrecision", prec_per_class.mean(), 0)
+                writer.add_scalar("Metrics/AvgRecall", rec_per_class.mean(), 0)
 
 
-        prec_tensor = torch.tensor(prec_per_class)
-        writer.add_histogram("Precision Distribution", prec_tensor, 0, bins=100)
+                prec_tensor = torch.tensor(prec_per_class)
+                writer.add_histogram("Precision Distribution", prec_tensor, 0, bins=100)
 
-        rec_tensor = torch.tensor(rec_per_class)
-        writer.add_histogram("Recall Distribution", rec_tensor, 0, bins=100)
+                rec_tensor = torch.tensor(rec_per_class)
+                writer.add_histogram("Recall Distribution", rec_tensor, 0, bins=100)
 
+                for i in range(1, NUM_CLASSES):
+                    writer.add_scalar(f"Precision/Class_{i}", prec_per_class[i - 1], 0)
+                    writer.add_scalar(f"Recall/Class_{i}", rec_per_class[i - 1], 0)
+
+                # if dist.get_rank() == 0:
+                #     # Print results
+                #     print(f"Accuracy: {accuracy:.4f}")
+                #     # print(f"Weighted precision (all classes): {weighted_precision:.4f}")
+
+                #     print("\nPrecision Metrics:")
+                #     for i in range(1, NUM_CLASSES):
+                #         print(f"Precision for class {i}: {prec_per_class[i - 1]:.4f}")
+
+                #     print("\nRecall Metrics:")
+                #     for i in range(1, NUM_CLASSES):
+                #         print(f"Recall    for class {i}: {rec_per_class[i - 1]:.4f}")
+
+                #     print("TRUE:",true_labels[0:100])
+                #     print("PRED:",predictions[0:100])
+                    # print(predictions_raw[0:5])
+
+                    # print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
+
+
+                all_predictions.extend(predictions)
+                all_predictions_raw.extend(predictions_raw)
+                all_accuracies.append(accuracy)
+                all_accuracies.append(accuracy)
+
+                for i in range(1, NUM_CLASSES):
+                    all_precisions_per_class[i].append(prec_per_class[i - 1])
+                    all_recalls_per_class[i].append(rec_per_class[i - 1])
+
+
+
+
+
+                # Close the writer
+                writer.close()
+                # print(f"Metrics logged to TensorBoard in '{TENSBORBOARD_LOG_DIR}'")
+
+                # print("raw", predictions_raw[:30])
+                # print("maxed", predictions[:30])
+
+            # print("Prediction run done.\n")
+
+            # print(predictions_raw[0])
+
+
+
+    if RANK == 0:
+        print("Mean accuracy over all batches:", np.mean(all_accuracies))
+        print("Mean accuracy over all batches:", np.mean(all_accuracies))
         for i in range(1, NUM_CLASSES):
-            writer.add_scalar(f"Precision/Class_{i}", prec_per_class[i - 1], 0)
-            writer.add_scalar(f"Recall/Class_{i}", rec_per_class[i - 1], 0)
-
-        if dist.get_rank() == 0:
-            # Print results
-            print(f"Accuracy: {accuracy:.4f}")
-            # print(f"Weighted precision (all classes): {weighted_precision:.4f}")
-
-            print("\nPrecision Metrics:")
-            for i in range(1, NUM_CLASSES):
-                print(f"Precision for class {i}: {prec_per_class[i - 1]:.4f}")
-
-            print("\nRecall Metrics:")
-            for i in range(1, NUM_CLASSES):
-                print(f"Recall    for class {i}: {rec_per_class[i - 1]:.4f}")
-
-            # print("TRUE:",true_labels[0:5])
-            # print("PRED:",predictions[0:5])
-            # print(predictions_raw[0:5])
-
-            # print(f"Confusion Matrix (rows=true, cols=pred):\n{confusion}\n")
-
-        # Close the writer
-        writer.close()
-        # print(f"Metrics logged to TensorBoard in '{TENSBORBOARD_LOG_DIR}'")
-
-        # print("raw", predictions_raw[:30])
-        # print("maxed", predictions[:30])
-
-    # print("Prediction run done.\n")
-
-    # print(predictions_raw[0])
-
-    return predictions, true_labels, predictions_raw
+            print(
+                f"Mean precision for class {i}: {np.mean(all_precisions_per_class[i]):.4f}, Mean recall: {np.mean(all_recalls_per_class[i]):.4f}"
+            )
+    return all_predictions, all_predictions_raw
 
 
 # -------------------------
@@ -373,64 +440,62 @@ def check_dropping_logits_across_cuts(logits_so_far, threshold=2):
 # -------------------------
 # 7. Boundary gatherer
 # -------------------------
-def boundary_gatherer(predictions, df, df_starts, df_ends):
+def boundary_gatherer(predictions, loader):
     """
     Gather the boundaries, true classes, true pos of predicted domains from the predictions list.
 
     Args:
         predictions: List of predicted domain starts and ends.
-        df: DataFrame with sequence data
-        df_starts: Tensor/list of domain start positions
-        df_ends: Tensor/list of domain end positions
+        loader: DataLoader with sequence data
 
     Returns:
         pos_indices, pos_true_start, pos_true_end, true_class
     """
-    # # Debug prints to understand the data structure
-    # print(f"Debug info:")
-    # print(f"predictions length: {len(predictions)}")
-    # print(f"df length: {len(df)}")
-    # print(f"df_starts length: {len(df_starts)}")
-    # print(f"df_ends length: {len(df_ends)}")
-    # print(df.head())
     
-    pos_indices = [i for i, p in enumerate(predictions) if p != 0]
+    # Initialize lists to collect results across all batches
+    pos_indices = []
+    pos_true_start = []
+    pos_true_end = []
+    true_class = []
+    
+    for batch_idx, batch in enumerate(loader):
+        inputs, labels, df_starts, df_ends = batch
+        
+        # Get predictions for this batch
+        batch_start_idx = batch_idx * BATCH_SIZE
+        batch_end_idx = min(batch_start_idx + inputs.size(0), len(predictions))
+        batch_predictions = predictions[batch_start_idx:batch_end_idx]
+        
+        # Find positive indices within this batch (local indices)
+        batch_pos_indices = [i for i, p in enumerate(batch_predictions) if p != 0]
+        
+        # Convert to global indices
+        global_pos_indices = [batch_start_idx + i for i in batch_pos_indices]
+        
+        # Extend the global pos_indices list
+        pos_indices.extend(global_pos_indices)
+        
+        # Get starts, ends, and labels for positive predictions in this batch
+        if batch_pos_indices:  # Only process if there are positive predictions
+            batch_pos_true_start = [df_starts[i].item() for i in batch_pos_indices]
+            batch_pos_true_end = [df_ends[i].item() for i in batch_pos_indices]
+            batch_true_class = [labels[i].item() for i in batch_pos_indices]
+            
+            # Extend the global lists
+            pos_true_start.extend(batch_pos_true_start)
+            pos_true_end.extend(batch_pos_true_end)
+            true_class.extend(batch_true_class)
+    
     if not pos_indices:
-        print("No positives found.")
+        if RANK == 0:
+            print("No positives found.")
         return None, None, None, None
     
-    print(f"pos_indices: {pos_indices[:10]}...")  # Show first 10
-    print(f"max pos_index: {max(pos_indices)}")
-
-    # Convert tensors to lists if needed
-    if hasattr(df_starts, 'tolist'):
-        starts_list = df_starts.tolist()
-        ends_list = df_ends.tolist()
-    else:
-        starts_list = df_starts
-        ends_list = df_ends
-
-    # Check if indices are within bounds
-    max_valid_index = min(len(starts_list), len(ends_list), len(df)) - 1
-    valid_pos_indices = [i for i in pos_indices if i <= max_valid_index]
-    
-    if len(valid_pos_indices) != len(pos_indices):
-        print(f"Warning: {len(pos_indices) - len(valid_pos_indices)} indices out of bounds, filtering them out")
-        pos_indices = valid_pos_indices
-
-    # Get starts and ends for positive predictions only
-    pos_true_start = [starts_list[i] for i in pos_indices]
-    pos_true_end = [ends_list[i] for i in pos_indices]
-
-    # Get true classes for positive predictions - use different variable name
-    all_true_classes = df["label"].to_list()
-    true_class = [all_true_classes[i] for i in pos_indices]
-
-    # print("\nLengths:")
-    # print(f"pos_true_start: {len(pos_true_start)}")
-    # print(f"pos_true_end: {len(pos_true_end)}")
-    # print(f"true_class: {len(true_class)}")
-    
+    if RANK == 0:
+        print(f"Total positives found: {len(pos_indices)}")
+        print(f"pos_indices sample: {pos_indices[:100000]}...")  # Show first 10
+        print(f"max pos_index: {max(pos_indices)}")
+        
     return pos_indices, pos_true_start, pos_true_end, true_class
 # -------------------------
 # 8. Cutter-Loop
@@ -675,7 +740,7 @@ def list_concatenater(endlist):
     # print("\n\n\nConcatenated Endlist:", endlist)
 
     concatenated_df = pd.DataFrame(concatenated_list)
-    concatenated_df.to_csv("./Results/Predicter_from_ESM_final_result.csv", index=False)
+    concatenated_df.to_csv("/scratch/tmp/sapelt/Master_Thesis/Results/Predicter_from_ESM_final_result.csv", index=False)
     print("Saved results to predicted_boundaries_after.csv")
 
 
@@ -704,7 +769,7 @@ def plotter(
     plt.grid(axis="y", alpha=0.5, linestyle="--")
     plt.tight_layout()
     plt.savefig(
-        f"./Evalresults/ESM/histogram_{Name}_errors.png", dpi=300, bbox_inches="tight"
+        f"/scratch/tmp/sapelt/Master_Thesis/Evalresults/ESM/histogram_{Name}_errors.png", dpi=300, bbox_inches="tight"
     )
     plt.show()
 
@@ -741,7 +806,7 @@ def boxplotter(errors, classes, Name):
     ax.set_ylim(bottom=0, top=100)  # Set y-axis limits
 
     plt.tight_layout()
-    plt.savefig(f"./Evalresults/ESM/boxplot_{Name}.png", dpi=300, bbox_inches="tight")
+    plt.savefig(f"/scratch/tmp/sapelt/Master_Thesis/Evalresults/ESM/boxplot_{Name}.png", dpi=300, bbox_inches="tight")
     plt.show()
 
 
@@ -752,7 +817,7 @@ def boxplotter(errors, classes, Name):
 
 def main():
     ### Load embeddings, labels abd predicting ###
-    df_embeddings, df_labels, df_starts, df_ends, df = opener()
+    eval_loader= opener()
     print('\n')
     # if dist.get_rank() == 0:
     #     first_batch = next(iter(df_embeddings))
@@ -762,29 +827,35 @@ def main():
 
 
     
+    print("Starting first prediction run...")
 
-    predictions, true_labels, raw_scores_nocut = predict(
-        MODEL_PATH, df_embeddings, df_labels, firstrun=True
+    predictions, raw_scores_nocut = predict(
+        MODEL_PATH, eval_loader, firstrun=True
     )
+
+
+
 
     # temp quit
     dist.barrier()  # Ensure all processes reach this point before quitting
-    if dist.get_rank() == 0:
+    if RANK == 0:
         print("Exiting after first run for debugging purposes.")
     dist.destroy_process_group()  # Clean up the process group
     quit()
-    
-    
+    df = None
+
+
+
 
 
     pos_indices, pos_true_start, pos_true_end, true_class = boundary_gatherer(
-        predictions, df, df_starts, df_ends
+        predictions, eval_loader
     )
 
     ### Cut loop start ###
     all_residues_start, errors_start = cutter_loop(
         predictions,
-        true_labels,
+        true_class,
         df,
         pos_indices,
         pos_true_start,
@@ -794,7 +865,7 @@ def main():
 
     all_residues_end, errors_end = cutter_loop(
         predictions,
-        true_labels,
+        true_class,
         df,
         pos_indices,
         pos_true_end,
