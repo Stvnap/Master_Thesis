@@ -39,7 +39,7 @@ pd.set_option("display.max_rows", None)
 # -------------------------
 # 1. GLOBALS
 # -------------------------
-NUM_CLASSES = 1001  # classes + 1 for "other" class
+NUM_CLASSES = 24381  # classes + 1 for "other" class
 if RANK == 0:
     print("USING n CLASSES:",NUM_CLASSES)
 
@@ -789,8 +789,8 @@ def objective(
             save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/tensorboard", 
             name=f"optuna_trial_{trial.number}"
         ),
-        # limit_train_batches=250, #245
-        # limit_val_batches=250,   #245
+        limit_train_batches=250, #245
+        limit_val_batches=250,   #245
         use_distributed_sampler=False,
     )
 
@@ -1478,8 +1478,8 @@ def main_HP(Final_training=False):
             logger=TensorBoardLogger(
                 save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/tensorboard", name=f"{PROJECT_NAME}_final"
             ),
-            # limit_train_batches=250,
-            # limit_val_batches=250,
+            limit_train_batches=250,
+            limit_val_batches=250,
             use_distributed_sampler=False,
         )
         if RANK == 0:

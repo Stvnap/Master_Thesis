@@ -39,10 +39,10 @@ DEVICE_ID = RANK % torch.cuda.device_count()
 # 1. Global settings
 # -------------------------
 
-CSV_PATH = "./Dataframes/v3/FoundEntriesSwissProteins.csv"
+CSV_PATH = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"
+CACHE_PATH = "/scratch/tmp/sapelt/Master_Thesis/pickle/FoundEntriesSwissProteins_domains.pkl"
 PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
@@ -61,7 +61,7 @@ VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
 BATCH_SIZE = 40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
-EPOCHS = 30
+EPOCHS = 50
 STUDY_N_TRIALS = 3  # number of optuna trials
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -305,9 +305,10 @@ def main_trainer(Final_training=False):
     os.makedirs(f"logs/{PROJECT_NAME}", exist_ok=True)
     os.makedirs("models", exist_ok=True)
     os.makedirs("temp", exist_ok=True)
-    print("Directories created.")
+    if RANK == 0:
+        print("Directories created.")
 
-    if not os.path.exists("./temp/embeddings_domain.h5"):
+    if not os.path.exists("/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_domain.h5"):
         ESMDataset(
             FSDP_used=False,
             domain_boundary_detection=True,
@@ -317,12 +318,14 @@ def main_trainer(Final_training=False):
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
         )
-        print("Using preembedded ESM data from scratch")
+        if RANK == 0:
+            print("Using preembedded ESM data from scratch")
 
 
-    print("Creating DomainBoundaryDataset from embeddings in H5 file...")
+    if RANK == 0:
+        print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("./temp/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset("/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_domain.h5")
 
     # Split indices for train and validation sets
     dataset_size = len(domain_boundary_dataset)
@@ -343,12 +346,13 @@ def main_trainer(Final_training=False):
 
     sample_embedding, sample_label = train_dataset[0]
 
-    print("shapes:", sample_embedding.dim(), sample_label.dim())
+    # print("shapes:", sample_embedding.dim(), sample_label.dim())
 
     if sample_embedding.dim() == 3 and sample_label.dim() == 2:
-        print(
-            "Squeezing dimensions of embeddings and labels in train and val datasets."
-        )
+        if RANK == 0:
+            print(
+                "Squeezing dimensions of embeddings and labels in train and val datasets."
+            )
         # Create new datasets with squeezed tensors
 
 
@@ -363,9 +367,9 @@ def main_trainer(Final_training=False):
     # sample dim size taken from the first sample
     input_dims_sample = train_dataset[0][0].unsqueeze(0)  # [1, seq_len, embedding_dim]
 
-    if RANK == 0:
+    # if RANK == 0:
         # print(input_dims_sample)
-        print(input_dims_sample.shape)
+        # print(input_dims_sample.shape)
 
     # Create DataLoaders for each subset
     train_loader = DataLoader(
@@ -387,12 +391,14 @@ def main_trainer(Final_training=False):
         prefetch_factor=2,
     )
 
-    print(f"Train set: {len(train_dataset)} samples")
-    print(f"Val set: {len(val_dataset)} samples")
-    print("Datasets and DataLoaders for domain boundary detection created.")
+    if RANK == 0:
+        print(f"Train set: {len(train_dataset)} samples")
+        print(f"Val set: {len(val_dataset)} samples")
+        print("Datasets and DataLoaders for domain boundary detection created.")
 
-    # Calculate class weights by iterating through the dataset
-    print("Calculating class weights for training set...")
+        # Calculate class weights by iterating through the dataset
+        print("Calculating class weights for training set...")
+
     all_labels = []
     for i in range(0, 20):
         _, labels = train_dataset[i]
@@ -406,7 +412,8 @@ def main_trainer(Final_training=False):
 
     # Handle cases where a class might be missing in a small sample
     if torch.any(counts == 0):
-        print("Warning: One or more classes have zero samples. Using uniform weights.")
+        if RANK == 0:
+            print("Warning: One or more classes have zero samples. Using uniform weights.")
         weights = torch.ones(NUM_CLASSES, device=DEVICE)
     else:
         total = train_labels_flat.size(0)
@@ -485,7 +492,7 @@ def main_trainer(Final_training=False):
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
-                save_dir=f"./logs/{PROJECT_NAME}", name=PROJECT_NAME
+                save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/{PROJECT_NAME}", name=PROJECT_NAME
             ),
         )
 
@@ -499,7 +506,7 @@ def main_trainer(Final_training=False):
         trainer.fit(lit_model, train_loader, val_loader)
 
         # save the final model
-    final_model_path = f"./models/{PROJECT_NAME}.pt"
+    final_model_path = f"/scratch/tmp/sapelt/Master_Thesis/models/{PROJECT_NAME}.pt"
     torch.save(lit_model, final_model_path)   
     lit_model=torch.load(final_model_path, map_location=DEVICE, weights_only=False)
 
@@ -586,7 +593,7 @@ def loader(ESM_Model, input_file):
     import pandas as pd
 
     os.makedirs("tempTest/embeddings", exist_ok=True)
-    if not os.path.exists("./tempTest/embeddings/embeddings_domain.h5"):
+    if not os.path.exists("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain.h5"):
         if RANK == 0:
             print("Generating embeddings with ESM model...")
         ESMDataset(
@@ -608,7 +615,7 @@ def loader(ESM_Model, input_file):
     if RANK == 0:
         print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("./tempTest/embeddings/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain.h5")
 
     # Load the original CSV to get actual sequence lengths
     df = pd.read_csv(input_file)
@@ -661,7 +668,7 @@ def loader(ESM_Model, input_file):
         print("Datasets and DataLoaders for domain boundary detection created.")
         print("\nLoading Model...\n")
 
-    model = torch.load("./models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
+    model = torch.load("/scratch/tmp/sapelt/Master_Thesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
     model = model.to(DEVICE)
     model.eval()
 
@@ -728,10 +735,12 @@ def Predictor(model, domain_boudnary_set_loader):
         windowed_originals = [idx for idx, count in original_counts.items() if count > 1]
         
         if windowed_originals:
-            print(f"Original sequences with multiple windows: {windowed_originals}")
+            if RANK == 0:
+                print(f"Original sequences with multiple windows: {windowed_originals}")
             for orig_idx in windowed_originals[:3]:  # Show first 3
                 windows = [i for i, meta in enumerate(sequence_metadata) if meta['original_seq_idx'] == orig_idx]
-                print(f"  Original sequence {orig_idx} -> dataset indices {windows}")
+                if RANK == 0:
+                    print(f"  Original sequence {orig_idx} -> dataset indices {windows}")
         
         # Print debug info for first few sequences
         # for i in range(min(3, len(all_sequence_preds))):
@@ -869,7 +878,7 @@ def main(input_file):
     #     print("First sequence regions:", all_regions[0][1] if all_regions else "No regions")
 
     # Save all_regions to file
-    output_file = "./tempTest/predicted_domain_regions.pkl"
+    output_file = "/scratch/tmp/sapelt/Master_Thesis/tempTest/predicted_domain_regions.pkl"
     with open(output_file, 'wb') as f:
         pickle.dump(all_regions, f)
         pickle.dump(sequence_metadata, f)
@@ -880,7 +889,7 @@ def main(input_file):
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Domain Finder Script")
     parser.add_argument("--input", type=str, required=False, help="Input file path")
-    parser.add_argument("--output", type=str, default="./tempTest/predicted_domain_regions.pkl", help="Output file path")
+    parser.add_argument("--output", type=str, default="/scratch/tmp/sapelt/Master_Thesis/tempTest/predicted_domain_regions.pkl", help="Output file path")
     parser.add_argument("--model", type=str, required=False, help="ESM model name")
     parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
     return parser.parse_args()

@@ -224,7 +224,7 @@ class ESMDataset:
                     global_pfam_counts = pd.Series(dtype=int)
                     # Create a lightweight iterator that only reads the category column.
                     try:
-                        count_iter = pd.read_csv(csv_path, usecols=[category_col], chunksize=10000000)
+                        count_iter = pd.read_csv(csv_path, usecols=[category_col], chunksize=chunksize)
                         for chunk in count_iter:
                             global_pfam_counts = global_pfam_counts.add(chunk[category_col].value_counts(), fill_value=0)
                     except Exception as e:
@@ -385,7 +385,6 @@ class ESMDataset:
                     print(f"Saved {len(selected_ids)} globally selected Pfam IDs to file.")
             
 
-                expected_chunks = 22
 
                 if num_classes != 24381:
                     with open(selected_ids_file, "r") as f:
@@ -400,7 +399,10 @@ class ESMDataset:
                 first_subsampler = True
 
 
+
+
                 # Check for existing progress and resume
+                chunksize = 20000000
                 start_chunk = 0
                 del_key = False
                 if os.path.exists(f"/scratch/tmp/sapelt/Master_Thesis/temp/progress_{num_classes}.txt"):
@@ -421,12 +423,13 @@ class ESMDataset:
                     chunk_iter = pd.read_csv(
                         csv_path,
                         usecols=["start", "end", "id", "Pfam_id", "Sequence"],
-                        chunksize=10000000,
+                        chunksize=chunksize,
+
                     )
                 except Exception as e:
                     if RANK == 0:
                         print(f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}")
-                    chunk_iter = pd.read_csv(csv_path, chunksize=10000000) #10000000
+                    chunk_iter = pd.read_csv(csv_path, chunksize=chunksize) #10000000
                     self.usage_mode = True
 
                 # Skip processed chunks
@@ -440,6 +443,9 @@ class ESMDataset:
                                 if RANK == 0:
                                     status_file.write(f"All chunks processed. Exiting.\n")
                         return
+
+                expected_chunks = 22 * (10000000/chunksize)  # Approximate number of chunks for progress reporting, based on the 22 chunks for chunksize 10000000
+
 
                 # Process remaining chunks
                 for chunk_num, chunk in enumerate(chunk_iter, start=start_chunk):
@@ -569,23 +575,46 @@ class ESMDataset:
                         )
 
                     if self.training is True and self.usage_mode is False:
+
+
+
+                        unique_labels, counts = torch.unique(labels, return_counts=True)
+                        single_sample_classes = unique_labels[counts == 1]
+                        # --- END: Definition ---
+
+                        if len(single_sample_classes) > 0 and RANK == 0:
+                            if RANK == 0:
+                                print(f"Warning: Found {len(single_sample_classes)} classes with only one sample. Removing them before splitting.")
+                        else:
+                            if RANK == 0:
+                                print("All classes have more than one sample.")
+
+
+                        mask = torch.ones_like(labels, dtype=torch.bool)
+                        for cls_label in single_sample_classes:
+                            mask &= (labels != cls_label)
+
+                        # Apply the exact same mask to both tensors.
+                        filtered_embeddings = embeddings[mask]
+                        filtered_labels = labels[mask]
+
+
                         # print("Creating stratified train/val split...")
                         if num_classes != 24381:
                             X_train, X_val, y_train, y_val = train_test_split(
-                                embeddings,
-                                labels,
+                                filtered_embeddings,
+                                filtered_labels,
                                 test_size=VAL_FRAC,
-                                stratify=labels,
+                                stratify=filtered_labels,
                                 random_state=42,
                             )
                         else:
                             X_train, X_val, y_train, y_val = train_test_split(
-                                embeddings,
-                                labels,
+                                filtered_embeddings,
+                                filtered_labels,
                                 test_size=VAL_FRAC,
                                 random_state=42,
                             )
-
 
                         train_embeddings = X_train
                         train_labels = y_train
@@ -734,9 +763,11 @@ class ESMDataset:
                     
                     if RANK == 0:
                         print(f"Successfully completed chunk {chunk_num}")
+                        
                     # exit(0)
 
-                print("Done Embedding! Closing Embedder")
+                # print("Done Embedding! Closing Embedder")
+
 
                 if self.domain_boundary_detection is True:
                     if RANK == 0:
@@ -813,8 +844,8 @@ class ESMDataset:
                             sequences
                         )
 
-                    print("Done Embedding! Closing Embedder")
-                    return  # Return early if domain boundary detection is enabled
+                print("Done Embedding! Closing Embedder")
+                return  # Return early if domain boundary detection is enabled
 
         else:
             self.df = skip_df
@@ -1100,7 +1131,7 @@ class ESMDataset:
             seq_dataset = SeqDataset(seqs, self.labels)
 
         # if RANK == 0:
-        print(len(seq_dataset))
+        # print(len(seq_dataset))
 
         if self.training is True:
             new_seqs, new_labels, idx_multiplied = windower(
@@ -1191,6 +1222,20 @@ class ESMDataset:
             )
             print(f"Each Rank will process sequences {sampler.num_samples}")
 
+        # Pre-allocate tensors on CPU to save GPU memory
+        total_samples = len(seq_dataset)
+        if self.domain_boundary_detection:
+            pass  # This logic will be handled inside the loop for domain boundary detection
+        else:
+            all_embeddings = torch.empty((total_samples, expected_dim), dtype=torch.float32, device='cpu')
+            all_labels = torch.empty(total_samples, dtype=torch.long, device='cpu')
+            if not self.training:
+                all_starts = torch.empty(total_samples, dtype=torch.long, device='cpu')
+                all_ends = torch.empty(total_samples, dtype=torch.long, device='cpu')
+
+        # Keep track of the current position in the pre-allocated tensor
+        processed_samples = 0
+
         chunk = 1
 
         seq_dataset = None  # Clear the dataset to free memory
@@ -1213,7 +1258,7 @@ class ESMDataset:
                 _, _, batch_tokens = self.batch_converter(batch)
                 batch_tokens = batch_tokens.cuda(non_blocking=True)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     results = self.model(
                         batch_tokens,
                         repr_layers=[self.model_layers],
@@ -1237,43 +1282,49 @@ class ESMDataset:
                 if self.domain_boundary_detection is True:
                     # no pooling, just store the embeddings as they are
 
-                    all_embeddings.append(embeddings)
-                    all_labels.append(batch_labels)
+                
+
+
+                    all_embeddings.append(embeddings.cpu())
+                    all_labels.append(batch_labels.cpu())
+                    if self.training is False:
+                        all_starts.append(batch_start)
+                        all_ends.append(batch_end)
 
                     # if RANK == 0:
                     #     print(type(all_embeddings), "type of embeddings before move")
                     #     print(type(all_labels), "type of labels before move")
 
-                    if batch_num % 1000 == 0 and batch_num > 0:
-                        # # Move the previous chunk to CPU in batch to stop vram overflow, but yet keep speed high
+                    # if batch_num % 1000 == 0 and batch_num > 0:
+                    #     # # Move the previous chunk to CPU in batch to stop vram overflow, but yet keep speed high
 
-                        # start_idx = 0
-                        # end_idx = min(1001, len(all_embeddings))
+                    #     # start_idx = 0
+                    #     # end_idx = min(1001, len(all_embeddings))
 
-                        start_idx = (chunk - 1) * 1000
-                        end_idx = min((chunk * 1000) + 1, len(all_embeddings))
+                    #     start_idx = (chunk - 1) * 1000
+                    #     end_idx = min((chunk * 1000) + 1, len(all_embeddings))
 
-                        # print(start_idx, end_idx, len(all_embeddings), len(all_labels))
+                    #     # print(start_idx, end_idx, len(all_embeddings), len(all_labels))
 
-                        # Batch move to CPU (more efficient)
-                        for i in range(start_idx, end_idx):
-                            # if RANK == 0:
-                            #     print(type(all_embeddings), "type of embeddings")
+                    #     # Batch move to CPU (more efficient)
+                    #     for i in range(start_idx, end_idx):
+                    #         # if RANK == 0:
+                    #         #     print(type(all_embeddings), "type of embeddings")
 
-                            all_embeddings[i] = all_embeddings[i].cpu()
+                    #         all_embeddings[i] = all_embeddings[i].cpu()
 
-                            # if RANK == 0:
-                            # print(type(all_embeddings), "type of embeddings")
+                    #         # if RANK == 0:
+                    #         # print(type(all_embeddings), "type of embeddings")
 
-                        for i in range(start_idx, end_idx):
-                            all_labels[i] = all_labels[i].cpu()
+                    #     for i in range(start_idx, end_idx):
+                    #         all_labels[i] = all_labels[i].cpu()
 
-                        chunk += 1
+                    #     chunk += 1
 
-                        # Optional: Check for any remaining CUDA tensors, sanity check
-                        for i, emb in enumerate(all_embeddings):
-                            if emb.is_cuda:
-                                print(f"Warning: embedding {i} still on GPU")
+                    #     # Optional: Check for any remaining CUDA tensors, sanity check
+                    #     for i, emb in enumerate(all_embeddings):
+                    #         if emb.is_cuda:
+                    #             print(f"Warning: embedding {i} still on GPU")
 
                 else:
                     # For ID classification, we pool the embeddings
@@ -1281,11 +1332,20 @@ class ESMDataset:
                     pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1) / lengths
                     pooled = pooled.cpu()  # Move to CPU immediately
 
-                    all_embeddings.append(pooled)
-                    all_labels.append(batch_labels)  # Store the corresponding labels
-                if self.training is False or self.domain_boundary_detection is True:
-                    all_starts.append(batch_start)
-                    all_ends.append(batch_end)
+                    start_idx = processed_samples
+                    end_idx = start_idx + pooled.size(0)
+                    
+                    all_embeddings[start_idx:end_idx] = pooled.cpu()
+                    all_labels[start_idx:end_idx] = batch_labels.cpu()
+                    if not self.training:
+                        all_starts[start_idx:end_idx] = batch_start.cpu()
+                        all_ends[start_idx:end_idx] = batch_end.cpu()
+                    
+                    processed_samples = end_idx
+
+                # if self.training is False or self.domain_boundary_detection is True:
+                #     all_starts.append(batch_start)
+                #     all_ends.append(batch_end)
 
                 from tqdm import tqdm
 
@@ -1333,7 +1393,7 @@ class ESMDataset:
                         )
                         single_tokens = single_tokens.cuda()
 
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             results = self.model(
                                 single_tokens,
                                 repr_layers=[self.model_layers],
@@ -1377,9 +1437,16 @@ class ESMDataset:
                         print(
                             f"\nRank {RANK}: Error processing individual sequence: {single_e}\n"
                         )
-                        zero_embedding = torch.zeros(1, expected_dim)
-                        all_embeddings.append(zero_embedding)
-                        all_labels.append(label.unsqueeze(0))  # Still keep the label
+                        if not self.domain_boundary_detection:
+                            start_idx = processed_samples
+                            end_idx = start_idx + 1
+                            all_embeddings[start_idx:end_idx] = torch.zeros(1, expected_dim)
+                            all_labels[start_idx:end_idx] = label.unsqueeze(0)
+                            processed_samples = end_idx
+                        else:
+                            zero_embedding = torch.zeros(1, expected_dim)
+                            all_embeddings.append(zero_embedding)
+                            all_labels.append(label.unsqueeze(0))  # Still keep the label
                         if (
                             self.training is False
                             or self.domain_boundary_detection is True
@@ -1423,10 +1490,18 @@ class ESMDataset:
                     #     print(all_labels[0].shape, "labels shape after padding")
 
                     # Convert list of tensors to a single tensor, then to numpy
-                    embeddings_tensor = torch.stack(
-                        [emb.cpu() for emb in all_embeddings]
-                    )
-                    labels_tensor = torch.stack([lbl.cpu() for lbl in all_labels])
+                    embeddings_tensor = torch.cat(all_embeddings, dim=0)
+                    labels_tensor = torch.cat(all_labels, dim=0)
+
+
+                    # Gather data to RANK 0
+                    gathered_embeddings = [None] * dist.get_world_size()
+                    gathered_labels = [None] * dist.get_world_size()
+                    dist.gather(embeddings_tensor, gather_list=gathered_embeddings if RANK == 0 else None, dst=0)
+                    dist.gather(labels_tensor, gather_list=gathered_labels if RANK == 0 else None, dst=0)
+
+
+
 
                     dist.barrier()  # Ensure all ranks are synchronized before saving
 
@@ -1437,28 +1512,23 @@ class ESMDataset:
 
                     if RANK == 0:
                         print("\n\nWriting...")
-                    for rank_id in range(dist.get_world_size()):
-                        if RANK == rank_id:
-                            with h5py.File(save_path, "a") as f:
-                                f[f"batch_{batch_num}_rank_{RANK}"] = (
-                                    embeddings_tensor.numpy()
-                                )
-                                f[f"labels_batch_{batch_num}_rank_{RANK}"] = (
-                                    labels_tensor.numpy()
-                                )
-                        dist.barrier()  # Ensure only one rank writes at a time
-                    if RANK == 0:
-                        print(
-                            f"Wrote embeddings and labels for batch {batch_num} to file"
-                        )
+                        with h5py.File(save_path, "a") as f:
+                            # Concatenate tensors from all ranks
+                            final_embeddings = torch.cat(gathered_embeddings, dim=0).numpy()
+                            final_labels = torch.cat(gathered_labels, dim=0).numpy()
+                            
+                            f[f"embeddings_chunk_{batch_num}"] = final_embeddings
+                            f[f"labels_chunk_{batch_num}"] = final_labels
+                        print(f"Wrote chunk {batch_num} to file")
+
 
                     # Clear the lists to free memory, should do the job, but somewhere i leak memory
 
                     del embeddings_tensor, labels_tensor
 
                     # Clear references before deleting the lists
-                    all_embeddings.clear()
-                    all_labels.clear()
+                    # all_embeddings.clear()
+                    # all_labels.clear()
 
                     # Reinitialize the lists
                     all_embeddings = []
@@ -1471,23 +1541,25 @@ class ESMDataset:
                     dist.barrier()  # Synchronize all ranks before continuing
 
             else:
-                # basic way for ID classification, just store the embeddings and labels
-
-                # Concatenate local embeddings and labels
-                local_embeddings = torch.cat(all_embeddings, dim=0)
-                local_labels = torch.cat(all_labels, dim=0)
+                # Pre-allocated tensors are already filled, just assign them
+                local_embeddings = all_embeddings
+                local_labels = all_labels
 
             if self.training is False:
-                local_starts = (
-                    torch.cat(all_starts, dim=0)
-                    if all_starts
-                    else torch.empty(0, dtype=torch.long)
-                )
-                local_ends = (
-                    torch.cat(all_ends, dim=0)
-                    if all_ends
-                    else torch.empty(0, dtype=torch.long)
-                )
+                if not self.domain_boundary_detection:
+                    local_starts = all_starts
+                    local_ends = all_ends
+                else:
+                    local_starts = (
+                        torch.cat(all_starts, dim=0)
+                        if all_starts
+                        else torch.empty(0, dtype=torch.long)
+                    )
+                    local_ends = (
+                        torch.cat(all_ends, dim=0)
+                        if all_ends
+                        else torch.empty(0, dtype=torch.long)
+                    )
 
         #     # Print the shapes of the gathered data
         #     print(
@@ -1515,8 +1587,8 @@ class ESMDataset:
         # NOT NEEDED FOR DOMAIN BOUDNARY TASK
 
         if dist.get_world_size() > 1 and self.domain_boundary_detection is False:
-            all_embeddings.clear()
-            all_labels.clear()
+            # all_embeddings.clear()
+            # all_labels.clear()
             print(len(local_embeddings), "local embeddings size")
             final_embeddings = local_embeddings
             final_labels = local_labels
