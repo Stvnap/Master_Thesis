@@ -1022,7 +1022,6 @@ class ESMDataset:
                 # Embed sequences with _embed function
                 self._embed(sequences)
 
-
             print("Done Embedding! Closing Embedder")
             # Return early if domain boundary detection is enabled, due to saved embeddings in _embed function
             return
@@ -1360,15 +1359,12 @@ class ESMDataset:
             self.labels = [torch.zeros(1000, dtype=torch.long) for seq in seqs]
 
         # Determine the appropriate Dataset class based on the mode
-        if (
-            self.domain_boundary_detection is True
-            or (
-                self.training is False
-                and hasattr(self, "all_starts")
-                and hasattr(self, "all_ends")
-                and self.all_starts is not None
-                and self.all_ends is not None
-            )
+        if self.domain_boundary_detection is True or (
+            self.training is False
+            and hasattr(self, "all_starts")
+            and hasattr(self, "all_ends")
+            and self.all_starts is not None
+            and self.all_ends is not None
         ):
             # Domain boundary detection OR EVAL mode with positions
             seq_dataset = SeqDatasetForEval(
@@ -1377,22 +1373,25 @@ class ESMDataset:
         else:
             # Training mode or fallback (when positions aren't available)
             seq_dataset = SeqDataset(seqs, self.labels)
-        
+
         # ESM2 limitation
         max_dimension = 1000
 
         # Apply windower func to cut sequences longer than 1000 into windows
         if self.training is True:
-            new_seqs, new_labels, idx_multiplied = windower(stepsize=500, dimension=max_dimension)
+            new_seqs, new_labels, idx_multiplied = windower(
+                stepsize=500, dimension=max_dimension
+            )
             seq_dataset.seqs = new_seqs
             seq_dataset.labels = new_labels
         else:
-            new_seqs, new_labels, new_starts, new_ends, idx_multiplied = windower(stepsize=500, dimension=max_dimension)
+            new_seqs, new_labels, new_starts, new_ends, idx_multiplied = windower(
+                stepsize=500, dimension=max_dimension
+            )
             seq_dataset.seqs = new_seqs
             seq_dataset.labels = new_labels
             seq_dataset.starts = new_starts
             seq_dataset.ends = new_ends
-
 
         if self.domain_boundary_detection is True:
             # Convert seq_dataset.labels to a tensor if it's a list facilitate overview
@@ -1408,7 +1407,6 @@ class ESMDataset:
         #     print(seq_dataset.labels.shape)
         #     print(len(seq_dataset))
         #     print( f"Seq: {seq_dataset.seqs[0:5]}, Label: {seq_dataset.labels[0:5]}")
-
 
         # Create a DataLoader with DistributedSampler for distributed training, drop last to ensure equal batch sizes and no deadlocks
         sampler = DistributedSampler(
@@ -1486,11 +1484,10 @@ class ESMDataset:
         # Flags for processed_samples and chunk number
         processed_samples = 0
         # Clear the dataset to free memory
-        seq_dataset = None  
+        seq_dataset = None
 
         # Embedding loop over dataloader with batch_num for progress tracking and actual batch_data
         for batch_num, batch_data in enumerate(dataloader):
-
             # Different unpacking based on training or EVAL mode
             if self.training is True:
                 batch_seqs, batch_labels = batch_data
@@ -1514,7 +1511,7 @@ class ESMDataset:
                 with torch.inference_mode():
                     results = self.model(
                         batch_tokens,
-                        repr_layers=[self.model_layers],    # last layer as representation
+                        repr_layers=[self.model_layers],  # last layer as representation
                         return_contacts=False,
                     )
 
@@ -1526,9 +1523,7 @@ class ESMDataset:
                 # Remove <cls> (first token) and <eos> (last token) positions from mask
                 mask = mask[:, 1:-1]
                 # remove <eos> and <cls> tokens, made by esm model (start and end tokens)
-                embeddings = embeddings[
-                    :, 1:-1, :
-                ]  
+                embeddings = embeddings[:, 1:-1, :]
 
                 # Print first 2 batches for debugging
                 # if RANK == 0 and batch_num < 2:
@@ -1537,7 +1532,6 @@ class ESMDataset:
                 #     )
                 #     print(embeddings[0:2, 0:5, 0:5])
 
-                
                 # no pooling as we need per residue embeddings for domain boundary detection
                 if self.domain_boundary_detection is True:
                     all_embeddings.append(embeddings.cpu())
@@ -1614,16 +1608,16 @@ class ESMDataset:
                         # gather single seq
                         single_seq = [("seq0", seq)]
                         # convert to tokens and move to gpu
-                        _, _, single_tokens = (
-                            self.batch_converter(single_seq)
-                        )
+                        _, _, single_tokens = self.batch_converter(single_seq)
                         single_tokens = single_tokens.cuda()
 
                         # forward pass
                         with torch.inference_mode():
                             results = self.model(
                                 single_tokens,
-                                repr_layers=[self.model_layers], # last layer = representative layer
+                                repr_layers=[
+                                    self.model_layers
+                                ],  # last layer = representative layer
                                 return_contacts=False,
                             )
                             # extract embeddings
@@ -1639,7 +1633,7 @@ class ESMDataset:
                             # no pooling for domain boundary detection, keep per residue embeddings
                             if self.domain_boundary_detection is True:
                                 # Move to CPU immediately, free vram
-                                embedding = embedding.cpu() 
+                                embedding = embedding.cpu()
                                 all_embeddings.append(embedding)
                                 all_labels.append(batch_labels)
 
@@ -1685,9 +1679,7 @@ class ESMDataset:
                         else:
                             zero_embedding = torch.zeros(1, expected_dim)
                             all_embeddings.append(zero_embedding)
-                            all_labels.append(
-                                label.unsqueeze(0)
-                            )
+                            all_labels.append(label.unsqueeze(0))
                         # and if in EVAL mode or domain boundary detection, placeholder starts and ends
                         if (
                             self.training is False
@@ -1695,7 +1687,6 @@ class ESMDataset:
                         ):
                             all_starts.append(torch.tensor([0], dtype=torch.long))
                             all_ends.append(torch.tensor([len(seq)], dtype=torch.long))
-
 
             # Save part of the embed loop for domain boundary detection
             if self.domain_boundary_detection is True:
@@ -1705,7 +1696,6 @@ class ESMDataset:
                     and batch_num > 0
                     or batch_num == len(dataloader) - 1
                 ):
-                    
                     # debug prints before padding
                     # if RANK == 0:
                     # print(all_labels[0].shape, "labels shape before padding")
@@ -1774,28 +1764,29 @@ class ESMDataset:
                     gc.collect()
                     torch.cuda.empty_cache()
                     dist.barrier()
-        
+
         # Close progress bar if it exists
-        if RANK == 0 and 'progress_bar' in locals():
+        if RANK == 0 and "progress_bar" in locals():
             progress_bar.close()
 
         # Synchronize before finalizing
         dist.barrier()
-        
+
         if RANK == 0:
             print("\nEmbeddings DONE!\n")
 
         # Return appropriate values based on mode
         if self.domain_boundary_detection:
             # Data already saved to h5 in chunks, just return idx_multiplied
-            return 
+            return
         elif self.training is False:
             # EVAL mode: return embeddings, labels, starts, ends
             return all_embeddings, all_labels, all_starts, all_ends, idx_multiplied
         else:
             # Training mode: return embeddings and labels only
             return all_embeddings, all_labels, None, None, idx_multiplied
-    
+
+
 # not intended to be run directly, raise error
 if __name__ == "__main__":
     raise NotImplementedError("This script is not intended to be run directly")
