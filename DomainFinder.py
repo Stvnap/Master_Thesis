@@ -12,6 +12,7 @@ import torch.nn as nn
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import precision_score, recall_score
+from scipy.ndimage import binary_closing, binary_opening
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -54,11 +55,11 @@ TRAIN_FRAC = 0.6
 VAL_FRAC = 0.2
 TEST_FRAC = 0.2
 
-EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
 # print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
 VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
 BATCH_SIZE = 40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
+EMB_BATCH = 32 if VRAM >= 24 else 16 if VRAM >= 16 else 8 if VRAM >= 8 else 4
 LR = 1e-5
 WEIGHT_DECAY = 1e-2
 EPOCHS = 50
@@ -593,7 +594,8 @@ def loader(ESM_Model, input_file):
     import pandas as pd
 
     os.makedirs("tempTest/embeddings", exist_ok=True)
-    if not os.path.exists("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain.h5"):
+    os.makedirs("/global/scratch2/sapelt/tempTest/embeddings", exist_ok=True)
+    if not os.path.exists("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"):
         if RANK == 0:
             print("Generating embeddings with ESM model...")
         ESMDataset(
@@ -604,7 +606,6 @@ def loader(ESM_Model, input_file):
             csv_path=input_file,
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
-            emb_batch=1,
         )
         if RANK == 0:
             print("Embeddings generated and saved.")
@@ -615,7 +616,7 @@ def loader(ESM_Model, input_file):
     if RANK == 0:
         print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5")
 
     # Load the original CSV to get actual sequence lengths
     df = pd.read_csv(input_file)
@@ -753,100 +754,48 @@ def Predictor(model, domain_boudnary_set_loader):
 
 def regions_search(all_preds, sequence_metadata=None):
     """
-    Function to search for domain regions in the predictions.
+    Function to search for domain regions using morphological operations.
     This function will return the start and end positions of each domain region.
     """
     all_regions = []
-    
+
+    # Define the structure for morphological operations. This is like a window size.
+    # A larger structure removes more noise and fills larger gaps.
+    opening_structure = np.ones(70)  # Removes positive regions smaller than 70 residues
+    closing_structure = np.ones(70)  # Fills gaps smaller than 70 residues    
+
     for seq_idx, seq_preds in enumerate(all_preds):
+        
+        # Ensure seq_preds is a numpy array
+        preds_array = np.array(seq_preds)
+
+        # 1. Apply binary opening to remove small, noisy positive predictions
+        cleaned_preds = binary_opening(preds_array, structure=opening_structure)
+
+        # 2. Apply binary closing to fill small gaps within domain regions
+        final_preds = binary_closing(cleaned_preds, structure=closing_structure)
+
+        # 3. Find contiguous regions of '1's in the final processed array
         regions = []
-        start = None
-        structured_counter = 0
-        in_structured_region = False
-        last_region_end = -1  # Track the end of the last region
-        
-        # Get actual sequence length from metadata
-        seq_len = len(seq_preds)
-        if sequence_metadata and seq_idx < len(sequence_metadata):
-            original_seq_idx = sequence_metadata[seq_idx]['original_seq_idx']
-            actual_seq_length = sequence_metadata[seq_idx]['actual_seq_length']
-            if RANK == 0 and seq_idx < 3:
-                print(f"Processing sequence {seq_idx} (original idx: {original_seq_idx}), "
-                      f"actual length: {actual_seq_length}, predictions length: {seq_len}")
-        
-        # Find FIRST 2 occurrence of 1s
-        first_positive = None
-        for i in range(seq_len):
-            if seq_preds[i] and seq_preds[i-1] == 1:
-                first_positive = i
-                break
-        
-        # If we found ANY 1, start region MUCH earlier before it
-        if first_positive is not None:
-            # Start 15 positions before first positive (reduced from 25)
-            start = max(0, first_positive)  
-            in_structured_region = True
-            structured_counter = 35  # Keep initial counter
-            if RANK == 0 and seq_idx < 3:
-                print(f"  Structured region started at position {start} (15 before first positive at {first_positive})")
-        
-        for i, pred in enumerate(seq_preds):
-            # Update counter based on prediction
-            if pred == 1:
-                structured_counter = min(structured_counter + 6, 60)  # Keep same increment
-            else:
-                structured_counter = max(structured_counter - 2, 0)   # Increase penalty from -1 to -2
-        
-            # Even lower threshold to start a new region
-            if structured_counter > 6 and not in_structured_region:  # Increased from 2 to 6
-                # Start with smaller offset - 15 positions before current (reduced from 25)
-                potential_start = max(0, i)
-                
-                # Ensure we don't overlap with the previous region
-                if potential_start > last_region_end:
-                    start = potential_start
-                    in_structured_region = True
-                    if RANK == 0 and seq_idx < 3:
-                        print(f"  Structured region started at index {start} (15 before trigger at {i})")
-            
-            # Higher threshold to end current region (from 3 to 2)
-            elif structured_counter <= 2 and in_structured_region:  # Decreased from 3 to 2
-                end = i  # End at current position
-                in_structured_region = False
-                if RANK == 0 and seq_idx < 3:
-                    print(f"  Structured region ended at index {i} (counter: {structured_counter})")
-                
-                # Only add regions that are long enough
+        if np.any(final_preds):
+            # Find where regions of 1s start and end
+            diff = np.diff(np.concatenate(([0], final_preds, [0])))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+
+            for start, end in zip(starts, ends):
                 region_length = end - start
-                if region_length >= 20:
-                    regions.append((start, end))
-                    last_region_end = end  # Update the last region end
-                    if RANK == 0 and seq_idx < 3:
-                        print(f"    Added region: ({start}, {end}) length: {region_length}")
-                elif RANK == 0 and seq_idx < 3:
-                    print(f"    Rejected short region: length {region_length}")
-                
-                start = None
-        
-        # Handle case where sequence ends while in a structured region
-        if in_structured_region and start is not None:
-            region_length = seq_len - start
-            if region_length >= 20:
-                regions.append((start, seq_len))
-                if RANK == 0 and seq_idx < 3:
-                    print(f"  Region ended at sequence end: ({start}, {seq_len}) length: {region_length}")
-            elif RANK == 0 and seq_idx < 3:
-                print(f"  Rejected short final region: length {region_length}")
-        
+                # Filter for regions of a minimum length
+                if region_length >= 30:
+                    regions.append((int(start), int(end)))
+
         all_regions.append(regions)
-    
+
+        if RANK == 0 and seq_idx < 3:
+            print(f"Processing sequence {seq_idx}: Found {len(regions)} regions: {regions}")
+
     if RANK == 0:
         print(f"Found {len(all_regions)} sequences with domain regions.")
-        # for seq_idx in range(min(3, len(all_regions))):
-        #     regions = all_regions[seq_idx]
-        #     metadata = sequence_metadata[seq_idx] if sequence_metadata else {}
-        #     actual_length = metadata.get('actual_seq_length', 'unknown')
-        #     print(f"Sequence {seq_idx} (actual length: {actual_length}) has {len(regions)} regions: {regions}")
 
     return all_regions
 

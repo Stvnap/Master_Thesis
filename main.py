@@ -512,10 +512,12 @@ def main(input_file, output_file, ESM_Model, gpus):
             # print(f"Temporary file not found: {temp_file}")
             continue
     embeddings_dir = "./tempTest/embeddings"
+    embedding_dir_scratch = "/global/scratch2/sapelt/tempTest/embeddings"
     if os.path.exists(embeddings_dir):
         import shutil
 
         shutil.rmtree(embeddings_dir)
+        shutil.rmtree(embedding_dir_scratch)
         # print(f"Removed embeddings cache directory: {embeddings_dir}")
 
     return final_df

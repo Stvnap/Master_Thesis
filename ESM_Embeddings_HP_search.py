@@ -43,10 +43,10 @@ NUM_CLASSES = 1001  # classes + 1 for "other" class
 if RANK == 0:
     print("USING n CLASSES:",NUM_CLASSES)
 
-CSV_PATH = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv"
+CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = f"/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_classification_{NUM_CLASSES-1}d.h5"
+CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES-1}d.h5"
 PROJECT_NAME = f"t33_ALL_{NUM_CLASSES-1}d"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
@@ -54,7 +54,7 @@ ESM_MODEL = "esm2_t33_650M_UR50D"
 EPOCHS = 10000
 STUDY_N_TRIALS = 10
 BATCH_SIZE = 512
-NUM_WORKERS_EMB = 8
+NUM_WORKERS_EMB = 64
 
 VAL_FRAC = 0.2
 TRAIN_FRAC = 1 - VAL_FRAC
@@ -786,7 +786,7 @@ def objective(
         enable_progress_bar=True,
         callbacks=[early_stop, checkpoint_callback],
         logger=TensorBoardLogger(
-            save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/tensorboard", 
+            save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/tensorboard", 
             name=f"optuna_trial_{trial.number}"
         ),
         # limit_train_batches=250, #245
@@ -961,7 +961,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
 
     # Rest of the function remains the same...
     # ckpt_dir = (
-    #     f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/tensorboard/optuna_trial_{trial.number}/version_0/checkpoints/"
+    #     f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/tensorboard/optuna_trial_{trial.number}/version_0/checkpoints/"
     # )
     # print(f"Looking for checkpoints in: {ckpt_dir}")
     # pattern = os.path.join(ckpt_dir, "*.ckpt")
@@ -978,7 +978,7 @@ def load_best_model(trial, input_dim, weights, domain_task=False):
 
 
 
-    # model_path = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}.pt"
+    # model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{PROJECT_NAME}.pt"
     # os.makedirs(os.path.dirname(model_path), exist_ok=True)
     # torch.save(model, model_path)
     # model = model.to(DEVICE).eval()
@@ -1058,12 +1058,12 @@ def class_distribution(val_dataset):
 
 
 def main_HP(Final_training=False):
-    os.makedirs("/scratch/tmp/sapelt/Master_Thesis/pickle", exist_ok=True)
-    os.makedirs(f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}", exist_ok=True)
-    os.makedirs("/scratch/tmp/sapelt/Master_Thesis/models", exist_ok=True)
+    os.makedirs("/global/research/students/sapelt/Masters/MasterThesis/pickle", exist_ok=True)
+    os.makedirs(f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}", exist_ok=True)
+    os.makedirs("/global/research/students/sapelt/Masters/MasterThesis/models", exist_ok=True)
     # Check if cache file exists, and if not, create embeddings and log progress
-    if os.path.exists(f"/scratch/tmp/sapelt/Master_Thesis/temp/progress_{NUM_CLASSES}.txt"):
-        with open(f"/scratch/tmp/sapelt/Master_Thesis/temp/progress_{NUM_CLASSES}.txt", "r") as status_file:
+    if os.path.exists(f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"):
+        with open(f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt", "r") as status_file:
             if "All chunks processed. Exiting." not in status_file.read():
                 ESMDataset(
                     esm_model=ESM_MODEL,
@@ -1209,12 +1209,12 @@ def main_HP(Final_training=False):
     
     
     # # Create sample weights inversely proportional to class frequency
-    # if os.path.exists(f"/scratch/tmp/sapelt/Master_Thesis/temp/sample_weights_{NUM_CLASSES}_idx.npy"):
-    #     sample_weights = np.load(f"/scratch/tmp/sapelt/Master_Thesis/temp/sample_weights_{NUM_CLASSES}_idx.npy")
+    # if os.path.exists(f"/global/research/students/sapelt/Masters/MasterThesis/temp/sample_weights_{NUM_CLASSES}_idx.npy"):
+    #     sample_weights = np.load(f"/global/research/students/sapelt/Masters/MasterThesis/temp/sample_weights_{NUM_CLASSES}_idx.npy")
     # else:
     #     sample_weights = [1.0/class_counts[label] for label in tqdm(train_labels[:25*5005], desc="Creating sample weights")]
     #     sample_weights = np.array(sample_weights)
-    #     np.save(f"/scratch/tmp/sapelt/Master_Thesis/temp/sample_weights_{NUM_CLASSES}_idx.npy", sample_weights)
+    #     np.save(f"/global/research/students/sapelt/Masters/MasterThesis/temp/sample_weights_{NUM_CLASSES}_idx.npy", sample_weights)
         
     # torch.from_numpy(sample_weights)   
 
@@ -1311,7 +1311,7 @@ def main_HP(Final_training=False):
         print("Starting Optuna hyperparameter search...")
         study = optuna.create_study(
             directions=["minimize", "maximize"],
-            storage=f"sqlite:////scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",
+            storage=f"sqlite:////global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",
             load_if_exists=True,
             study_name=PROJECT_NAME,
             # overwrite=True,
@@ -1324,7 +1324,7 @@ def main_HP(Final_training=False):
     if RANK != 0:
         study = optuna.create_study(
             direction="minimize",
-            storage=f"sqlite:////scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",
+            storage=f"sqlite:////global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",
             load_if_exists=True,
             study_name=PROJECT_NAME,
             # overwrite=True,
@@ -1476,7 +1476,7 @@ def main_HP(Final_training=False):
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
-                save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/FINAL/{PROJECT_NAME}/tensorboard", name=f"{PROJECT_NAME}_final"
+                save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/tensorboard", name=f"{PROJECT_NAME}_final"
             ),
             # limit_train_batches=250,
             # limit_val_batches=250,
@@ -1488,7 +1488,7 @@ def main_HP(Final_training=False):
         trainer.fit(lit_model, train_loader, val_loader)
 
         # save the final model
-        final_model_path = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}.pt"
+        final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{PROJECT_NAME}.pt"
 
         if RANK == 0:
             print(f"\nTraining complete, saving final model under: {final_model_path} ...\n")
@@ -1549,7 +1549,7 @@ class ClassifierDataset(torch.utils.data.Dataset):
 
 
 def loader(csv_path):
-    if not os.path.exists("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain_classifier.h5"):
+    if not os.path.exists("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"):
         ESMDataset(
             esm_model=ESM_MODEL,
             FSDP_used=False,
@@ -1565,7 +1565,7 @@ def loader(csv_path):
 
 
     # Create inference dataset
-    classifier_dataset = ClassifierDataset("/scratch/tmp/sapelt/Master_Thesis/tempTest/embeddings/embeddings_domain_classifier.h5")
+    classifier_dataset = ClassifierDataset("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5")
 
 
     # Create DataLoader for inference
@@ -1581,7 +1581,7 @@ def loader(csv_path):
 
 
     # Load the best model
-    model = torch.load("/scratch/tmp/sapelt/Master_Thesis/models/Optuna_1000d_uncut_t33.pt",weights_only=False)
+    model = torch.load("/global/research/students/sapelt/Masters/MasterThesis/models/Optuna_1000d_uncut_t33.pt",weights_only=False)
     model.to(DEVICE).eval()
     print("Model loaded and set to eval mode")
     print(len(classifier_loader), "batches in classifier_loader")
@@ -1627,7 +1627,7 @@ def parse_args():
     import argparse
     
     parser = argparse.ArgumentParser(description="ESM Embeddings HP Search")
-    parser.add_argument("--csv_path", type=str, default="/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv", help="Path to input CSV file")
+    parser.add_argument("--csv_path", type=str, default="/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv", help="Path to input CSV file")
     parser.add_argument("--HP_mode", action="store_true", help="Use to run hyperparameter optimization")
     
     return parser.parse_args()
@@ -1656,9 +1656,9 @@ if __name__ == "__main__":
         'raw_scores': all_predictions_raw
     })
     
-    os.makedirs('/scratch/tmp/sapelt/Master_Thesis/tempTest', exist_ok=True)
-    predictions_df.to_csv('/scratch/tmp/sapelt/Master_Thesis/tempTest/predictions.csv', index=False)
+    os.makedirs('/global/research/students/sapelt/Masters/MasterThesis/tempTest', exist_ok=True)
+    predictions_df.to_csv('/global/research/students/sapelt/Masters/MasterThesis/tempTest/predictions.csv', index=False)
     
     if RANK == 0:
-        print("Predictions saved to /scratch/tmp/sapelt/Master_Thesis/tempTest/predictions.csv")
+        print("Predictions saved to /global/research/students/sapelt/Masters/MasterThesis/tempTest/predictions.csv")
         print(f"Total predictions: {len(all_predictions)}")
