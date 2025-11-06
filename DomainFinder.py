@@ -40,10 +40,10 @@ DEVICE_ID = RANK % torch.cuda.device_count()
 # 1. Global settings
 # -------------------------
 
-CSV_PATH = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/FoundEntriesSwissProteins.csv"
+CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesSwissProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = "/scratch/tmp/sapelt/Master_Thesis/pickle/FoundEntriesSwissProteins_domains.pkl"
+CACHE_PATH = "/global/research/students/sapelt/Masters/MasterThesis/pickle/FoundEntriesSwissProteins_domains.pkl"
 PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
@@ -309,7 +309,7 @@ def main_trainer(Final_training=False):
     if RANK == 0:
         print("Directories created.")
 
-    if not os.path.exists("/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_domain.h5"):
+    if not os.path.exists("/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"):
         ESMDataset(
             FSDP_used=False,
             domain_boundary_detection=True,
@@ -326,7 +326,7 @@ def main_trainer(Final_training=False):
     if RANK == 0:
         print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset("/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5")
 
     # Split indices for train and validation sets
     dataset_size = len(domain_boundary_dataset)
@@ -493,7 +493,7 @@ def main_trainer(Final_training=False):
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
-                save_dir=f"/scratch/tmp/sapelt/Master_Thesis/logs/{PROJECT_NAME}", name=PROJECT_NAME
+                save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/{PROJECT_NAME}", name=PROJECT_NAME
             ),
         )
 
@@ -507,7 +507,7 @@ def main_trainer(Final_training=False):
         trainer.fit(lit_model, train_loader, val_loader)
 
         # save the final model
-    final_model_path = f"/scratch/tmp/sapelt/Master_Thesis/models/{PROJECT_NAME}.pt"
+    final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/{PROJECT_NAME}.pt"
     torch.save(lit_model, final_model_path)   
     lit_model=torch.load(final_model_path, map_location=DEVICE, weights_only=False)
 
@@ -669,7 +669,7 @@ def loader(ESM_Model, input_file):
         print("Datasets and DataLoaders for domain boundary detection created.")
         print("\nLoading Model...\n")
 
-    model = torch.load("/scratch/tmp/sapelt/Master_Thesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
+    model = torch.load("/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
     model = model.to(DEVICE)
     model.eval()
 
@@ -827,7 +827,7 @@ def main(input_file):
     #     print("First sequence regions:", all_regions[0][1] if all_regions else "No regions")
 
     # Save all_regions to file
-    output_file = "/scratch/tmp/sapelt/Master_Thesis/tempTest/predicted_domain_regions.pkl"
+    output_file = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl"
     with open(output_file, 'wb') as f:
         pickle.dump(all_regions, f)
         pickle.dump(sequence_metadata, f)
@@ -838,7 +838,7 @@ def main(input_file):
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Domain Finder Script")
     parser.add_argument("--input", type=str, required=False, help="Input file path")
-    parser.add_argument("--output", type=str, default="/scratch/tmp/sapelt/Master_Thesis/tempTest/predicted_domain_regions.pkl", help="Output file path")
+    parser.add_argument("--output", type=str, default="/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl", help="Output file path")
     parser.add_argument("--model", type=str, required=False, help="ESM model name")
     parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
     return parser.parse_args()

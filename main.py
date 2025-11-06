@@ -113,7 +113,7 @@ def Transformer(input_file, ESM_Model, gpus):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        universal_newlines=False,
+        universal_newlines=True,
         bufsize=1,
         env={**os.environ, 'PYTHONUNBUFFERED': '1'},  # Force Python to be unbuffered
 
@@ -229,7 +229,7 @@ def classifier(gpus):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        universal_newlines=False,
+        universal_newlines=True,
         bufsize=1,
         env={**os.environ, 'PYTHONUNBUFFERED': '1'},  # Force Python to be unbuffered
     )
@@ -483,7 +483,7 @@ def main(input_file, output_file, ESM_Model, gpus):
     # --------------------------------------------------------------------
 
     # Call classifier script to classify the domains
-    print("/n/n Classifying domains...")
+    print("\n\nClassifying domains...")
     all_predictions, all_predictions_raw = classifier(gpus)  
 
     print("Classification completed.\n")
@@ -496,7 +496,7 @@ def main(input_file, output_file, ESM_Model, gpus):
     # --------------------------------------------------------------------
 
     # clean up temporary files
-    print(f"\n\nPipeline completed. Results saved to {output_file}\n\n")
+    print(f"\n\nPipeline completed. Results saved to {output_file}. Removing temp files...\n\n")
     temp_files = [
         "./tempTest/seqs.csv",
         "./tempTest/regions.csv",

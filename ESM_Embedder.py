@@ -1,3 +1,33 @@
+"""
+ESM_Embedder.py
+
+Table of Contents:
+1. Imports & basic setup
+2. GLOBALS & ENV SETUP
+3. Dataset Classes
+4. Embedder Class (ESMDataset)
+
+Classes:
+- SeqDataset
+- SeqDatasetForEval
+- ESMDataset
+
+Functions:
+- ESMDataset.__init__
+- ESMDataset.esm_loader
+- ESMDataset._embed
+
+Nested Functions within __init__:
+- map_label
+- minicutter
+- subsampler
+
+Nested Functions within _embed:
+- windower
+"""
+# -------------------------
+# 1. Imports & basic setup
+# -------------------------
 import datetime
 import gc
 import os
@@ -9,13 +39,17 @@ import pandas as pd
 import psutil
 import torch
 import torch.distributed as dist
-import tqdm
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
 from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+
+# -------------------------
+# 2. GLOBALS & ENV SETUP
+# -------------------------
 
 os.environ["NCCL_TIMEOUT"] = (
     "36000000"  # 10 hours in milliseconds, to prevent NCCL timeout issues that sometimes arise during long training runs
@@ -100,7 +134,7 @@ EMB_BATCH = (
 
 
 # -------------------------
-# 4. Dataset & embedding
+# 3. Dataset Classes
 # -------------------------
 class SeqDataset(Dataset):
     """
@@ -135,6 +169,11 @@ class SeqDatasetForEval(Dataset):
 
     def __getitem__(self, idx):
         return self.seqs[idx], self.labels[idx], self.starts[idx], self.ends[idx]
+
+
+# -------------------------
+# 4. Embedder Class
+# -------------------------
 
 
 class ESMDataset:
@@ -228,50 +267,37 @@ class ESMDataset:
             end = int(row["end"])
             return sequence[start:end]
 
-        def subsampler(df, target, first_subsampler):
-            """
-            Subsamples class 0 to target samples to reduce class imbalance. Mainly used for smaller num_classes settings.
-            """
-            if target is None:  # early exit if no subsampling set
+        def subsampler(df, target, first_subsampler, selected_ids):
+            if target is None:
                 return df
 
             # Count samples per class
             class_counts = df["label"].value_counts()
 
-            # Subsample class 0  to target samples each
+            # Subsample class 0 to target samples each
+            target_samples_per_class = target
             subsampled_dfs = []
 
             for class_label in sorted(class_counts.index):
-                class_samples = df[
-                    df["label"] == class_label
-                ]  # loop over classes to get samples
-                current_count = len(
-                    class_samples
-                )  # get current count of samples for each class
+                class_samples = df[df["label"] == class_label]
+                current_count = len(class_samples)
 
-                if (
-                    class_label == 0 and current_count > target
-                ):  # subsample only class 0 if above target
+                if class_label == 0 and current_count > target_samples_per_class:
                     class_subsampled = class_samples.sample(
-                        n=target,
-                        random_state=42,  # reproducible subsampling
+                        n=target_samples_per_class, random_state=42
                     )
-                    # if RANK == 0:
-                    #     print(f"  Class {class_label}: {current_count} -> {target}")
                 else:
-                    class_subsampled = class_samples  # keep all other classes as is
-                    # if RANK == 0:
-                    #     print(f"  Class {class_label}: {current_count} (kept all)")
+                    class_subsampled = class_samples
 
-                subsampled_dfs.append(class_subsampled)  # store subsampled class dfs
+                subsampled_dfs.append(class_subsampled)
 
             # Combine all subsampled classes
             df = pd.concat(subsampled_dfs, ignore_index=True)
 
-            if RANK == 0:
-                # print final class distribution
-                all_pfam = []
-                # print("Final class distribution after subsampling:")
+            # Print distribution info only from rank 0
+
+            if RANK == 0 and first_subsampler is True:
+                print(f"[RANK {RANK}] Final class distribution after subsampling:")
                 final_counts = df["label"].value_counts()
                 for i in sorted(final_counts.index):
                     if i in final_counts:
@@ -280,25 +306,10 @@ class ESMDataset:
                             if i > 0 and i <= len(selected_ids)
                             else "other"
                         )
-                        if first_subsampler is True:
-                            print(
-                                f"Class {i} with ID {pfam_id}: {final_counts[i]} from samples | avg length {df[df['label'] == i][sequence_col].str.len().mean():.2f}"
-                            )
-
-                        all_pfam.append(pfam_id)
-
-                if self.training is True:
-                    os.makedirs(
-                        "/global/research/students/sapelt/Masters/MasterThesis/temp",
-                        exist_ok=True,
-                    )
-                    all_pfam = all_pfam[1:]  # Exclude "other" category
-                    open(
-                        f"/global/research/students/sapelt/Masters/MasterThesis/temp/selected_pfam_ids_{num_classes - 1}.txt",
-                        "w",
-                    ).write("\n".join(all_pfam))
-
-            del class_samples, class_subsampled
+                        print(
+                            f"Class {i} with ID {pfam_id}: {final_counts[i]} samples | "
+                            f"avg length {df[df['label'] == i][sequence_col].str.len().mean():.2f}"
+                        )
 
             return df
 
@@ -309,7 +320,7 @@ class ESMDataset:
                     print("Loading data...")
 
                 # !!! Chunk size, adjust based on available memory !!!
-                chunksize = 20000000
+                chunksize = 100000
 
                 # path to selected IDs file, based on num_classes set
                 selected_ids_file = f"/global/research/students/sapelt/Masters/MasterThesis/temp/selected_pfam_ids_{num_classes - 1}.txt"
@@ -499,13 +510,14 @@ class ESMDataset:
                             available_priority_ids + remaining_ids[:max_additional_ids]
                         )
 
-                        # Save the globally determined list to a file.
-                        with open(selected_ids_file, "w") as f:
-                            for pfam_id in selected_ids:
-                                f.write(f"{pfam_id}\n")
-                        print(
-                            f"Saved {len(selected_ids)} globally selected Pfam IDs to file."
-                        )
+                        # Save the globally determined list to a file. Only RANK 0 writes to avoid conflicts.
+                        if RANK == 0:
+                            with open(selected_ids_file, "w") as f:
+                                for pfam_id in selected_ids:
+                                    f.write(f"{pfam_id}\n")
+                            print(
+                                f"Saved {len(selected_ids)} globally selected Pfam IDs to file."
+                            )
 
                     elif (
                         num_classes != 24381 and os.path.exists(selected_ids_file)
@@ -519,6 +531,10 @@ class ESMDataset:
                     ) as f:
                         selected_ids = [line.strip() for line in f.readlines()]
 
+                print(
+                    f"RANK {RANK}: Using {len(selected_ids)} selected Pfam IDs for mapping."
+                )
+
                 # Create mapping from Pfam ID to label index
                 pfam_to_label = {
                     pfam_id: i + 1 for i, pfam_id in enumerate(selected_ids)
@@ -529,14 +545,43 @@ class ESMDataset:
 
                 # start chunk set and creating del_flag for interrupted chunks
                 start_chunk = 0
+                expected_chunks = int(
+                    22 * (10000000 / chunksize)
+                )  # Approximate number of chunks for progress reporting, based on the 22 chunks for chunksize 10000000 based of earlier calculation on the full uniprot set
+
                 del_key = False
 
+                # Create chunk iterators for different use cases
+                try:
+                    # base iter for train mode
+                    chunk_iter = pd.read_csv(
+                        csv_path,
+                        usecols=["start", "end", "id", "Pfam_id", "Sequence"],
+                        chunksize=chunksize,
+                    )
+                except Exception as e:
+                    # exception handling to enter usage mode based on the missing columns earlier described
+                    if RANK == 0:
+                        print(
+                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
+                        )
+                    chunk_iter = pd.read_csv(csv_path, chunksize=chunksize)
+                    self.usage_mode = True
+
+                # set path for progress file based on usage mode
+                if self.usage_mode is True:
+                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_{num_classes}.txt"
+                else:
+                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt"
+
+
+                print(f"RANK {RANK}: Using progress file at {progress_file_path}")
                 # check progress file to resume from last processed chunk if available
                 if os.path.exists(
-                    f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt"
+                    progress_file_path
                 ):
                     with open(
-                        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt",
+                        progress_file_path,
                         "r",
                     ) as status_file:
                         lines = status_file.readlines()
@@ -557,54 +602,35 @@ class ESMDataset:
                             if RANK == 0:
                                 print(f"Resuming from chunk {start_chunk}")
 
-                # Create chunk iterators for different use cases
-                try:
-                    # base iter for train mode
-                    chunk_iter = pd.read_csv(
-                        csv_path,
-                        usecols=["start", "end", "id", "Pfam_id", "Sequence"],
-                        chunksize=chunksize,
-                    )
-                except Exception as e:
-                    # exception handling to enter usage mode based on the missing columns earlier described
-                    if RANK == 0:
-                        print(
-                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
-                        )
-                    chunk_iter = pd.read_csv(csv_path, chunksize=chunksize)
-                    self.usage_mode = True
-
-                # Skip processed chunks
+                # Skip processed chunks and if skip failes exit embedding
                 for _ in range(start_chunk):
                     try:
                         next(chunk_iter)
                     except StopIteration:
                         if RANK == 0:
                             print("All chunks processed. No more chunks to process.")
+                            # Write final status to progress file
                             with open(
-                                f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt",
+                                progress_file_path,
                                 "a",
                             ) as status_file:
                                 if RANK == 0:
                                     status_file.write(
                                         "All chunks processed. Exiting.\n"
                                     )
-                        return  # exit if all chunks are already processed
-
-                expected_chunks = int(
-                    22 * (10000000 / chunksize)
-                )  # Approximate number of chunks for progress reporting, based on the 22 chunks for chunksize 10000000 based of earlier calculation on the full uniprot set
+                        # exit if all chunks are already processed
+                        return
 
                 # Loop to process remaining chunks with the chosen chunk_iter from the set start_chunk
                 for chunk_num, chunk in enumerate(chunk_iter, start=start_chunk):
                     if RANK == 0:
                         print(
-                            f"Processing chunk {chunk_num}/{int(expected_chunks)} with {len(chunk)} sequences"
+                            f"\nProcessing chunk {chunk_num}/{int(expected_chunks)} with {len(chunk)} sequences"
                         )
 
                     # Write processing status (before processing): "Processing chunk {chunk_num}"
                     with open(
-                        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt",
+                        progress_file_path,
                         "a",
                     ) as status_file:
                         if RANK == 0:
@@ -637,7 +663,7 @@ class ESMDataset:
                         chunk["label"] = chunk["label"].astype(int)
 
                         # Subsample class 0 to target samples to reduce class imbalance, when not in usage mode
-                        chunk = subsampler(chunk, 100000, first_subsampler)
+                        chunk = subsampler(chunk, 10000, first_subsampler, selected_ids)                        
 
                     # store start and end positions for EVAL mode
                     if self.training is False:
@@ -726,19 +752,25 @@ class ESMDataset:
 
                     # train/val split and saving to h5 file for training mode
                     if self.training is True and self.usage_mode is False:
-                        unique_labels, counts = torch.unique(labels, return_counts=True)
-                        single_sample_classes = unique_labels[counts == 1]
+                        if num_classes != 24381:
+                            unique_labels, counts = torch.unique(
+                                labels, return_counts=True
+                            )
+                            single_sample_classes = unique_labels[counts == 1]
 
-                        # mask to remove single sample classes due to stratified splitting requirement
-                        if len(single_sample_classes) > 0:
-                            if RANK == 0:
-                                print(
-                                    f"Warning: Found {len(single_sample_classes)} classes with only one sample. Removing them before splitting."
-                                )
-                            mask = ~torch.isin(labels, single_sample_classes)
+                            # mask to remove single sample classes due to stratified splitting requirement
+                            if len(single_sample_classes) > 0:
+                                if RANK == 0:
+                                    print(
+                                        f"Warning: Found {len(single_sample_classes)} start_chunk before splitting."
+                                    )
+                                mask = ~torch.isin(labels, single_sample_classes)
 
-                            embeddings = embeddings[mask]
-                            labels = labels[mask]
+                                embeddings = embeddings[mask]
+                                labels = labels[mask]
+
+                        if RANK == 0:
+                            print("Performing train/val split...")
 
                         # Stratified train/val split, either stratified if num_classes != 24381 else normal split
                         if num_classes != 24381:
@@ -833,12 +865,9 @@ class ESMDataset:
                     # idx_multiplied to track which original sequences were slided into windows
                     elif self.usage_mode is True:
                         # fix save_path for usage mode, no need to make it variable
-                        save_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/embeddings/embeddings_domain_classifier.h5"
+                        save_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
                         # create tempTest/embeddings directory if not exists to load in embeddings
-                        os.makedirs(
-                            "/global/research/students/sapelt/Masters/MasterThesis/tempTest/embeddings",
-                            exist_ok=True,
-                        )
+                        os.makedirs("/global/scratch2/sapelt/tempTest/embeddings", exist_ok=True)
 
                         # save loop for each rank singlely to prevent conflicts
                         for rank_id in range(dist.get_world_size()):
@@ -913,7 +942,7 @@ class ESMDataset:
 
                     # Final status write after completing chunk. Now its ensured that chunk got fully processed
                     with open(
-                        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt",
+                        progress_file_path,
                         "a",
                     ) as status_file:
                         if RANK == 0:
@@ -1022,7 +1051,8 @@ class ESMDataset:
                 # Embed sequences with _embed function
                 self._embed(sequences)
 
-            print("Done Embedding! Closing Embedder")
+            if RANK == 0:
+                print("Done Embedding! Closing Embedder")
             # Return early if domain boundary detection is enabled, due to saved embeddings in _embed function
             return
 
@@ -1355,8 +1385,13 @@ class ESMDataset:
         seqs = list(seqs)
 
         if self.usage_mode is True:
-            # dummy labels for usage mode - make them all the same size (1000) for consistency to allow tensor concatenation later
-            self.labels = [torch.zeros(1000, dtype=torch.long) for seq in seqs]
+            # dummy labels for usage mode during embedding. Real labels will be gathered later from the Model prediction
+            if self.domain_boundary_detection is True:
+                # Per-residue labels for domain boundary detection
+                self.labels = [torch.zeros(1000, dtype=torch.long) for seq in seqs]
+            else:
+                # Scalar labels for classification mode
+                self.labels = [torch.tensor(0, dtype=torch.long) for seq in seqs]
 
         # Determine the appropriate Dataset class based on the mode
         if self.domain_boundary_detection is True or (
@@ -1468,7 +1503,7 @@ class ESMDataset:
             print(f"Each Rank will process sequences {sampler.num_samples}")
 
         # Pre-allocate tensors on CPU to save GPU memory and improve speed
-        total_samples = len(seq_dataset)
+        total_samples = sampler.num_samples
         if self.domain_boundary_detection:
             pass  # This logic will be handled inside the loop for domain boundary detection
         else:
@@ -1485,6 +1520,17 @@ class ESMDataset:
         processed_samples = 0
         # Clear the dataset to free memory
         seq_dataset = None
+        chunk_num = 0
+
+        progress_bar = None
+        if RANK == 0:
+            progress_bar = tqdm(
+                total=len(dataloader),
+                desc="Embedding Data",
+                position=0,
+                leave=True,
+                ncols=150,
+            )
 
         # Embedding loop over dataloader with batch_num for progress tracking and actual batch_data
         for batch_num, batch_data in enumerate(dataloader):
@@ -1509,7 +1555,8 @@ class ESMDataset:
 
                 # Forward pass through the model to get embeddings
                 with torch.inference_mode():
-                    results = self.model(
+                    model_to_run = getattr(self.model, "module", self.model)
+                    results = model_to_run(
                         batch_tokens,
                         repr_layers=[self.model_layers],  # last layer as representation
                         return_contacts=False,
@@ -1562,14 +1609,14 @@ class ESMDataset:
                     processed_samples = end_idx
 
                 # Progress bar initialization
-                if batch_num == 0 and RANK == 0:
-                    progress_bar = tqdm(
-                        total=len(dataloader),
-                        desc="Embedding Data",
-                        position=0,
-                        leave=True,
-                        ncols=150,
-                    )
+                # if batch_num == 0 and RANK == 0:
+                #     progress_bar = tqdm(
+                #         total=len(dataloader),
+                #         desc="Embedding Data",
+                #         position=0,
+                #         leave=True,
+                #         ncols=150,
+                #     )
 
                 # Update progress bar and memory stats every 1 batch or on last batch
                 if (
@@ -1613,7 +1660,8 @@ class ESMDataset:
 
                         # forward pass
                         with torch.inference_mode():
-                            results = self.model(
+                            model_to_run = getattr(self.model, "module", self.model)
+                            results = model_to_run(
                                 single_tokens,
                                 repr_layers=[
                                     self.model_layers
@@ -1713,45 +1761,37 @@ class ESMDataset:
                     #     print(all_labels[0].shape, "labels shape after padding")
 
                     # start with current rank concat to torch tensor
+
                     embeddings_tensor = torch.cat(all_embeddings, dim=0)
                     labels_tensor = torch.cat(all_labels, dim=0)
 
-                    # Gather data to RANK 0
-                    gathered_embeddings = [None] * dist.get_world_size()
-                    gathered_labels = [None] * dist.get_world_size()
-                    # use dist.gather to collect tensors from all ranks to rank 0 for embeddings and labels
-                    dist.gather(
-                        embeddings_tensor,
-                        gather_list=gathered_embeddings if RANK == 0 else None,
-                        dst=0,
-                    )
-                    dist.gather(
-                        labels_tensor,
-                        gather_list=gathered_labels if RANK == 0 else None,
-                        dst=0,
-                    )
-                    # Ensure all ranks are synchronized before saving
-                    dist.barrier()
-
                     # save path handling, different for usage mode and normal mode
                     if self.usage_mode is True:
-                        save_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/embeddings/embeddings_domain.h5"
+                        save_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
                     else:
                         save_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
 
-                    # Only RANK 0 writes to the h5 file, others wait
+                    # Save embeddings and labels to h5py file with rank identifier to avoid write conflicts
                     if RANK == 0:
-                        print("\n\nWriting...")
-                        with h5py.File(save_path, "a") as f:
-                            # Concatenate tensors from all ranks
-                            final_embeddings = torch.cat(
-                                gathered_embeddings, dim=0
-                            ).numpy()
-                            final_labels = torch.cat(gathered_labels, dim=0).numpy()
+                        print("\n...Writing chunk to disk...")
+                    for rank_id in range(dist.get_world_size()):
+                        if RANK == rank_id:
+                            with h5py.File(save_path, "a") as f:
+                                f[f"batch_{batch_num}_rank_{RANK}"] = (
+                                    embeddings_tensor.numpy()
+                                )
+                                f[f"labels_batch_{batch_num}_rank_{RANK}"] = (
+                                    labels_tensor.numpy()
+                                )
+                        dist.barrier()  # Ensure only one rank writes at a time
 
-                            f[f"embeddings_chunk_{batch_num}"] = final_embeddings
-                            f[f"labels_chunk_{batch_num}"] = final_labels
-                        print(f"Wrote chunk {batch_num} to file")
+                    if RANK == 0:
+                        print(
+                            f"Rank {RANK}: Saved chunk {chunk_num} with {embeddings_tensor.shape[0]} embeddings to {save_path}"
+                        )
+
+                    # Chunk counter
+                    chunk_num += 1
 
                     # Clear the lists to free memory, should do the job, but somewhere i leak memory
                     del embeddings_tensor, labels_tensor
