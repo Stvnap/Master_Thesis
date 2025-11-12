@@ -2,7 +2,8 @@
 ESM_Embedder.py
 
 Table of Contents:
-1. Imports & basic setup
+
+1. Imports
 2. GLOBALS & ENV SETUP
 3. Dataset Classes
 4. Embedder Class (ESMDataset)
@@ -26,7 +27,7 @@ Nested Functions within _embed:
 - windower
 """
 # -------------------------
-# 1. Imports & basic setup
+# 1. Imports
 # -------------------------
 import datetime
 import gc
@@ -522,6 +523,10 @@ class ESMDataset:
                     elif (
                         num_classes != 24381 and os.path.exists(selected_ids_file)
                     ):  # For smaller num_classes, load selected Pfam IDs from file if it exists
+                        with open(selected_ids_file, "r") as f:
+                            selected_ids = [line.strip() for line in f.readlines()]
+                    elif num_classes != 24381 and self.training is False:
+                        # In eval mode, load the same selected IDs as in training mode
                         with open(selected_ids_file, "r") as f:
                             selected_ids = [line.strip() for line in f.readlines()]
                 else:  # For 24381 classes, use all Pfam IDs stored in a made file
@@ -1603,8 +1608,8 @@ class ESMDataset:
                     all_embeddings[start_idx:end_idx] = pooled.cpu()
                     all_labels[start_idx:end_idx] = batch_labels.cpu()
                     if not self.training:
-                        all_starts[start_idx:end_idx] = batch_start.cpu()
-                        all_ends[start_idx:end_idx] = batch_end.cpu()
+                        all_starts[start_idx:end_idx] = batch_start
+                        all_ends[start_idx:end_idx] = batch_end
 
                     processed_samples = end_idx
 

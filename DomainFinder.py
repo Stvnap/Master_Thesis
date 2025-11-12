@@ -1,6 +1,13 @@
+# -------------------------
+# 1. Imports
+# -------------------------
+import argparse
 import math
 import os
-import argparse
+
+# from main import input_file
+import pickle
+
 import h5py
 import numpy as np
 import optuna
@@ -11,68 +18,61 @@ import torch.distributed as dist
 import torch.nn as nn
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from sklearn.metrics import precision_score, recall_score
 from scipy.ndimage import binary_closing, binary_opening
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-# from main import input_file
-import pickle
+
 from ESM_Embeddings_HP_search import (
     ESMDataset,
     load_best_model,
     objective,
 )
 
+# -------------------------
+# 2. Global settings & basic setup
+# -------------------------
 
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))# BATCH_SIZE = 10000
-
+# ddp setup
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # device setup
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 if not dist.is_initialized():
     dist.init_process_group("nccl")
     if dist.get_rank() == 0:
         print("Initializing process group for DDP")
-RANK = dist.get_rank()
-# print(f"Start running basic DDP example on rank {RANK}.")
-# create model and move it to GPU with id rank
-DEVICE_ID = RANK % torch.cuda.device_count()
+RANK = dist.get_rank()  # rank of the current process
 
-# -------------------------
-# 1. Global settings
-# -------------------------
-
-CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesSwissProteins.csv"
-CATEGORY_COL = "Pfam_id"
-SEQUENCE_COL = "Sequence"
-CACHE_PATH = "/global/research/students/sapelt/Masters/MasterThesis/pickle/FoundEntriesSwissProteins_domains.pkl"
-PROJECT_NAME = "Optuna_uncut_t33_domains_boundary"
-
-ESM_MODEL = "esm2_t33_650M_UR50D"
-
-NUM_CLASSES = (
-    2  # Number of classes for domain detection, set to 1 for binary classification
+# GLOBAL SETTINGS AND PATHS
+CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesSwissProteins.csv"  # path to the csv file with sequences
+CATEGORY_COL = "Pfam_id"  # category column in the csv file
+SEQUENCE_COL = "Sequence"  # sequence column in the csv file
+CACHE_PATH = "/global/research/students/sapelt/Masters/MasterThesis/pickle/FoundEntriesSwissProteins_domains.pkl"  # path to cache pickle file
+PROJECT_NAME = (
+    "Optuna_uncut_t33_domains_boundary"  # project name for logging and model saving
 )
-TRAIN_FRAC = 0.6
-VAL_FRAC = 0.2
-TEST_FRAC = 0.2
-
-NUM_WORKERS = min(16, os.cpu_count())
-# print(f"Using {NUM_WORKERS_EMB} workers for embedding generation")
-VRAM = psutil.virtual_memory().total // (1024 ** 3)  # in GB
-BATCH_SIZE = 40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
-EMB_BATCH = 32 if VRAM >= 24 else 16 if VRAM >= 16 else 8 if VRAM >= 8 else 4
-LR = 1e-5
-WEIGHT_DECAY = 1e-2
-EPOCHS = 50
+ESM_MODEL = "esm2_t33_650M_UR50D"  # ESM model to use
+NUM_CLASSES = (
+    2  # Number of classes for domain detection. Keep 2 for boundary vs non-boundary
+)
+TRAIN_FRAC = 0.6  # Fraction of data used for training
+VAL_FRAC = 0.2  # ... for validation
+TEST_FRAC = 0.2  # ... for testing
+NUM_WORKERS = min(16, os.cpu_count())  # number of DataLoader workers
+VRAM = psutil.virtual_memory().total // (1024**3)  # systems VRAM in GB
+BATCH_SIZE = (
+    40 if VRAM >= 24 else 20 if VRAM >= 16 else 10 if VRAM >= 8 else 5
+)  # adjust batch size based on available VRAM
+EPOCHS = 50  # number of training epochs
 STUDY_N_TRIALS = 3  # number of optuna trials
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# print(f"Using device: {DEVICE}")
-
 
 # -------------------------
-# 2. Transformer Model
+# 3. Transformer Class
 # -------------------------
 class Transformer(nn.Module):
+    """
+    
+    """
     def __init__(
         self,
         input_dim,  # 1280 for ESM2-t33
@@ -111,7 +111,7 @@ class Transformer(nn.Module):
             dim_feedforward=working_dim * 4,  # Standard: 4x model dimension
             dropout=dropout,
             activation=activation,
-            batch_first=True,  
+            batch_first=True,
         )
 
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
@@ -166,9 +166,11 @@ class Transformer(nn.Module):
 
         return logits
 
+
 # -------------------------
 # 4. Loader Class
 # -------------------------
+
 
 class DomainBoundaryDataset(Dataset):
     """Custom dataset for domain boundary detection with ESM embeddings that loads data from an H5 file."""
@@ -186,18 +188,25 @@ class DomainBoundaryDataset(Dataset):
             self.length = (
                 self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
             )
-            
+
             # Read idx_multiplied data if available
             self.idx_multiplied = None
             if "idx_multiplied" in f:
                 self.idx_multiplied = list(f["idx_multiplied"][:])
                 if RANK == 0:
-                    print(f"Found idx_multiplied data: {len(self.idx_multiplied)} entries")
+                    print(
+                        f"Found idx_multiplied data: {len(self.idx_multiplied)} entries"
+                    )
                     # Show which original sequences were windowed
                     from collections import Counter
+
                     idx_counts = Counter(self.idx_multiplied)
-                    windowed_sequences = [idx for idx, count in idx_counts.items() if count > 1]
-                    print(f"Original sequences that were windowed: {windowed_sequences}")
+                    windowed_sequences = [
+                        idx for idx, count in idx_counts.items() if count > 1
+                    ]
+                    print(
+                        f"Original sequences that were windowed: {windowed_sequences}"
+                    )
             else:
                 if RANK == 0:
                     print("No idx_multiplied data found in H5 file")
@@ -223,41 +232,40 @@ class DomainBoundaryDataset(Dataset):
             key_suffix = embedding_key.replace("batch_", "")
             labels_key = f"labels_batch_{key_suffix}"
 
-            embeddings = torch.tensor(
-                f[embedding_key][local_idx], dtype=torch.float32
-            )
+            embeddings = torch.tensor(f[embedding_key][local_idx], dtype=torch.float32)
             labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
 
             return embeddings, labels
-    
+
     def get_original_sequence_index(self, idx):
         """Get the original sequence index for a given dataset index"""
         if self.idx_multiplied is not None and idx < len(self.idx_multiplied):
             return self.idx_multiplied[idx]
         else:
             return idx  # fallback if no mapping available
-    
+
     def get_windowed_sequences_info(self):
         """Get information about which sequences were windowed"""
         if self.idx_multiplied is None:
             return {}
-        
-        from collections import defaultdict, Counter
-        
+
+        from collections import Counter, defaultdict
+
         # Count how many windows each original sequence has
         idx_counts = Counter(self.idx_multiplied)
-        
+
         # Group dataset indices by original sequence index
         original_to_dataset_indices = defaultdict(list)
         for dataset_idx, original_idx in enumerate(self.idx_multiplied):
             original_to_dataset_indices[original_idx].append(dataset_idx)
-        
-        return {
-            'windowed_sequences': [idx for idx, count in idx_counts.items() if count > 1],
-            'sequence_window_counts': dict(idx_counts),
-            'original_to_dataset_mapping': dict(original_to_dataset_indices)
-        }
 
+        return {
+            "windowed_sequences": [
+                idx for idx, count in idx_counts.items() if count > 1
+            ],
+            "sequence_window_counts": dict(idx_counts),
+            "original_to_dataset_mapping": dict(original_to_dataset_indices),
+        }
 
 
 class SqueezedDataset(Dataset):
@@ -273,13 +281,14 @@ class SqueezedDataset(Dataset):
         embedding, label = self.original_dataset[original_idx]
         return embedding.squeeze(0), label.squeeze(0)
 
+
 class SqueezedDataset_Usage(Dataset):
     def __init__(self, original_dataset, actual_seq_lengths):
         self.original_dataset = original_dataset
         self.actual_seq_lengths = actual_seq_lengths
-        
+
         # Get windowing information if available
-        if hasattr(original_dataset, 'get_windowed_sequences_info'):
+        if hasattr(original_dataset, "get_windowed_sequences_info"):
             self.windowing_info = original_dataset.get_windowed_sequences_info()
         else:
             self.windowing_info = {}
@@ -289,13 +298,21 @@ class SqueezedDataset_Usage(Dataset):
 
     def __getitem__(self, idx):
         embedding, label = self.original_dataset[idx]
-        actual_length = self.actual_seq_lengths[idx] if idx < len(self.actual_seq_lengths) else 1000
-        
+        actual_length = (
+            self.actual_seq_lengths[idx] if idx < len(self.actual_seq_lengths) else 1000
+        )
+
         # Get original sequence index if available
-        original_seq_idx = self.original_dataset.get_original_sequence_index(idx) if hasattr(self.original_dataset, 'get_original_sequence_index') else idx
-        
+        original_seq_idx = (
+            self.original_dataset.get_original_sequence_index(idx)
+            if hasattr(self.original_dataset, "get_original_sequence_index")
+            else idx
+        )
+
         # Return embedding, dataset index, actual length, and original sequence index
         return embedding.squeeze(0), idx, actual_length, original_seq_idx
+
+
 # -------------------------
 # 6. MAIN TRAINER
 # -------------------------
@@ -309,7 +326,9 @@ def main_trainer(Final_training=False):
     if RANK == 0:
         print("Directories created.")
 
-    if not os.path.exists("/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"):
+    if not os.path.exists(
+        "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
+    ):
         ESMDataset(
             FSDP_used=False,
             domain_boundary_detection=True,
@@ -322,11 +341,12 @@ def main_trainer(Final_training=False):
         if RANK == 0:
             print("Using preembedded ESM data from scratch")
 
-
     if RANK == 0:
         print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset(
+        "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
+    )
 
     # Split indices for train and validation sets
     dataset_size = len(domain_boundary_dataset)
@@ -356,7 +376,6 @@ def main_trainer(Final_training=False):
             )
         # Create new datasets with squeezed tensors
 
-
         train_dataset = SqueezedDataset(domain_boundary_dataset, train_indices)
         val_dataset = SqueezedDataset(domain_boundary_dataset, val_indices)
 
@@ -369,8 +388,8 @@ def main_trainer(Final_training=False):
     input_dims_sample = train_dataset[0][0].unsqueeze(0)  # [1, seq_len, embedding_dim]
 
     # if RANK == 0:
-        # print(input_dims_sample)
-        # print(input_dims_sample.shape)
+    # print(input_dims_sample)
+    # print(input_dims_sample.shape)
 
     # Create DataLoaders for each subset
     train_loader = DataLoader(
@@ -414,7 +433,9 @@ def main_trainer(Final_training=False):
     # Handle cases where a class might be missing in a small sample
     if torch.any(counts == 0):
         if RANK == 0:
-            print("Warning: One or more classes have zero samples. Using uniform weights.")
+            print(
+                "Warning: One or more classes have zero samples. Using uniform weights."
+            )
         weights = torch.ones(NUM_CLASSES, device=DEVICE)
     else:
         total = train_labels_flat.size(0)
@@ -493,7 +514,8 @@ def main_trainer(Final_training=False):
             enable_progress_bar=True,
             callbacks=[early_stop, checkpoint_callback],
             logger=TensorBoardLogger(
-                save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/{PROJECT_NAME}", name=PROJECT_NAME
+                save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/{PROJECT_NAME}",
+                name=PROJECT_NAME,
             ),
         )
 
@@ -508,8 +530,8 @@ def main_trainer(Final_training=False):
 
         # save the final model
     final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/{PROJECT_NAME}.pt"
-    torch.save(lit_model, final_model_path)   
-    lit_model=torch.load(final_model_path, map_location=DEVICE, weights_only=False)
+    torch.save(lit_model, final_model_path)
+    lit_model = torch.load(final_model_path, map_location=DEVICE, weights_only=False)
 
     lit_model = lit_model.to(DEVICE)
 
@@ -521,7 +543,6 @@ def main_trainer(Final_training=False):
     device = lit_model.device
     # print(device)
 
-
     with torch.no_grad():
         # Initialize metrics accumulators instead of storing all data
         total_boundary_tp = 0
@@ -530,7 +551,7 @@ def main_trainer(Final_training=False):
         total_sequences = 0
         total_correct_boundaries = 0
         total_true_boundaries = 0
-        
+
         for batch_idx, (batch_embeddings, batch_labels) in enumerate(val_loader):
             batch_embeddings = batch_embeddings.to(device)
             batch_logits = lit_model(batch_embeddings)
@@ -544,26 +565,28 @@ def main_trainer(Final_training=False):
                 # Calculate sequence-level metrics immediately
                 boundary_positions_pred = np.where(seq_preds == 1)[0]
                 boundary_positions_true = np.where(seq_labels == 1)[0]
-                
+
                 # Accumulate metrics without storing individual sequences
-                correct_boundaries = len(np.intersect1d(boundary_positions_pred, boundary_positions_true))
+                correct_boundaries = len(
+                    np.intersect1d(boundary_positions_pred, boundary_positions_true)
+                )
                 total_correct_boundaries += correct_boundaries
                 total_true_boundaries += len(boundary_positions_true)
                 total_sequences += 1
-                
+
                 # Calculate position-level TP, FP, FN for this sequence
                 tp = correct_boundaries
                 fp = len(boundary_positions_pred) - correct_boundaries
                 fn = len(boundary_positions_true) - correct_boundaries
-                
+
                 total_boundary_tp += tp
                 total_boundary_fp += fp
                 total_boundary_fn += fn
-            
+
             # Clear batch data from memory
             del batch_embeddings, batch_logits, batch_preds, batch_labels
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
+
             # Optional: Print progress every 100 batches to monitor memory usage
             if RANK == 0 and batch_idx % 100 == 0:
                 print(f"Processed batch {batch_idx}/{len(val_loader)}")
@@ -573,8 +596,12 @@ def main_trainer(Final_training=False):
     boundary_rec = total_boundary_tp / max(total_boundary_tp + total_boundary_fn, 1)
 
     # Sequence-level metrics
-    sequences_with_correct_boundaries = total_sequences  # This needs adjustment based on your definition
-    avg_boundary_detection_rate = total_correct_boundaries / max(total_true_boundaries, 1)
+    sequences_with_correct_boundaries = (
+        total_sequences  # This needs adjustment based on your definition
+    )
+    avg_boundary_detection_rate = total_correct_boundaries / max(
+        total_true_boundaries, 1
+    )
 
     if RANK == 0:
         print("\n=== Boundary-Specific Metrics ===")
@@ -587,15 +614,14 @@ def main_trainer(Final_training=False):
         print(f"Average boundary detection rate: {avg_boundary_detection_rate:.4f}")
 
 
-
-
-
 def loader(ESM_Model, input_file):
     import pandas as pd
 
     os.makedirs("tempTest/embeddings", exist_ok=True)
     os.makedirs("/global/scratch2/sapelt/tempTest/embeddings", exist_ok=True)
-    if not os.path.exists("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"):
+    if not os.path.exists(
+        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
+    ):
         if RANK == 0:
             print("Generating embeddings with ESM model...")
         ESMDataset(
@@ -616,17 +642,21 @@ def loader(ESM_Model, input_file):
     if RANK == 0:
         print("Creating DomainBoundaryDataset from embeddings in H5 file...")
     # Create the dataset and dataloader
-    domain_boundary_dataset = DomainBoundaryDataset("/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5")
+    domain_boundary_dataset = DomainBoundaryDataset(
+        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
+    )
 
     # Load the original CSV to get actual sequence lengths
     df = pd.read_csv(input_file)
     csv_seq_lengths = [len(seq) for seq in df[SEQUENCE_COL]]
-    
+
     # Ensure the actual_seq_lengths matches the dataset size
     dataset_size = len(domain_boundary_dataset)
     if len(csv_seq_lengths) != dataset_size:
         if RANK == 0:
-            print(f"Warning: CSV has {len(csv_seq_lengths)} sequences but dataset has {dataset_size} samples")
+            print(
+                f"Warning: CSV has {len(csv_seq_lengths)} sequences but dataset has {dataset_size} samples"
+            )
         # Truncate or pad the sequence lengths to match dataset size
         actual_seq_lengths = csv_seq_lengths[:dataset_size]
 
@@ -643,7 +673,9 @@ def loader(ESM_Model, input_file):
         #         "Squeezing dimensions of embeddings and labels in train and val datasets."
         #     )
         # Create new datasets with squeezed tensors
-        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
+        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(
+            domain_boundary_dataset, actual_seq_lengths
+        )
 
         if RANK == 0:
             print(
@@ -651,7 +683,9 @@ def loader(ESM_Model, input_file):
             )
     else:
         # If dimensions are correct, still need to create the usage dataset
-        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(domain_boundary_dataset, actual_seq_lengths)
+        domain_boundary_dataset_squeezed = SqueezedDataset_Usage(
+            domain_boundary_dataset, actual_seq_lengths
+        )
 
     # Create DataLoader for the dataset
     domain_boudnary_set_loader = DataLoader(
@@ -669,14 +703,19 @@ def loader(ESM_Model, input_file):
         print("Datasets and DataLoaders for domain boundary detection created.")
         print("\nLoading Model...\n")
 
-    model = torch.load("/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt", map_location=DEVICE, weights_only=False)
+    model = torch.load(
+        "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt",
+        map_location=DEVICE,
+        weights_only=False,
+    )
     model = model.to(DEVICE)
     model.eval()
 
     if RANK == 0:
-        print("Model loaded and set to eval mode")    
+        print("Model loaded and set to eval mode")
 
     return model, domain_boudnary_set_loader
+
 
 def Predictor(model, domain_boudnary_set_loader):
     """
@@ -689,19 +728,35 @@ def Predictor(model, domain_boudnary_set_loader):
 
     with torch.no_grad():
         # Create progress bar that only shows on rank 0
-        for batch_data in tqdm(domain_boudnary_set_loader, desc="Predicting domain boundaries", disable=RANK != 0,unit="Batches", position=0, leave=True):
+        for batch_data in tqdm(
+            domain_boudnary_set_loader,
+            desc="Predicting domain boundaries",
+            disable=RANK != 0,
+            unit="Batches",
+            position=0,
+            leave=True,
+        ):
             # Unpack the batch data
-            if len(batch_data) == 4:  # embedding, dataset_idx, actual_seq_len, original_seq_idx
-                batch_embeddings, batch_dataset_indices, batch_actual_lengths, batch_original_indices = batch_data
+            if (
+                len(batch_data) == 4
+            ):  # embedding, dataset_idx, actual_seq_len, original_seq_idx
+                (
+                    batch_embeddings,
+                    batch_dataset_indices,
+                    batch_actual_lengths,
+                    batch_original_indices,
+                ) = batch_data
             elif len(batch_data) == 3:  # embedding, seq_idx, actual_seq_len
-                batch_embeddings, batch_dataset_indices, batch_actual_lengths = batch_data
+                batch_embeddings, batch_dataset_indices, batch_actual_lengths = (
+                    batch_data
+                )
                 batch_original_indices = batch_dataset_indices  # fallback
             else:  # fallback for old format
                 batch_embeddings = batch_data
                 batch_dataset_indices = list(range(len(batch_embeddings)))
                 batch_actual_lengths = [emb.shape[0] for emb in batch_embeddings]
                 batch_original_indices = batch_dataset_indices
-            
+
             batch_embeddings = batch_embeddings.to(DEVICE)
             batch_logits = model(batch_embeddings)
             batch_preds = batch_logits.argmax(dim=-1)
@@ -709,40 +764,63 @@ def Predictor(model, domain_boudnary_set_loader):
             # Process each sequence in the batch separately
             for i in range(batch_preds.size(0)):
                 seq_preds_full = batch_preds[i].cpu().numpy()
-                dataset_idx = batch_dataset_indices[i] if hasattr(batch_dataset_indices, '__iter__') else batch_dataset_indices
-                original_idx = batch_original_indices[i] if hasattr(batch_original_indices, '__iter__') else batch_original_indices
-                actual_len = batch_actual_lengths[i] if hasattr(batch_actual_lengths, '__iter__') else batch_actual_lengths
-                
+                dataset_idx = (
+                    batch_dataset_indices[i]
+                    if hasattr(batch_dataset_indices, "__iter__")
+                    else batch_dataset_indices
+                )
+                original_idx = (
+                    batch_original_indices[i]
+                    if hasattr(batch_original_indices, "__iter__")
+                    else batch_original_indices
+                )
+                actual_len = (
+                    batch_actual_lengths[i]
+                    if hasattr(batch_actual_lengths, "__iter__")
+                    else batch_actual_lengths
+                )
+
                 # IMPORTANT: Truncate predictions to actual sequence length (remove padding)
                 seq_preds = seq_preds_full[:actual_len]
-                
+
                 # Store predictions and metadata for this sequence
                 all_sequence_preds.append(seq_preds)
-                sequence_metadata.append({
-                    'dataset_idx': dataset_idx,
-                    'original_seq_idx': original_idx,
-                    'actual_seq_length': actual_len,
-                    'padded_length': len(seq_preds_full),
-                    'batch_idx': i
-                })
-    
-    # if RANK == 0:
-    #     print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
-        
+                sequence_metadata.append(
+                    {
+                        "dataset_idx": dataset_idx,
+                        "original_seq_idx": original_idx,
+                        "actual_seq_length": actual_len,
+                        "padded_length": len(seq_preds_full),
+                        "batch_idx": i,
+                    }
+                )
+
+        # if RANK == 0:
+        #     print(f"Predicted {len(all_sequence_preds)} sequences with domain boundaries.")
+
         # Show information about windowed sequences
-        original_indices = [meta['original_seq_idx'] for meta in sequence_metadata]
+        original_indices = [meta["original_seq_idx"] for meta in sequence_metadata]
         from collections import Counter
+
         original_counts = Counter(original_indices)
-        windowed_originals = [idx for idx, count in original_counts.items() if count > 1]
-        
+        windowed_originals = [
+            idx for idx, count in original_counts.items() if count > 1
+        ]
+
         if windowed_originals:
             if RANK == 0:
                 print(f"Original sequences with multiple windows: {windowed_originals}")
             for orig_idx in windowed_originals[:3]:  # Show first 3
-                windows = [i for i, meta in enumerate(sequence_metadata) if meta['original_seq_idx'] == orig_idx]
+                windows = [
+                    i
+                    for i, meta in enumerate(sequence_metadata)
+                    if meta["original_seq_idx"] == orig_idx
+                ]
                 if RANK == 0:
-                    print(f"  Original sequence {orig_idx} -> dataset indices {windows}")
-        
+                    print(
+                        f"  Original sequence {orig_idx} -> dataset indices {windows}"
+                    )
+
         # Print debug info for first few sequences
         # for i in range(min(3, len(all_sequence_preds))):
         #     metadata = sequence_metadata[i]
@@ -751,6 +829,7 @@ def Predictor(model, domain_boudnary_set_loader):
         #           f"padded_length={metadata['padded_length']}")
 
     return all_sequence_preds, sequence_metadata
+
 
 def regions_search(all_preds, sequence_metadata=None):
     """
@@ -762,10 +841,9 @@ def regions_search(all_preds, sequence_metadata=None):
     # Define the structure for morphological operations. This is like a window size.
     # A larger structure removes more noise and fills larger gaps.
     opening_structure = np.ones(70)  # Removes positive regions smaller than 70 residues
-    closing_structure = np.ones(70)  # Fills gaps smaller than 70 residues    
+    closing_structure = np.ones(70)  # Fills gaps smaller than 70 residues
 
     for seq_idx, seq_preds in enumerate(all_preds):
-        
         # Ensure seq_preds is a numpy array
         preds_array = np.array(seq_preds)
 
@@ -792,12 +870,15 @@ def regions_search(all_preds, sequence_metadata=None):
         all_regions.append(regions)
 
         if RANK == 0 and seq_idx < 3:
-            print(f"Processing sequence {seq_idx}: Found {len(regions)} regions: {regions}")
+            print(
+                f"Processing sequence {seq_idx}: Found {len(regions)} regions: {regions}"
+            )
 
     if RANK == 0:
         print(f"Found {len(all_regions)} sequences with domain regions.")
 
     return all_regions
+
 
 # -------------------------
 # 6. MAIN USAGE
@@ -814,12 +895,11 @@ def main(input_file):
     model, domain_boudnary_set_loader = loader(ESM_MODEL, input_file)
 
     # Call the Predictor function to predict domain boundaries
-    all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)  
-     
-   
+    all_preds, sequence_metadata = Predictor(model, domain_boudnary_set_loader)
+
     # if RANK == 0:
     #     print("First sequence sum shape:", len(all_preds[0]) if all_preds else "No predictions")
-   
+
     # Search for domain regions with metadata
     all_regions = regions_search(all_preds, sequence_metadata)
 
@@ -828,20 +908,31 @@ def main(input_file):
 
     # Save all_regions to file
     output_file = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl"
-    with open(output_file, 'wb') as f:
+    with open(output_file, "wb") as f:
         pickle.dump(all_regions, f)
         pickle.dump(sequence_metadata, f)
-    
+
     return all_regions
 
-    
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Domain Finder Script")
     parser.add_argument("--input", type=str, required=False, help="Input file path")
-    parser.add_argument("--output", type=str, default="/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl", help="Output file path")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl",
+        help="Output file path",
+    )
     parser.add_argument("--model", type=str, required=False, help="ESM model name")
-    parser.add_argument("--TrainerMode", type=str, default="False", help="Set to True to run the trainer, False to run the predictor")
+    parser.add_argument(
+        "--TrainerMode",
+        type=str,
+        default="False",
+        help="Set to True to run the trainer, False to run the predictor",
+    )
     return parser.parse_args()
+
 
 # Parse arguments at the beginning
 args = parse_arguments()
@@ -857,7 +948,7 @@ else:
 if __name__ == "__main__":
     if TRAINER_MODE is True:
         main_trainer(Final_training=False)
-    
+
     else:
         main(input_file)
 
