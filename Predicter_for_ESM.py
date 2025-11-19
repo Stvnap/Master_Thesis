@@ -83,7 +83,7 @@ EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
-THRESHOLD = 5  # Number of consecutive drops to trigger exclusion
+THRESHOLD = 5  # Number of consecutive drops to trigger exclusion, relic from old approach
 if RANK == 0:
     print("Treshold:", THRESHOLD)
 
@@ -215,11 +215,20 @@ def opener():
     # optional subset for testing
     # evaldataset = torch.utils.data.Subset(evaldataset, list(range(100 * 5005)))
 
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        evaldataset,
+        num_replicas=dist.get_world_size(),
+        rank=RANK,
+        shuffle=True,
+        drop_last=False
+    ) 
+
     # init DataLoader
     eval_loader = DataLoader(
         evaldataset,  # Eval dataset
+        sampler=sampler,
         batch_size=BATCH_SIZE,  # Global batch size
-        shuffle=True,  # Shuffle for eval
+        # shuffle=True,  # Shuffle for eval
         persistent_workers=True,  # Keep workers alive, faster
         num_workers=NUM_WORKERS_EMB,  # Number of workers for loading
         pin_memory=True,  # Pin memory for faster transfer to GPU
@@ -238,7 +247,8 @@ def opener():
 # -------------------------
 def predict(modelpath, loader, firstrun=False):
     """
-    Predicts the classes for the given DataLoader using the specified pretrained model. Step where the evaluation is done.
+    Predicts the classes for the given Eval dataloader using the specified pretrained model.
+    Additionally logs metrics to TensorBoard if firstrun is True.
     Args:
         modelpath: Path to the pretrained model or the model object itself.
         loader: DataLoader containing the data to predict on.
@@ -247,118 +257,148 @@ def predict(modelpath, loader, firstrun=False):
         all_predictions: List of predicted classes.
         all_predictions_raw: List of raw prediction scores.
     """
-
-    # Load the model freshly from path or if type not string, use already passed model object
+    # Load model
     if isinstance(modelpath, str):
         model = torch.load(modelpath, map_location=DEVICE, weights_only=False)
         model = model.to(DEVICE)
     else:
         model = modelpath.to(DEVICE)
-    # model to eval
+    
+    # Wrap model with DDP if distributed training is enabled
+    if dist.is_initialized():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[RANK] if torch.cuda.is_available() else None,
+            output_device=RANK if torch.cuda.is_available() else None
+        )
+    
     model.eval()
-    print(model)
+    if RANK == 0:
+        print(model)
 
-    # Initialize lists to collect predictions and metrics
+    # Initialize lists to collect predictions and labels for this process
     all_predictions = []
     all_predictions_raw = []
-    all_accuracies = []
+    all_true_labels = []
 
-    # init per class metrics
-    all_precisions_per_class = {i: [] for i in range(1, NUM_CLASSES)}
-    all_recalls_per_class = {i: [] for i in range(1, NUM_CLASSES)}
-
-    # Prediction loop, no gradients needed, therefore inference_mode
+    # Prediction loop
     with torch.inference_mode():
-        # Batch loop, with tqdm progress bar
-        for batch in tqdm.tqdm(loader, desc="Predicting batches"):
-            # init batch lists
-            predictions = []
-            predictions_raw = []
-            # try to unpack batch
+        for batch in tqdm.tqdm(loader, desc=f"Predicting batches (Rank {RANK})", disable=(RANK != 0)):
             inputs, true_labels, starts, ends = batch
 
-            # move inputs to device and get outputs
+            # Store true labels for this batch
+            all_true_labels.extend(true_labels.cpu().numpy())
+
             inputs = inputs.to(DEVICE)
             output = model(inputs)
-
-            # get raw logits and maxed predictions
             preds_raw, preds = torch.max(output, dim=1)
 
-            # append preds to batch lists
-            predictions.extend(preds.cpu().numpy())
-            predictions_raw.extend(preds_raw.cpu().numpy())
+            # Accumulate predictions
+            all_predictions.extend(preds.cpu().numpy())
+            all_predictions_raw.extend(preds_raw.cpu().numpy())
 
-            # Debug prints
-            # if RANK == 0:
-            # print("TRUE:",true_labels[:30],print(len(true_labels)))
-            # print("PRED:",predictions[:30],print(len(predictions)))
-            # print("PRED RAW:",predictions_raw[:30],print(len(predictions_raw)))
+    # Gather predictions from all processes if DDP is enabled
+    if dist.is_initialized():
+        # Move to CPU immediately to save GPU memory
+        local_preds = torch.tensor(all_predictions, dtype=torch.long).cpu()
+        local_preds_raw = torch.tensor(all_predictions_raw, dtype=torch.float32).cpu()
+        local_labels = torch.tensor(all_true_labels, dtype=torch.long).cpu()
+        
+        if RANK == 0:
+            # Only rank 0 gathers everything
+            # Get sizes from all processes
+            size_list = [None] * dist.get_world_size()
+            dist.gather_object(local_preds.size(0), size_list if RANK == 0 else None, dst=0)
+            
+            # Gather actual data
+            gathered_preds = [None] * dist.get_world_size()
+            gathered_preds_raw = [None] * dist.get_world_size()
+            gathered_labels = [None] * dist.get_world_size()
+            
+            dist.gather_object(local_preds, gathered_preds, dst=0)
+            dist.gather_object(local_preds_raw, gathered_preds_raw, dst=0)
+            dist.gather_object(local_labels, gathered_labels, dst=0)
+            
+            # Concatenate on CPU (rank 0 only)
+            all_predictions = []
+            all_predictions_raw = []
+            all_true_labels = []
+            
+            for preds, preds_raw, labels in zip(gathered_preds, gathered_preds_raw, gathered_labels):
+                all_predictions.extend(preds.numpy())
+                all_predictions_raw.extend(preds_raw.numpy())
+                all_true_labels.extend(labels.numpy())
+            
+            # Clean up gathered tensors
+            del gathered_preds, gathered_preds_raw, gathered_labels
+        else:
+            # Other ranks just send their data
+            dist.gather_object(local_preds.size(0), None, dst=0)
+            dist.gather_object(local_preds, None, dst=0)
+            dist.gather_object(local_preds_raw, None, dst=0)
+            dist.gather_object(local_labels, None, dst=0)
+        
+        # Clean up local tensors
+        del local_preds, local_preds_raw, local_labels
 
-            # calclate metrics only on first run, not required for cutter runs when trying to detect boundaries, relic from old approach
-            if firstrun is True:
-                # Initialize TensorBoard writer
-                os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
-                writer = SummaryWriter(TENSBORBOARD_LOG_DIR)
+    # Calculate metrics ONCE after all batches are processed (only on rank 0)
+    if firstrun is True and RANK == 0:
+        os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
+        writer = SummaryWriter(TENSBORBOARD_LOG_DIR)
 
-                # Overall metrics
-                accuracy = accuracy_score(true_labels, predictions)
-                weighted_precision = precision_score(
-                    true_labels, predictions, average="weighted"
-                )
+        # Overall metrics using ALL predictions and labels
+        accuracy = accuracy_score(all_true_labels, all_predictions)
+        weighted_precision = precision_score(
+            all_true_labels, all_predictions, average="weighted", zero_division=0
+        )
 
-                # Class‐specific precision & recall
-                prec_per_class = precision_score(
-                    true_labels,
-                    predictions,
-                    labels=list(range(1, NUM_CLASSES)),
-                    average=None,
-                )
-                rec_per_class = recall_score(
-                    true_labels,
-                    predictions,
-                    labels=list(range(1, NUM_CLASSES)),
-                    average=None,
-                )
+        # Class-specific precision & recall
+        prec_per_class = precision_score(
+            all_true_labels,
+            all_predictions,
+            labels=list(range(1, NUM_CLASSES)),
+            average=None,
+            zero_division=0,
+        )
+        rec_per_class = recall_score(
+            all_true_labels,
+            all_predictions,
+            labels=list(range(1, NUM_CLASSES)),
+            average=None,
+            zero_division=0,
+        )
 
-                # Log overall metrics to TensorBoard
-                writer.add_scalar("Metrics/Accuracy", accuracy, 0)
-                writer.add_scalar("Metrics/Weighted_Precision", weighted_precision, 0)
-                writer.add_scalar("Metrics/AvgPrecision", prec_per_class.mean(), 0)
-                writer.add_scalar("Metrics/AvgRecall", rec_per_class.mean(), 0)
+        # Log overall metrics to TensorBoard
+        writer.add_scalar("Metrics/Accuracy", accuracy, 0)
+        writer.add_scalar("Metrics/Weighted_Precision", weighted_precision, 0)
+        writer.add_scalar("Metrics/AvgPrecision", prec_per_class.mean(), 0)
+        writer.add_scalar("Metrics/AvgRecall", rec_per_class.mean(), 0)
 
-                # create plot for precision and recall distribution
-                prec_tensor = torch.tensor(prec_per_class)
-                writer.add_histogram("Precision Distribution", prec_tensor, 0, bins=100)
-                rec_tensor = torch.tensor(rec_per_class)
-                writer.add_histogram("Recall Distribution", rec_tensor, 0, bins=100)
+        # Create histograms
+        prec_tensor = torch.tensor(prec_per_class)
+        writer.add_histogram("Precision Distribution", prec_tensor, 0, bins=100)
+        rec_tensor = torch.tensor(rec_per_class)
+        writer.add_histogram("Recall Distribution", rec_tensor, 0, bins=100)
 
-                # Log class‐specific metrics to TensorBoard
-                for i in range(1, NUM_CLASSES):
-                    writer.add_scalar(f"Precision/Class_{i}", prec_per_class[i - 1], 0)
-                    writer.add_scalar(f"Recall/Class_{i}", rec_per_class[i - 1], 0)
-
-                # Accumulate all predictions and metrics
-                all_predictions.extend(predictions)
-                all_predictions_raw.extend(predictions_raw)
-                all_accuracies.append(accuracy)
-                all_accuracies.append(accuracy)
-
-                # Accumulate per class metrics
-                for i in range(1, NUM_CLASSES):
-                    all_precisions_per_class[i].append(prec_per_class[i - 1])
-                    all_recalls_per_class[i].append(rec_per_class[i - 1])
-
-                # close writer
-                writer.close()
-
-    # metric prints
-    if RANK == 0:
-        print("Mean accuracy over all batches:", np.mean(all_accuracies))
-        print("Mean accuracy over all batches:", np.mean(all_accuracies))
+        # Log class-specific metrics
         for i in range(1, NUM_CLASSES):
-            print(
-                f"Mean precision for class {i}: {np.mean(all_precisions_per_class[i]):.4f}, Mean recall: {np.mean(all_recalls_per_class[i]):.4f}"
-            )
+            writer.add_scalar(f"Precision/Class_{i}", prec_per_class[i - 1], 0)
+            writer.add_scalar(f"Recall/Class_{i}", rec_per_class[i - 1], 0)
+
+        # Print summary
+        print(f"\nOverall Accuracy: {accuracy:.4f}")
+        print(f"Overall Weighted Precision: {weighted_precision:.4f}")
+        
+        total_precision = 0.0
+        for i in range(1, NUM_CLASSES):
+            mean_prec = prec_per_class[i - 1]
+            mean_rec = rec_per_class[i - 1]
+            print(f"Mean precision for class {i}: {mean_prec:.4f}, Mean recall: {mean_rec:.4f}")
+            total_precision += mean_prec
+        print(f"Mean precision over all classes: {total_precision / (NUM_CLASSES - 1):.4f}")
+
+        writer.close()
+
     return all_predictions, all_predictions_raw
 
 
@@ -988,7 +1028,8 @@ def main():
 
     # Open File and get DataLoader for Evaluation
     eval_loader = opener()
-    print("\nStarting first prediction run...")
+    if RANK == 0:
+        print("\nStarting first prediction run...")
 
     # Initial Prediction on uncut sequences to gather predictions for classes and raw scores
     predictions, raw_scores_nocut = predict(MODEL_PATH, eval_loader, firstrun=True)

@@ -40,7 +40,7 @@ saved_datasetPF00210/
 Datasets/
 shells/
 Dataframes/
-sideScripts/
+#sideScripts/
 lightning_logs/
 tuner_dir/
 pickle/
@@ -49,15 +49,18 @@ Results/
 temp/
 backup/
 tempTest/
+ExpFiles/
 
 
 # scripts #
 fastacutter.py
 Dataset_preprocess_v2old.py
-csv_to_fasta.py
+#csv_to_fasta.py
 Dataset_preprocessold.py
 LengthHistoPlotter.py
-tf.dataset_to_csv.py
+#tf.dataset_to_csv.py
+README_old.md
+
 
 test*
 train*

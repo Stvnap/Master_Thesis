@@ -1,4 +1,6 @@
 """
+ESM_Embeddings_HP_search.py 
+
 Table of Contents:
 ===================
 
@@ -40,6 +42,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import pytorch_lightning as pl
+import psutil
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -69,7 +72,7 @@ pd.set_option("display.max_rows", None)
 # 2. GLOBALS
 # --------------------------------------------------------------------------------------------
 
-NUM_CLASSES = 1001  # classes + 1 for "other" class
+NUM_CLASSES = 1001  # classes + 1 for "other" class or FULL for full pfam classification
 if RANK == 0:
     print("USING n CLASSES:", NUM_CLASSES)
 
@@ -86,7 +89,10 @@ ESM_MODEL = "esm2_t33_650M_UR50D"
 # HYPERPARAMETER SEARCH SETTINGS & EMB SIZE
 EPOCHS = 10000
 STUDY_N_TRIALS = 10
-BATCH_SIZE = 512
+VRAM = psutil.virtual_memory().total // (1024**3)  # systems VRAM in GB
+BATCH_SIZE = (
+    512 if VRAM >= 24 else 256 if VRAM >= 16 else 128 if VRAM >= 8 else 64
+)  # adjust batch size based on available VRAM
 NUM_WORKERS_EMB = 64
 
 # Data split fractions (test is missing, splitted beforehand into another CSV)
@@ -1898,10 +1904,10 @@ def loader(csv_path):
     # set model to eval mode and move to device
     model.to(DEVICE).eval()
 
-    # prints
-    if RANK == 0:
-        print("Model loaded and set to eval mode")
-        print(len(classifier_loader), "batches in classifier_loader")
+    # debug prints
+    # if RANK == 0:
+        # print("Model loaded and set to eval mode")
+        # print(len(classifier_loader), "batches in classifier_loader")
 
     return model, classifier_loader
 
@@ -2179,13 +2185,7 @@ def main_usage(csv_path, output_dir=None):
         print("Prediction Summary:")
         print(f"{'='*60}")
         print(f"Total predictions: {len(all_predictions)}")
-        print(f"Predictions saved to: {output_path}")
-        print(f"DataFrame shape: {predictions_df.shape}")
         print(f"{'='*60}\n")
-
-    # Final print
-    if RANK == 0:
-        print("Inference pipeline completed successfully!")
 
     # Cleanup distributed processes to end script cleanly
     if dist.is_initialized():
@@ -2231,4 +2231,6 @@ def main():
 #############################################################################################################
 
 if __name__ == "__main__":
+    if NUM_CLASSES == "FULL":
+        NUM_CLASSES = 24381  # for full pfam classification, based on pfam 37.3
     main()

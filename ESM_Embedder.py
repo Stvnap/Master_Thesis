@@ -2,28 +2,32 @@
 ESM_Embedder.py
 
 Table of Contents:
-
+===================
 1. Imports
 2. GLOBALS & ENV SETUP
 3. Dataset Classes
 4. Embedder Class (ESMDataset)
 
 Classes:
+--------
 - SeqDataset
 - SeqDatasetForEval
 - ESMDataset
 
 Functions:
+--------
 - ESMDataset.__init__
 - ESMDataset.esm_loader
 - ESMDataset._embed
 
 Nested Functions within __init__:
+--------
 - map_label
 - minicutter
 - subsampler
 
 Nested Functions within _embed:
+--------
 - windower
 """
 # -------------------------
@@ -33,7 +37,7 @@ import datetime
 import gc
 import os
 import time
-
+import random
 import esm
 import h5py
 import pandas as pd
@@ -317,8 +321,6 @@ class ESMDataset:
         if skip_df is None:
             # domain boundary detection mode
             if domain_boundary_detection is False:
-                if RANK == 0:
-                    print("Loading data...")
 
                 # !!! Chunk size, adjust based on available memory !!!
                 chunksize = 100000
@@ -536,9 +538,10 @@ class ESMDataset:
                     ) as f:
                         selected_ids = [line.strip() for line in f.readlines()]
 
-                print(
-                    f"RANK {RANK}: Using {len(selected_ids)} selected Pfam IDs for mapping."
-                )
+                if RANK == 0:
+                    print(
+                        f"Using {len(selected_ids)} selected Pfam IDs for mapping."
+                    )
 
                 # Create mapping from Pfam ID to label index
                 pfam_to_label = {
@@ -551,7 +554,7 @@ class ESMDataset:
                 # start chunk set and creating del_flag for interrupted chunks
                 start_chunk = 0
                 expected_chunks = int(
-                    22 * (10000000 / chunksize)
+                    21 * (10000000 / chunksize)
                 )  # Approximate number of chunks for progress reporting, based on the 22 chunks for chunksize 10000000 based of earlier calculation on the full uniprot set
 
                 del_key = False
@@ -564,12 +567,8 @@ class ESMDataset:
                         usecols=["start", "end", "id", "Pfam_id", "Sequence"],
                         chunksize=chunksize,
                     )
-                except Exception as e:
+                except Exception:
                     # exception handling to enter usage mode based on the missing columns earlier described
-                    if RANK == 0:
-                        print(
-                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
-                        )
                     chunk_iter = pd.read_csv(csv_path, chunksize=chunksize)
                     self.usage_mode = True
 
@@ -579,8 +578,8 @@ class ESMDataset:
                 else:
                     progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt"
 
-
-                print(f"RANK {RANK}: Using progress file at {progress_file_path}")
+                if RANK == 0:
+                    print(f"Using progress file at {progress_file_path}")
                 # check progress file to resume from last processed chunk if available
                 if os.path.exists(
                     progress_file_path
@@ -690,8 +689,6 @@ class ESMDataset:
 
                     # add reference to current chunk
                     self.chunk = chunk
-                    if RANK == 0:
-                        print("Data loaded")
 
                     # Use sequences in original order for embedding
                     sequences = self.chunk[sequence_col].tolist()
@@ -748,51 +745,85 @@ class ESMDataset:
 
                     # prints
                     if RANK == 0:
+                        print("=" * 40)
                         print("Embedding generation completed!")
                         print(
                             f"Total time: {embedding_time:.2f} seconds ({embedding_time / 60:.2f} minutes) | "
                             f"Time per sequence: {embedding_time / len(sequences):.4f} seconds | "
                             f"Sequences per second: {len(sequences) / embedding_time:.2f}"
                         )
+                        print("=" * 40)
 
                     # train/val split and saving to h5 file for training mode
                     if self.training is True and self.usage_mode is False:
-                        if num_classes != 24381:
-                            unique_labels, counts = torch.unique(
-                                labels, return_counts=True
-                            )
-                            single_sample_classes = unique_labels[counts == 1]
-
-                            # mask to remove single sample classes due to stratified splitting requirement
-                            if len(single_sample_classes) > 0:
-                                if RANK == 0:
-                                    print(
-                                        f"Warning: Found {len(single_sample_classes)} start_chunk before splitting."
-                                    )
-                                mask = ~torch.isin(labels, single_sample_classes)
-
-                                embeddings = embeddings[mask]
-                                labels = labels[mask]
-
                         if RANK == 0:
                             print("Performing train/val split...")
 
-                        # Stratified train/val split, either stratified if num_classes != 24381 else normal split
-                        if num_classes != 24381:
+                        def custom_train_test_split(X, y, test_size, stratify, random_state):
+                            """
+                            Stratifiert that works like sklearns train_test_split but if one label is len(labels)==1 it chooses randomly either train or val set for that sample, with based probabilities from test_size
+                            """
+
+                            # check for labels with only one sample
+                            unique_labels, counts = torch.unique(y, return_counts=True)
+                            single_sample_classes = unique_labels[counts == 1]
+
+                            if len(single_sample_classes) == 0:
+                                # if no single sample classes, use standard stratified split
+                                return train_test_split(
+                                    X,
+                                    y,
+                                    test_size=test_size,
+                                    stratify=stratify,
+                                    random_state=random_state,
+                                )
+
+                            # generate mask and apply it to then create initial split.
+                            # afterward we apply the single classes randomly to either train or val set back                           
+                            # define and apply mask to remove single sample classes for initial split
+                            mask = ~torch.isin(labels, single_sample_classes)
+
+                            # initial stratified split without single sample classes
                             X_train, X_val, y_train, y_val = train_test_split(
-                                embeddings,
-                                labels,
-                                test_size=VAL_FRAC,
-                                stratify=labels,
-                                random_state=42,
+                                X[mask],
+                                y[mask],
+                                test_size=test_size,
+                                stratify=y[mask],
+                                random_state=random_state,
                             )
-                        else:
-                            X_train, X_val, y_train, y_val = train_test_split(
-                                embeddings,
-                                labels,
-                                test_size=VAL_FRAC,
-                                random_state=42,
-                            )
+
+                            # now add back single sample classes randomly
+                            for sample in single_sample_classes:
+                                sample_indices = torch.where(labels == sample)[0]
+                                for idx in sample_indices:
+                                    # probabilistically assign to val or train set based on test_size
+                                    if random.random() < test_size:
+                                        X_val = torch.cat(
+                                            (X_val, embeddings[idx].unsqueeze(0)), 0
+                                        )
+                                        y_val = torch.cat(
+                                            (y_val, labels[idx].unsqueeze(0)), 0
+                                        )
+                                    else:
+                                        X_train = torch.cat(
+                                            (X_train, embeddings[idx].unsqueeze(0)), 0
+                                        )
+                                        y_train = torch.cat(
+                                            (y_train, labels[idx].unsqueeze(0)), 0
+                                        )
+                        
+
+                            return X_train, X_val, y_train, y_val
+                        
+
+                        X_train, X_val, y_train, y_val = custom_train_test_split(
+                            embeddings,
+                            labels,
+                            test_size=VAL_FRAC,
+                            stratify=labels,
+                            random_state=42,
+                        )
+
 
                         # Save datasets to h5 file, each rank writes its own part singlely to prevent conflicts due to locking flagged with chunk_num and rank
                         os.makedirs(
@@ -940,11 +971,6 @@ class ESMDataset:
                             # Ensure only one rank writes at a time
                             dist.barrier()
 
-                    if RANK == 0:
-                        print(
-                            f"Wrote embeddings and labels for batch {chunk_num} to file"
-                        )
-
                     # Final status write after completing chunk. Now its ensured that chunk got fully processed
                     with open(
                         progress_file_path,
@@ -971,19 +997,14 @@ class ESMDataset:
 
             # Domain boundary detection embedding procedure
             if self.domain_boundary_detection is True:
-                if RANK == 0:
-                    print("Loading data...")
+
                 # load data in for basic training mode
                 try:
                     df = pd.read_csv(
                         csv_path, usecols=["start", "end", "id", "Pfam_id", "Sequence"]
                     )
                 # use exception handling to enter usage mode based on the missing columns earlier described
-                except Exception as e:
-                    if RANK == 0:
-                        print(
-                            f"Warning: Could not read with specific columns, falling back to all columns. Error: {e}"
-                        )
+                except Exception:
                     df = pd.read_csv(
                         csv_path,
                     )
@@ -1012,8 +1033,6 @@ class ESMDataset:
                 df = df[df[sequence_col].str.len() >= 10]
                 # reference to dataframe
                 self.df = df
-                if RANK == 0:
-                    print("Data loaded")
 
                 # Use sequences in original order
                 sequences = self.df[sequence_col].tolist()
@@ -1057,7 +1076,7 @@ class ESMDataset:
                 self._embed(sequences)
 
             if RANK == 0:
-                print("Done Embedding! Closing Embedder")
+                print("\nDone Embedding! Closing Embedder\n")
             # Return early if domain boundary detection is enabled, due to saved embeddings in _embed function
             return
 
@@ -1092,7 +1111,8 @@ class ESMDataset:
         # possible FSDP usage for large models, not stress tested but should work (based on ESM FSDP example on github)
         # facebookresearch/esm · examples/esm2_infer_fairscale_fsdp_cpu_offloading.py
         if self.FSDP_used is True:
-            print("Using FSDP for model wrapping")
+            if RANK == 0:
+                print("Using FSDP for model wrapping")
             # initialize the model with FSDP wrapper
             fsdp_params = dict(
                 mixed_precision=True,
@@ -1350,11 +1370,11 @@ class ESMDataset:
                             f"Updated dataframe from {len(seq_dataset.seqs)} to {len(new_seqs)} sequences due to sliding window"
                         )
 
-            # Print warning if any sequences were windowed per rank
-            for rank in range(dist.get_world_size()):
-                print(
-                    f"Rank {rank}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
-                )
+            # Print debug warning if any sequences were windowed per rank
+            # for rank in range(dist.get_world_size()):
+            #     print(
+            #         f"Rank {rank}: Warning: {count} sequences were longer than 1000 characters and slided into windows"
+            #     )
 
             # Returns training mode
             if self.training is True:
@@ -1486,8 +1506,6 @@ class ESMDataset:
                 rank=RANK,
                 shuffle=False,
             )
-            if RANK == 0:
-                print("SAMPLER FOR USAGE MODE ACTIVE")
 
         # init Dataloader
         dataloader = DataLoader(
@@ -1503,9 +1521,8 @@ class ESMDataset:
         if RANK == 0:
             # print(f"Expected embedding dimension: {expected_dim}")
             print(
-                f"Total sequences to process: {len(seq_dataset.seqs)} with batch size {self.emb_batch}"
+                f"\nTotal sequences to process: {len(seq_dataset.seqs)} with batch size {self.emb_batch}. Each Rank will process {sampler.num_samples} sequences."
             )
-            print(f"Each Rank will process sequences {sampler.num_samples}")
 
         # Pre-allocate tensors on CPU to save GPU memory and improve speed
         total_samples = sampler.num_samples
@@ -1818,7 +1835,7 @@ class ESMDataset:
         dist.barrier()
 
         if RANK == 0:
-            print("\nEmbeddings DONE!\n")
+            print("\nEmbeddings generation done!\n")
 
         # Return appropriate values based on mode
         if self.domain_boundary_detection:
