@@ -175,6 +175,7 @@ uv run main.py --input=<FASTA> --output=<CSV> [--gpus=<N>]
 - `Protein_match_complete.xml` from Pfam database
 - CSV file with protein IDs and sequences (2 columns)
 - Column names specified in script globals
+- Runs normal with **UV** not `torchrun` as no GPU is used
 
 **Output:**
 - CSV with columns: `domain_start`, `domain_end`, `protein_id`, `Pfam_id`, `taxid`, `Sequence`
@@ -190,6 +191,7 @@ uv run main.py --input=<FASTA> --output=<CSV> [--gpus=<N>]
 
 **Requirements:**
 - Preprocessed CSV from [`Dataset_preprocess_v3.py`](Dataset_preprocess_v3.py)
+- Runs normal with **UV** not `torchrun` as no GPU is used
 
 **Output:**
 - Main training set CSV
@@ -305,7 +307,7 @@ torchrun --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 \
 
 #### [`sideScripts/`](./sideScripts/)
 
-**Purpose:** Utility scripts for development and data conversion
+**Purpose:** Utility scripts for development and data conversion. All are started via **UV**.
 
 **Contains:**
 - FASTA to CSV converter (used in [`main.py`](main.py))

@@ -23,14 +23,14 @@ def plotter():
 
     # -----------------------------
 
-    d100_prec =                         # 0.9959  - old values from only SwissProt
-    d100_recall =                       # 0.9972
+    d100_prec = 0.990                        # 0.9959  - old values from only SwissProt
+    d100_recall = 0.998                      # 0.9972
 
-    d1000_prec =                        # 0.9909  - old values from only SwissProt
-    d1000_recall =                      #0.9952
+    d1000_prec = 0.992                       # 0.9909  - old values from only SwissProt
+    d1000_recall = 0.995                    #0.9952
 
-    dmax_prec =
-    dmax_recall =
+    # dmax_prec =
+    # dmax_recall =
 
     # -----------------------------
 
@@ -74,9 +74,9 @@ def plotter():
 
 
     
-    ax1.axvline(x=2.5, color='black', linestyle='--', alpha=0.7, linewidth=1.5)
-    ax1.text(0.95, -0.1, 'Complete UniProt', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
-    ax1.text(3.5, -0.1, 'SwissProt Only', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
+    # ax1.axvline(x=2.5, color='black', linestyle='--', alpha=0.7, linewidth=1.5)
+    # ax1.text(0.95, -0.1, 'Complete UniProt', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
+    # ax1.text(3.5, -0.1, 'SwissProt Only', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
 
 
     plt.tight_layout()
@@ -98,11 +98,14 @@ def plotter():
 
     # -----------------------------
 
-    d100_prec = 0.9429
-    d100_recall = 0.9154
+    d100_prec = 0.92495                        # 0.9429
+    d100_recall = 0.755013                      # 0.9154
 
-    d1000_prec = 0.9241
-    d1000_recall = 0.8474
+    d1000_prec = 0.8898                        # 0.9241
+    d1000_recall = 0.6782                     # 0.8474
+
+    # dmax_prec = 
+    # dmax_recall = 
 
 
 
@@ -138,9 +141,9 @@ def plotter():
             ax1.text(i + width/2, r + 0.002, f'{r:.4f}', ha='center', va='bottom', fontsize=9)
     
 
-    ax1.axvline(x=2.5, color='black', linestyle='--', alpha=0.7, linewidth=1.5)
-    ax1.text(0.95, -0.1, 'Complete UniProt', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
-    ax1.text(3.5, -0.1, 'SwissProt Only', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
+    # ax1.axvline(x=2.5, color='black', linestyle='--', alpha=0.7, linewidth=1.5)
+    # ax1.text(0.95, -0.1, 'Complete UniProt', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
+    # ax1.text(3.5, -0.1, 'SwissProt Only', ha='center', va='top', fontsize=10, fontweight='bold', transform=ax1.transData)
     
     plt.tight_layout()
     plt.show()
@@ -214,7 +217,7 @@ def plotter():
 
 
 
-    log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/1000d_uncut_logs"
+    log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/1000d_uncut_ALL"
     reader = SummaryReader(log_dir)
     df = reader.scalars
     # print('--- df.shape', df.shape)
@@ -233,13 +236,25 @@ def plotter():
             # print(f"Processing tag: {tag}")
     
     plt.figure(figsize=(10, 6))
-    sns.histplot(all_prec, kde=False, bins=50, alpha=0.7,stat="proportion",color=colors[0])
-    plt.title("Distribution of Precision for 1000 D Model")
+    sns.histplot(all_prec, kde=False, bins=100, alpha=0.7,stat="proportion",color=colors[0])
+    plt.title("Distribution of Precision for 1000 D Model (SwissProt + TrEMBL)")
     plt.xlabel("Precision")
     plt.ylabel("Fraction")
-    plt.grid(True, alpha=0.3)
     plt.show()
 
+    all_rec = []
+    for tag in tags:
+        if tag.startswith("Recall/"):
+            values = df[df["tag"] == tag]["value"].values
+            all_rec.extend(values)  # Changed from all_prec to all_rec
+            # print(f"Processing tag: {tag}")
+
+    plt.figure(figsize=(10, 6))
+    sns.histplot(all_rec, kde=False, bins=100, alpha=0.7,stat="proportion",color=colors[1])
+    plt.title("Distribution of Recall for 1000 D Model (SwissProt + TrEMBL)")
+    plt.xlabel("Recall")
+    plt.ylabel("Fraction")
+    plt.show()
 
 ##############################################################################################
 

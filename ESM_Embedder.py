@@ -1849,6 +1849,7 @@ class ESMDataset:
             return all_embeddings, all_labels, None, None, idx_multiplied
 
 
+###############################################################################################################
 # not intended to be run directly, raise error
 if __name__ == "__main__":
     raise NotImplementedError("This script is not intended to be run directly")
