@@ -237,7 +237,7 @@ Each `.h5` file contains the following datasets:
 | `start` | Domain start positions (evaluation only) |
 | `end` | Domain end positions (evaluation only) |
 
-**Structure:** Each dataset is indexed by `chunk_num` and process `Rank`
+**Structure:** Each dataset is indexed by `chunk_num` and process `Rank`. Custom dataloaders are in place to handle those `h5` files automatically.
 
 ---
 

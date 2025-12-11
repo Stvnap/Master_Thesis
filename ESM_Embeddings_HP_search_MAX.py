@@ -1464,9 +1464,23 @@ def main_HP(Final_training=False):
         early_stop = EarlyStopping(
             monitor="val_loss", patience=5, mode="min", verbose=True, min_delta=0.01
         )
-        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+        checkpoint_callback = ModelCheckpoint(
+            monitor="val_loss", 
+            mode="min",
+            dirpath=f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}/checkpoints",
+            filename=f"{PROJECT_NAME}_final_{{epoch:02d}}-{{val_loss:.4f}}",
+            save_top_k=3,  # Keep best 3 checkpoints
+            save_last=True,  # Always save the last checkpoint for resuming
+        )
         if RANK == 0:
             print("Lit model created")
+        
+        # Check for existing checkpoint to resume from
+        last_checkpoint_path = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}/checkpoints/last.ckpt"
+        resume_from_checkpoint = last_checkpoint_path if os.path.exists(last_checkpoint_path) else None
+        
+        if resume_from_checkpoint and RANK == 0:
+            print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
         
         trainer = pl.Trainer(
             max_epochs=EPOCHS,
@@ -1485,7 +1499,7 @@ def main_HP(Final_training=False):
         if RANK == 0:
             print("Trainer created")
 
-        trainer.fit(lit_model, train_loader, val_loader)
+        trainer.fit(lit_model, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
         # save the final model
         final_model_path = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}.pt"
@@ -1493,11 +1507,19 @@ def main_HP(Final_training=False):
         if RANK == 0:
             print(f"\nTraining complete, saving final model under: {final_model_path} ...\n")
 
-
         if hasattr(lit_model, 'model') and hasattr(lit_model.model, '__class__') and 'Transformer' in lit_model.model.__class__.__name__:
-            pass
+            final_model_path = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Domain_boundary_transformer.pt"
+            os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
+            # Load the best checkpoint before saving
+            if checkpoint_callback.best_model_path:
+                lit_model = LitClassifier.load_from_checkpoint(checkpoint_callback.best_model_path)
+            torch.save(lit_model, final_model_path)
+
         else:
             os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
+            # Load the best checkpoint before saving
+            if checkpoint_callback.best_model_path:
+                lit_model = LitClassifier.load_from_checkpoint(checkpoint_callback.best_model_path)
             torch.save(lit_model, final_model_path)
         
 
@@ -1507,7 +1529,6 @@ def main_HP(Final_training=False):
         if RANK == 0:
             print("Done! Exiting...")
         dist.destroy_process_group()
-
 
 
 # -------------------------

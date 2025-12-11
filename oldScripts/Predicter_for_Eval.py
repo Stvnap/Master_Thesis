@@ -1,4 +1,3 @@
-###################################################################################################################################
 """
 File for evaluating performance. Model is tested on an evalset and
 a final prediction file is created with all predicted doamin boundaries
@@ -7,7 +6,10 @@ INFOS:
 GPU disabled, crashed on GPU
 
 """
-###################################################################################################################################
+
+# ------------------------
+# Imports & Globals
+# ------------------------
 
 import re
 import time
@@ -20,13 +22,18 @@ from keras.saving import load_model
 from sklearn.metrics import classification_report, confusion_matrix
 
 from FinalTrainer import BATCH_SIZE
-
-##########################################################################################
-
 pd.set_option("display.max_rows", None)  # Show all rows
 pd.set_option("display.max_columns", None)  # Show all columns
 pd.set_option("display.max_colwidth", 75)  # Show full column content
 
+DF_PATH = "./Dataframes/Evalsets/DataEvalPF00210.csv"
+MODEL_PATH = "./models/modelPF00210_1.keras"
+FLANK_SIZE = 30
+STEP_SIZE = 10
+
+# ------------------------
+# Predicter_pipeline Class
+# ------------------------
 
 class Predicter_pipeline:
     """
@@ -927,8 +934,7 @@ class Predicter_pipeline:
 #####################################################################################
 
 if __name__ == "__main__":
-    df_path = "./Dataframes/Evalsets/DataEvalPF00210.csv"
-    model_path = "./models/modelPF00210_1.keras"
+
     Predicter = Predicter_pipeline(
-        model_path, df_path, flank_size=30, step=10, batch_size=BATCH_SIZE
+        MODEL_PATH, DF_PATH, FLANK_SIZE, STEP_SIZE, batch_size=BATCH_SIZE
     )

@@ -1,16 +1,14 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import cm
-from tbparse import SummaryReader
-import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib import cm
 
 
 def opener():
 
     ###################################
 
-    df_results = pd.read_csv('../tempTest/FINAL_SWISS.csv',usecols=['Sequence_ID','Domain_Start','Domain_End'])
+    df_results = pd.read_csv('../ExpFiles/FINAL.csv',usecols=['Sequence_ID','Domain_Start','Domain_End'])
     df_eval = pd.read_csv('../Dataframes/v3/FoundEntriesSwissProteins_Eval.csv',usecols=['start','end','id'])
 
     ###############################
@@ -78,6 +76,7 @@ def plotter(df_results):
     plt.xlim(-1000, 1000)
     # plt.axvline(x=0, color='red', linestyle='--', alpha=0.8)
     plt.tight_layout()
+    plt.savefig('/home/sapelt/Documents/Master/FINAL/Histogram of Start Position Differences.png', dpi=600)
     plt.show()
 
 
@@ -93,6 +92,8 @@ def plotter(df_results):
     plt.xlim(-1000, 1000)
     # plt.axvline(x=0, color='red', linestyle='--', alpha=0.8)
     plt.tight_layout()
+    plt.savefig('/home/sapelt/Documents/Master/FINAL/Histogram of End Position Differences.png', dpi=600)
+
     plt.show()
 
 ################################

@@ -36,7 +36,7 @@ Functions:
 # 1. Imports & basic setup
 # -------------------------
 import os
-
+import pickle
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from ESM_Embedder import DEVICE, RANK
-from ESM_Embeddings_HP_search import ESMDataset
+from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
 
 torch.set_float32_matmul_precision("high")
 
@@ -65,27 +65,27 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 # -------------------------
 
 GLOBAL_RUN = 0  # keep 0
-NUM_CLASSES = 1001
+NUM_CLASSES = 3 # including 0 class
 
-CSV_PATH = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
+CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/Evalsets/DataEvalSwissProt2d_esm_shuffled.csv"
 CATEGORY_COL = "Pfam_id"
-SEQUENCE_COL = "Sequence"
-MODEL_PATH = "/scratch/tmp/sapelt/Master_Thesis/models/FINAL/t33_ALL_1000d.pt"
-CACHE_PATH = f"/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL.h5"
+SEQUENCE_COL = "Sequences"
+MODEL_PATH = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/t33_ALL_2d.pt"
+CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL.h5"
 TENSBORBOARD_LOG_DIR = (
-    f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{NUM_CLASSES - 1}d_uncut_ALL"
+    f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{NUM_CLASSES - 1}d_uncut_ALL_cut_loop"
 )
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
 
-BATCH_SIZE = 4012
+BATCH_SIZE = 512
 EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
 THRESHOLD = 5  # Number of consecutive drops to trigger exclusion, relic from old approach
 if RANK == 0:
-    print("Treshold:", THRESHOLD)
+    print("Treshold:", THRESHOLD) 
 
 
 # -------------------------
@@ -175,10 +175,10 @@ def opener():
 
     # check if cache exists, if not, create embeddings via ESMDataset
     if os.path.exists(
-        f"/scratch/tmp/sapelt/Master_Thesis/temp/progress_{NUM_CLASSES}.txt"
+        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"
     ):
         with open(
-            f"/scratch/tmp/sapelt/Master_Thesis/temp/progress_{NUM_CLASSES}.txt", "r"
+            f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt", "r"
         ) as status_file:
             # continue only if not finished
             if "All chunks processed. Exiting." not in status_file.read():
@@ -273,8 +273,8 @@ def predict(modelpath, loader, firstrun=False):
         )
     
     model.eval()
-    if RANK == 0:
-        print(model)
+    # if RANK == 0:
+    #     print(model)
 
     # Initialize lists to collect predictions and labels for this process
     all_predictions = []
@@ -284,7 +284,11 @@ def predict(modelpath, loader, firstrun=False):
     # Prediction loop
     with torch.inference_mode():
         for batch in tqdm.tqdm(loader, desc=f"Predicting batches (Rank {RANK})", disable=(RANK != 0)):
-            inputs, true_labels, starts, ends = batch
+            if firstrun is True:
+                inputs, true_labels, starts, ends = batch
+            else:
+                inputs, true_labels = batch
+
 
             # Store true labels for this batch
             all_true_labels.extend(true_labels.cpu().numpy())
@@ -437,7 +441,9 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
 
             # append cut sequence and label
             positive_embeddings.append(temp_seq)
-            positive_labels.append(true_labels[i].item())
+            # Handle both tensor and non-tensor labels
+            label_value = true_labels[i].item() if isinstance(true_labels[i], torch.Tensor) else true_labels[i]
+            positive_labels.append(label_value)
 
     # create dataframe for ESMDataset
     df = pd.DataFrame(
@@ -447,10 +453,13 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
         }
     )
 
+    # test subset
+    # df = df.sample(frac=0.01, random_state=42)  # Example: take a 1% random subset
+
     # create ESMDataset for re-embedding
     esm_data = ESMDataset(
         esm_model=ESM_MODEL,
-        skip_df=df,  # skip df is used to pass custom df, that is based on the cut df and not loaded from csv file given
+        skip_df=df,
         FSDP_used=False,
         training=False,
         domain_boundary_detection=False,
@@ -461,9 +470,66 @@ def cut_inputs_embedding(predictions, true_labels, df, cut_size, cut_front=True)
     )
 
     # relic of old approach, when functions did return and not write to h5 file
-    df_embeddings = esm_data.embeddings
-    df_labels = esm_data.labels
-    df = esm_data.df
+    # Each rank has its own portion of embeddings and labels
+    local_embeddings = esm_data.embeddings
+    local_labels = esm_data.labels
+    local_df = esm_data.df
+
+    # for rank in range(dist.get_world_size()):
+    #     if RANK == rank:
+    #         print(f"Rank {RANK} has {len(local_embeddings)} embeddings after cutting.")
+
+    # Gather embeddings and labels from all ranks to all ranks
+    if dist.is_initialized():
+        # Gather from all ranks to rank 0 first
+        if RANK == 0:
+            gathered_embeddings = [None] * dist.get_world_size()
+            gathered_labels = [None] * dist.get_world_size()
+            gathered_dfs = [None] * dist.get_world_size()
+        else:
+            gathered_embeddings = None
+            gathered_labels = None
+            gathered_dfs = None
+        
+        # Gather to rank 0
+        dist.gather_object(local_embeddings, gathered_embeddings, dst=0)
+        dist.gather_object(local_labels, gathered_labels, dst=0)
+        dist.gather_object(local_df, gathered_dfs, dst=0)
+        
+        # Concatenate on rank 0
+        if RANK == 0:
+            # Concatenate embeddings (assuming they're tensors)
+            df_embeddings = torch.cat([e for e in gathered_embeddings if e is not None], dim=0)
+            # Concatenate labels
+            df_labels = torch.cat([torch.tensor(l) if not isinstance(l, torch.Tensor) else l 
+                                  for l in gathered_labels if l is not None], dim=0)
+            # Concatenate dataframes
+            df = pd.concat([d for d in gathered_dfs if d is not None], ignore_index=True)
+        else:
+            df_embeddings = None
+            df_labels = None
+            df = None
+        
+        # Broadcast from rank 0 to all other ranks
+        data_to_broadcast = [df_embeddings, df_labels, df]
+        dist.broadcast_object_list(data_to_broadcast, src=0)
+        
+        # All ranks now have the complete data
+        df_embeddings, df_labels, df = data_to_broadcast
+        
+        # Ensure all ranks are synchronized
+        dist.barrier()
+
+    # If not using distributed training, just use local data
+    else:
+        df_embeddings = local_embeddings
+        df_labels = local_labels
+        df = local_df
+
+
+    # for rank in range(dist.get_world_size()):
+    #     if RANK == rank:
+    #         print(f"Rank {RANK} has {len(df_embeddings)} embeddings after sharing.")
 
     # basic Dataset
     df_embeddings = TensorDataset(df_embeddings, df_labels)
@@ -662,7 +728,7 @@ def cutter_loop(
 
         # Determine active sequences that are not stopped
         active_sequences = [
-            pos_indices[row_idx]
+            row_idx
             for row_idx in range(Npos)
             if row_idx not in stopped_sequences
         ]
@@ -673,9 +739,11 @@ def cutter_loop(
             break
 
         # filter predictions and true_labels for active sequences & create filtered df
-        filtered_predictions = [predictions[i] for i in active_sequences]
-        filtered_true_labels = [true_labels[i] for i in active_sequences]
-        filtered_df = df.iloc[active_sequences].reset_index(drop=True)
+        # Use pos_indices to get global indices for filtering df
+        global_indices = [pos_indices[row_idx] for row_idx in active_sequences]
+        filtered_predictions = [predictions[i] for i in global_indices]
+        filtered_true_labels = [true_labels[row_idx] for row_idx in active_sequences]
+        filtered_df = df.iloc[global_indices].reset_index(drop=True)
 
         # print how many sequences are excluded due to stopping, more or less a progress report
         decrease_percentage = ((Npos - len(filtered_predictions)) / Npos) * 100
@@ -701,48 +769,46 @@ def cutter_loop(
                 cut_front=False,
             )
         # predict on the cut and re-embedded sequences
-        _, _, raw_scores = predict(MODEL_PATH, sub_loader, sub_labels, firstrun=False)
+        _, raw_scores = predict(MODEL_PATH, sub_loader, firstrun=False)
 
         # Update logits and check for stopping sequences
         # init idx to track position in raw_scores
         active_idx = 0
-        # loop through all positive sequences
-        for row_idx in range(Npos):
-            # only process if sequence is still active
-            if row_idx not in stopped_sequences:
-                # get current domain
-                current_domain = sequence_domain_status[row_idx]
-                # update raw_matrix and sequence_logits
-                raw_matrix[row_idx, j] = raw_scores[active_idx]
-                # append current raw score to logits list
-                sequence_logits[row_idx][current_domain].append(raw_scores[active_idx])
+        # loop through only the active sequences, not all Npos
+        for row_idx in active_sequences:  # Changed from: for row_idx in range(Npos)
+            # get current domain
+            current_domain = sequence_domain_status[row_idx]
+            # update raw_matrix and sequence_logits
+            raw_matrix[row_idx, j] = raw_scores[active_idx]
+            # append current raw score to logits list
+            sequence_logits[row_idx][current_domain].append(raw_scores[active_idx])
 
-                # Check if this sequence should stop further prediction, if yes func returns True
-                if check_dropping_logits_across_cuts(
-                    sequence_logits[row_idx][current_domain], threshold=THRESHOLD
-                ):
-                    # move to next domain counter within sequence
-                    current_domain += 1
-                    # update domain status in matrix
-                    sequence_domain_status[row_idx] = current_domain
+            # Check if this sequence should stop further prediction, if yes func returns True
+            if check_dropping_logits_across_cuts(
+                sequence_logits[row_idx][current_domain], threshold=THRESHOLD
+            ):
+                # move to next domain counter within sequence
+                current_domain += 1
+                # update domain status in matrix
+                sequence_domain_status[row_idx] = current_domain
 
-                    # If we have not exceeded max_domains, add new domain list.
-                    if current_domain < max_domains:
-                        # Check if previous domain has logits
-                        prev_domain_logits = sequence_logits[row_idx][
-                            current_domain - 1
-                        ]
-                        # if current score is better than previous domain max, append to current domain
-                        if raw_scores[active_idx] > max(prev_domain_logits):
-                            sequence_logits[row_idx][current_domain].append(
-                                raw_scores[active_idx]
-                            )
-                    # If exceeded, mark sequence as stopped
-                    else:
-                        stopped_sequences.add(row_idx)
+                # If we have not exceeded max_domains, add new domain list.
+                if current_domain < max_domains:
+                    # Check if previous domain has logits
+                    prev_domain_logits = sequence_logits[row_idx][
+                        current_domain - 1
+                    ]
+                    # if current score is better than previous domain max, append to current domain
+                    if raw_scores[active_idx] > max(prev_domain_logits):
+                        sequence_logits[row_idx][current_domain].append(
+                            raw_scores[active_idx]
+                        )
+                # If exceeded, mark sequence as stopped
+                else:
+                    stopped_sequences.add(row_idx)
 
-                # increment active idx to move to next active sequence
-                active_idx += 1
+            # increment active idx to move to next active sequence
+            active_idx += 1
 
         # Debug print for first few sequences
         # print(f"Sample sequence logits: {sequence_logits[0]}")
@@ -918,7 +984,7 @@ def list_concatenater(endlist):
     # Convert to DataFrame and save as CSV
     concatenated_df = pd.DataFrame(concatenated_list)
     concatenated_df.to_csv(
-        "/scratch/tmp/sapelt/Master_Thesis/Results/Predicter_from_ESM_final_result.csv",
+        "/global/research/students/sapelt/Masters/MasterThesis/Results/Predicter_from_ESM_final_result.csv",
         index=False,
     )
     print("Saved results to predicted_boundaries_after.csv")
@@ -958,11 +1024,7 @@ def plotter(
     plt.ylabel("Probability Density")
     plt.grid(axis="y", alpha=0.5, linestyle="--")
     plt.tight_layout()
-    plt.savefig(
-        f"/scratch/tmp/sapelt/Master_Thesis/Evalresults/ESM/histogram_{Name}_errors.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
+    plt.savefig(f"/home/sapelt/Documents/Master/FINAL/Normalized Distribution of {Name} Boundary Absolute Errors", dpi=600)
     # plt.show()
 
 
@@ -1007,11 +1069,7 @@ def boxplotter(errors, classes, Name):
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     ax.set_ylim(bottom=0, top=100)  # Set y-axis limits
     plt.tight_layout()
-    plt.savefig(
-        f"/scratch/tmp/sapelt/Master_Thesis/Evalresults/ESM/boxplot_{Name}.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
+    plt.savefig(f"/home/sapelt/Documents/Master/FINAL/boxplot_{Name}_errors.png", dpi=600)
     plt.show()
 
 
@@ -1035,43 +1093,96 @@ def main():
     predictions, raw_scores_nocut = predict(MODEL_PATH, eval_loader, firstrun=True)
 
     # new exit because unused relic cut loop below
-    dist.barrier()  # Ensure all processes reach this point before quitting
-    if RANK == 0:
-        print("Exiting after first run.")
-    dist.destroy_process_group()  # Clean up the process group
-    quit()
+    # dist.barrier()  # Ensure all processes reach this point before quitting
+    # if RANK == 0:
+    #     print("Exiting after first run.")
+    # dist.destroy_process_group()  # Clean up the process group
+    # quit()
     
     # ------------------------------------
     # RELIC PART OF THE OLD CUT-AND-RE-EMBED APPROACH, NOT USED ANYMORE
     # ------------------------------------
     
     # set df to none for first cut loop
-    df = None
-
+    df = pd.read_csv(CSV_PATH)
+    
     # Gather boundaries and true classes from initial predictions
     pos_indices, pos_true_start, pos_true_end, true_class = boundary_gatherer(
         predictions, eval_loader
     )
 
-    # Cutter loops for start boundaries and end boundaries
-    all_residues_start, errors_start = cutter_loop(
-        predictions,        # predictions made in predict()             
-        true_class,         # true classes gathered in boundary_gatherer()
-        df,                 # dataframe, set to none for first cut loop
-        pos_indices,        # positive sequences with domain class indices gathered in boundary_gatherer()
-        pos_true_start,     # true start positions gathered in boundary_gatherer()
-        raw_scores_nocut,   # raw scores from first predict() run
-        name="start",       # cutting start boundaries
-    )
-    all_residues_end, errors_end = cutter_loop(
-        predictions,        # predictions made in predict()
-        true_class,         # true classes gathered in boundary_gatherer()
-        df,                 # dataframe, set to none for first cut loop
-        pos_indices,        # positive sequences with domain class indices gathered in boundary_gatherer()
-        pos_true_end,       # true end positions gathered in boundary_gatherer()
-        raw_scores_nocut,   # raw scores from first predict() run
-        name="end",         # cutting end boundaries
-    )
+    if "./pickle/checkpoint_cutloop.pkl" in os.listdir("./pickle/"):
+        if RANK == 0:
+            print("Loading checkpoint data from pickle...")
+            with open("./pickle/checkpoint_cutloop.pkl", "rb") as f:
+                checkpoint_data = pickle.load(f)
+            predictions = checkpoint_data["predictions"]
+            pos_indices = checkpoint_data["pos_indices"]
+            all_residues_start = checkpoint_data["all_residues_start"]
+            all_residues_end = checkpoint_data["all_residues_end"]
+            errors_start = checkpoint_data["errors_start"]
+            errors_end = checkpoint_data["errors_end"]
+            true_class = checkpoint_data["true_class"]
+        # Broadcast loaded data to all ranks
+        data_to_broadcast = [
+            predictions,
+            pos_indices,
+            all_residues_start,
+            all_residues_end,
+            errors_start,
+            errors_end,
+            true_class,
+        ]
+        dist.broadcast_object_list(data_to_broadcast, src=0)
+        (
+            predictions,
+            pos_indices,
+            all_residues_start,
+            all_residues_end,
+            errors_start,
+            errors_end,
+            true_class,
+        ) = data_to_broadcast
+        dist.barrier()  # Ensure all ranks are synchronized after loading
+
+    else:
+        # Cutter loops for start boundaries and end boundaries
+        all_residues_start, errors_start = cutter_loop(
+            predictions,        # predictions made in predict()             
+            true_class,         # true classes gathered in boundary_gatherer()
+            df,                 # dataframe, set to none for first cut loop
+            pos_indices,        # positive sequences with domain class indices gathered in boundary_gatherer()
+            pos_true_start,     # true start positions gathered in boundary_gatherer()
+            raw_scores_nocut,   # raw scores from first predict() run
+            name="start",       # cutting start boundaries
+        )
+        all_residues_end, errors_end = cutter_loop(
+            predictions,        # predictions made in predict()
+            true_class,         # true classes gathered in boundary_gatherer()
+            df,                 # dataframe, set to none for first cut loop
+            pos_indices,        # positive sequences with domain class indices gathered in boundary_gatherer()
+            pos_true_end,       # true end positions gathered in boundary_gatherer()
+            raw_scores_nocut,   # raw scores from first predict() run
+            name="end",         # cutting end boundaries
+        )
+
+    # ------------------------------------
+    # create checkpoint pickle
+    if RANK == 0:
+        checkpoint_data = {
+            "predictions": predictions,
+            "pos_indices": pos_indices,
+            "all_residues_start": all_residues_start,
+            "all_residues_end": all_residues_end,
+            "errors_start": errors_start,
+            "errors_end": errors_end,
+            "true_class": true_class,
+        }
+        with open("./pickle/checkpoint_cutloop.pkl", "wb") as f:
+            pickle.dump(checkpoint_data, f)
+        print("Checkpoint data saved to checkpoint_cutloop.pkl")
+
+
 
     # Create final result list in list_creater() and concatenate entries with same ID in list_concatenater()
     endlist = list_creater(

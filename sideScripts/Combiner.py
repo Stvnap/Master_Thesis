@@ -14,21 +14,25 @@ Table of Contents:
 # -------------------------
 import pandas as pd
 
-LARGECSV = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv"
-SMALLCSV = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/Unknown_class_train.csv"
-OUTPUT = "/scratch/tmp/sapelt/Master_Thesis/Dataframes/v3/RemainingEntriesCompleteProteins_MAX.csv"
+LARGECSV = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/SampledEntriesCompleteProteins.csv"
+SMALLCSV = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/Unknown_class_test.csv"
+OUTPUT = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/SampledEntriesCompleteProteins_MAX.csv"
 
-
+# -------------------------
+# Function
+# -------------------------
 def combiner():
     """
-    Combines the class 0 csv for the max model with the training set. Saves it directly to OUTPUT.    
+    Combines the class 0 csv for the max model with the training set. Saves it directly to OUTPUT.
     """
     # Load both files, training st and class 0
     df_large = pd.read_csv(LARGECSV)
     df_small = pd.read_csv(SMALLCSV)
 
     # Get the union of all columns
-    all_columns = list(df_large.columns) + [c for c in df_small.columns if c not in df_large.columns]
+    all_columns = list(df_large.columns) + [
+        c for c in df_small.columns if c not in df_large.columns
+    ]
 
     # check columns
     print(all_columns)
@@ -50,6 +54,7 @@ def combiner():
     combined.to_csv(OUTPUT, index=False)
 
     print(f"Combined file written to {OUTPUT}")
+
 
 #################################
 if __name__ == "__main__":

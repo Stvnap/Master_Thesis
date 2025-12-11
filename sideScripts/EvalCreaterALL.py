@@ -17,7 +17,8 @@ Table of contents:
 # -------------------------
 # Imports and Globals
 # -------------------------
-import os 
+import os
+
 import pandas as pd
 
 CSV_PATH = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv"
@@ -27,11 +28,12 @@ ID_COL = "id"
 PFAM_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
 OUTPUT_PATH = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins_Eval.csv"
-pd.set_option('display.max_rows', None)     # Show all rows in DataFrame
+pd.set_option("display.max_rows", None)  # Show all rows in DataFrame
 
 # -------------------------
 # Functions
 # -------------------------
+
 
 def load_csv():
     """
@@ -40,10 +42,15 @@ def load_csv():
     # file check
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"CSV file not found at {CSV_PATH}")
-    
+
     # return dataframe
     print(f"Loading CSV from {CSV_PATH}")
-    return pd.read_csv(CSV_PATH, usecols=[START_COL, END_COL, ID_COL, PFAM_COL, SEQUENCE_COL],index_col=False)
+    return pd.read_csv(
+        CSV_PATH,
+        usecols=[START_COL, END_COL, ID_COL, PFAM_COL, SEQUENCE_COL],
+        index_col=False,
+    )
+
 
 def ReDefiner(df):
     """
@@ -82,9 +89,13 @@ def ReDefiner(df):
             else:
                 # Multiple entries → trim accordingly
                 if i == 0:
-                    # First entry: cut from 0 to start of next domain
-                    next_start = group.loc[i + 1, START_COL]
-                    new_seq = sequence[0:next_start]
+                    try:
+                        # First entry: cut from 0 to start of next domain
+                        next_start = group.loc[i + 1, START_COL]
+                        new_seq = sequence[0:next_start]
+                    except:
+                        # in case of artifical sequence, keep full sequence
+                        new_seq = sequence
                 elif i < num_rows - 1:
                     # Middle entries: cut from end of previous to start of next
                     prev_end = group.loc[i - 1, END_COL]
@@ -115,15 +126,16 @@ def save_to_csv(df, output_path):
     df.to_csv(output_path, index=False)
     print(f"DataFrame saved to {output_path}")
 
+
 # -------------------------
-# main 
+# main
 # -------------------------
 def main():
     # load in
     df = load_csv()
     print(f"Loaded DataFrame with {len(df)} entries")
 
-    # redefine sequences    
+    # redefine sequences
     trimmed_df = ReDefiner(df)
 
     # save csv
@@ -132,4 +144,4 @@ def main():
 
 ########################################################################################################################
 if __name__ == "__main__":
-    main()  
+    main()

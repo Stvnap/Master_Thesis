@@ -1730,11 +1730,26 @@ def final_training(lit_model, train_loader, val_loader):
     early_stop = EarlyStopping(
         monitor="val_loss", patience=5, mode="min", verbose=True, min_delta=0.01
     )
-    checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
-
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss", 
+        mode="min",
+        dirpath=f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}/checkpoints",
+        filename=f"{PROJECT_NAME}_final_{{epoch:02d}}-{{val_loss:.4f}}",
+        save_top_k=3,  # Keep best 3 checkpoints
+        save_last=True,  # Always save the last checkpoint for resuming
+    )
     if RANK == 0:
         print("Lit model created")
-
+    
+    
+    # Check for existing checkpoint to resume from
+    last_checkpoint_path = f"/scratch/tmp/sapelt/Master_Thesis/models/FINAL/{PROJECT_NAME}/checkpoints/last.ckpt"
+    resume_from_checkpoint = last_checkpoint_path if os.path.exists(last_checkpoint_path) else None
+    
+    if resume_from_checkpoint and RANK == 0:
+        print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+    
+    
     # Setup PyTorch-Lightning Trainer for final training
     trainer = pl.Trainer(
         max_epochs=EPOCHS,  # set max epochs
@@ -1760,7 +1775,7 @@ def final_training(lit_model, train_loader, val_loader):
         print("Trainer created")
 
     # Train the model with best hyperparameters
-    trainer.fit(lit_model, train_loader, val_loader)
+    trainer.fit(lit_model, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
     # Define path for saving the final model
     final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{PROJECT_NAME}.pt"
@@ -1776,16 +1791,26 @@ def final_training(lit_model, train_loader, val_loader):
         and hasattr(lit_model.model, "__class__")
         and "Transformer" in lit_model.model.__class__.__name__
     ):
-        # Don't save Transformer models (special handling needed)
-        if RANK == 0:
-            print("Transformer model detected, skipping save...")
+
+        final_model_path = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Domain_boundary_transformer.pt"
+        os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
+        # Load the best checkpoint before saving
+        if checkpoint_callback.best_model_path:
+            lit_model = LitClassifier.load_from_checkpoint(checkpoint_callback.best_model_path)
+        torch.save(lit_model, final_model_path)
+
+
     else:
         # Create directory if it doesn't exist and save the model
         os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
+        # Load the best checkpoint before saving
+        if checkpoint_callback.best_model_path:
+            lit_model = LitClassifier.load_from_checkpoint(checkpoint_callback.best_model_path)
         torch.save(lit_model, final_model_path)
-
-        if RANK == 0:
-            print(f"Model saved successfully to {final_model_path}")
+        
+    # final print
+    if RANK == 0:
+        print(f"Model saved successfully to {final_model_path}")
 
     return trainer, final_model_path
 

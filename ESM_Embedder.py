@@ -175,7 +175,20 @@ class SeqDatasetForEval(Dataset):
     def __getitem__(self, idx):
         return self.seqs[idx], self.labels[idx], self.starts[idx], self.ends[idx]
 
+class SeqDatasetCut(Dataset):
+    """
+    basic Dataset class to load seqs and corresponding labels
+    """
 
+    def __init__(self, seqs):
+        self.seqs = seqs
+        self.labels = 0  # dummy labels for compatibility
+
+    def __len__(self):
+        return len(self.seqs)
+
+    def __getitem__(self, idx):
+        return self.seqs[idx], self.labels[idx]
 # -------------------------
 # 4. Embedder Class
 # -------------------------
@@ -236,9 +249,11 @@ class ESMDataset:
         FSDP_used=False,
         domain_boundary_detection=False,
         training=False,
+        testing=False,
     ):
         self.esm_model = esm_model
         self.training = training
+        self.testing = testing
         # print(f"Training mode: {self.training}")
         self.skip_df = skip_df
         self.domain_boundary_detection = domain_boundary_detection
@@ -559,6 +574,7 @@ class ESMDataset:
 
                 del_key = False
 
+
                 # Create chunk iterators for different use cases
                 try:
                     # base iter for train mode
@@ -575,6 +591,10 @@ class ESMDataset:
                 # set path for progress file based on usage mode
                 if self.usage_mode is True:
                     progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_{num_classes}.txt"
+                if self.testing is True:
+                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}_TEST.txt"
+                    expected_chunks = int(
+                        6 * (10000000 / chunksize))
                 else:
                     progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt"
 
@@ -642,7 +662,7 @@ class ESMDataset:
 
                     # if domain start and end columns are present, cut sequences accordingly to only embed domains
                     if "start" in chunk.columns and "end" in chunk.columns:
-                        if training is True:
+                        if training is True or testing is True:
                             if RANK == 0 and chunk_num == 0:
                                 print(
                                     "Cutting sequences based on start and end positions"
@@ -666,11 +686,13 @@ class ESMDataset:
                         # set labels to int
                         chunk["label"] = chunk["label"].astype(int)
 
-                        # Subsample class 0 to target samples to reduce class imbalance, when not in usage mode
-                        chunk = subsampler(chunk, 10000, first_subsampler, selected_ids)                        
+
+                        if testing is False:
+                            # Subsample class 0 to target samples to reduce class imbalance, when not in usage mode
+                            chunk = subsampler(chunk, 10000, first_subsampler, selected_ids)                        
 
                     # store start and end positions for EVAL mode
-                    if self.training is False:
+                    if self.training is False and testing is False:
                         self.all_starts = chunk["start"].tolist()
                         self.all_ends = chunk["end"].tolist()
 
@@ -755,7 +777,7 @@ class ESMDataset:
                         print("=" * 40)
 
                     # train/val split and saving to h5 file for training mode
-                    if self.training is True and self.usage_mode is False:
+                    if self.training is True and self.usage_mode is False and testing is False:
                         if RANK == 0:
                             print("Performing train/val split...")
 
@@ -924,6 +946,39 @@ class ESMDataset:
                             # Ensure only one rank writes at a time
                             dist.barrier()
 
+                    elif self.testing is True:
+                        # Save embeddings and labels to files
+                        os.makedirs("/scratch/tmp/sapelt/Master_Thesis/temp", exist_ok=True)
+
+                        if RANK == 0:
+                            print("SHAPES")
+                            print(
+                                f"Embeddings: {embeddings.shape}, Labels: {labels.shape}"
+                            )
+
+                        for rank_id in range(dist.get_world_size()):
+                            if RANK == rank_id:
+                                with h5py.File(
+                                    f"/scratch/tmp/sapelt/Master_Thesis/temp/embeddings_classification_{self.num_classes - 1}d_TEST.h5",
+                                    "a",
+                                ) as f:
+                                    f.create_dataset(
+                                        f"embeddings_chunk{chunk_num}_rank{RANK}",
+                                        data=embeddings.cpu().numpy(),
+                                    )
+                                    f.create_dataset(
+                                        f"labels_chunk{chunk_num}_rank{RANK}",
+                                        data=labels.cpu().numpy(),
+                                    )
+
+                            dist.barrier()  # Ensure only one rank writes at a time
+
+                        if RANK == 0:
+                            print(
+                                f"Wrote embeddings and labels for batch {chunk_num} to file"
+                            )    
+
+
                     # EVAL mode save option - embeddings, labels, starts and ends saved for later Evaluation with "Predicter_for_ESM.py"
                     else:
                         # create temp directory if not exists
@@ -1077,12 +1132,37 @@ class ESMDataset:
 
             if RANK == 0:
                 print("\nDone Embedding! Closing Embedder\n")
+
+            # Write final status to progress file
+            with open(
+                progress_file_path,
+                "a",
+            ) as status_file:
+                if RANK == 0:
+                    status_file.write("All chunks processed. Exiting.\n")
+            
             # Return early if domain boundary detection is enabled, due to saved embeddings in _embed function
             return
 
         # Relic from previous re-embedding for boundary detection technique, for second embedding round
         else:
             self.df = skip_df
+            sequences = self.df[sequence_col].tolist()
+       
+            # print(self.df.head())
+
+            self.labels = [0] * len(sequences)  # dummy labels for compatibility
+            # Load ESM model and batch converter
+            self.model, self.batch_converter = self.esm_loader()
+            self.cutmode = True
+            # Embed sequences
+            self.embeddings, self.labels, _, _, idx_multiplied = self._embed(
+                sequences, cutmode=True
+            )
+
+            return
+
+
 
     def esm_loader(self):
         """
@@ -1154,7 +1234,7 @@ class ESMDataset:
         # return model and batch converter needed for _embed function
         return model, batch_converter
 
-    def _embed(self, seqs):
+    def _embed(self, seqs,cutmode=False):
         """
         Generate embeddings for a list of sequences using the preloaded ESM model from esm_loader func.
         Handles sequences longer than 1000 characters by cutting them into sliding windows. See windower func.
@@ -1194,7 +1274,7 @@ class ESMDataset:
             idx_multiplied = []
 
             # ------------- Train mode windowing BLOCK -------------
-            if self.training is True:
+            if self.training is True or self.cutmode is True or self.testing is True:
                 # loop through sequences and labels as a zip between seqs and labels with index
                 for idx, (seq, label) in enumerate(
                     zip(seq_dataset.seqs, seq_dataset.labels)
@@ -1377,7 +1457,7 @@ class ESMDataset:
             #     )
 
             # Returns training mode
-            if self.training is True:
+            if self.training is True or self.cutmode is True or self.testing is True:
                 return new_seqs, new_labels, idx_multiplied
             # Returns EVAL/usage mode
             else:
@@ -1430,6 +1510,7 @@ class ESMDataset:
             seq_dataset = SeqDatasetForEval(
                 seqs, self.labels, self.all_starts, self.all_ends
             )
+        
         else:
             # Training mode or fallback (when positions aren't available)
             seq_dataset = SeqDataset(seqs, self.labels)
@@ -1438,7 +1519,7 @@ class ESMDataset:
         max_dimension = 1000
 
         # Apply windower func to cut sequences longer than 1000 into windows
-        if self.training is True:
+        if self.training is True or self.cutmode is True or self.testing is True:
             new_seqs, new_labels, idx_multiplied = windower(
                 stepsize=500, dimension=max_dimension
             )
@@ -1534,7 +1615,7 @@ class ESMDataset:
             )
             all_labels = torch.empty(total_samples, dtype=torch.long, device="cpu")
             # for EVAL mode, pre-allocate starts and ends
-            if not self.training:
+            if not self.training or not self.cutmode:
                 all_starts = torch.empty(total_samples, dtype=torch.long, device="cpu")
                 all_ends = torch.empty(total_samples, dtype=torch.long, device="cpu")
 
@@ -1557,7 +1638,7 @@ class ESMDataset:
         # Embedding loop over dataloader with batch_num for progress tracking and actual batch_data
         for batch_num, batch_data in enumerate(dataloader):
             # Different unpacking based on training or EVAL mode
-            if self.training is True:
+            if self.training is True or self.usage_mode is True or self.cutmode is True or self.testing is True:
                 batch_seqs, batch_labels = batch_data
             else:
                 batch_seqs, batch_labels, batch_start, batch_end = batch_data
@@ -1606,7 +1687,7 @@ class ESMDataset:
                     all_embeddings.append(embeddings.cpu())
                     all_labels.append(batch_labels.cpu())
                     # if EVAL mode store starts and ends
-                    if self.training is False:
+                    if self.training is False and self.testing is False:
                         all_starts.append(batch_start)
                         all_ends.append(batch_end)
 
@@ -1624,7 +1705,7 @@ class ESMDataset:
                     # assign to preallocated tensors
                     all_embeddings[start_idx:end_idx] = pooled.cpu()
                     all_labels[start_idx:end_idx] = batch_labels.cpu()
-                    if not self.training:
+                    if not self.training and self.cutmode is False and self.testing is False:
                         all_starts[start_idx:end_idx] = batch_start
                         all_ends[start_idx:end_idx] = batch_end
 
@@ -1721,7 +1802,7 @@ class ESMDataset:
                                 all_labels.append(batch_labels)
                             # if EVAL mode or Domain boundary detection is active, store starts and ends
                             if (
-                                self.training is False
+                                self.training is False and self.testing is False and self.cutmode is False
                                 or self.domain_boundary_detection is True
                             ):
                                 all_starts.append(torch.tensor([0], dtype=torch.long))
@@ -1752,7 +1833,7 @@ class ESMDataset:
                             all_labels.append(label.unsqueeze(0))
                         # and if in EVAL mode or domain boundary detection, placeholder starts and ends
                         if (
-                            self.training is False
+                            self.training is False and self.testing is False and self.cutmode is False
                             or self.domain_boundary_detection is True
                         ):
                             all_starts.append(torch.tensor([0], dtype=torch.long))
@@ -1841,7 +1922,7 @@ class ESMDataset:
         if self.domain_boundary_detection:
             # Data already saved to h5 in chunks, just return idx_multiplied
             return
-        elif self.training is False:
+        elif self.training is False and self.testing is False:
             # EVAL mode: return embeddings, labels, starts, ends
             return all_embeddings, all_labels, all_starts, all_ends, idx_multiplied
         else:

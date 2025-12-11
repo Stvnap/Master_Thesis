@@ -1,16 +1,32 @@
-import Dataset_preprocess_TRAIN
+"""
+main_DataCreation.py
+
+Used to create training and evaluation datasets for domain boundary prediction and compeltly run the HP search, final training and evaluation.
+Was concepted to be run as main script for development, but never really tested. Was abandoned in favor of the other approach
+
+Table of Contents:
+=========================
+Training set creation
+Evaluation set creation
+Hyperparameter tuning
+Final training
+Evaluation on full sequences
+"""
+# -----------------------
+# Imports
+# -----------------------
+
 import Dataset_preprocess_EVAL
-import HPsearch
+import Dataset_preprocess_TRAIN
 import FinalTrainer
-import Predictor
+import HPsearch
+from Predicter_for_Eval import Predictor
 
-#################################################################################################
 
-if __name__ == "__main__":
-
-#################################################################################################
-
-    ### TRAINING SET CREATION ###
+def main():
+    # -----------------------
+    # Training set creation
+    # -----------------------
 
     fasta = Dataset_preprocess_TRAIN.DomainProcessing(
         "/global/research/students/sapelt/Masters/domains_PF00177.fa"
@@ -53,8 +69,7 @@ if __name__ == "__main__":
     )
     seqarray_clean_rnd_sprot = fasta._load_in_SwissProt()
 
-    ################### Data creation ########################
-    dataset = Dataset_preprocess_TRAIN.databaseCreater(
+    Dataset_preprocess_TRAIN.databaseCreater(
         seqarray_clean,
         seqarray_clean_PF00079,
         seqarray_clean_PF00080,
@@ -64,9 +79,10 @@ if __name__ == "__main__":
         dimension_positive,
         10,
     )
-    #################################################################################################
-    
-    ### EVAL SET CREATION ###
+
+    # -----------------------
+    # Eval set creation
+    # -----------------------
 
     # positive Domain PF00177
     print("Loading positive domain PF00177")
@@ -110,7 +126,6 @@ if __name__ == "__main__":
     )
 
     # load in swissprot and trembl
-
     fasta = Dataset_preprocess_EVAL.DomainProcessing(
         "/global/research/students/sapelt/Masters/rawuniprot_sprot.fasta"
     )
@@ -131,9 +146,8 @@ if __name__ == "__main__":
     ]
     boundaries_all = [item for sublist in boundaries_all for item in sublist]
 
-    ################### Data creation ########################
     print("Starting data creation for SwissProt validation set")
-    dataset = Dataset_preprocess_EVAL.databaseCreater(
+    Dataset_preprocess_EVAL.databaseCreater(
         seqarray_clean,
         seqarray_clean_PF00079,
         seqarray_clean_PF00080,
@@ -145,37 +159,35 @@ if __name__ == "__main__":
         0,
         boundaries_all,
     )
-    
     print("All done creating evaluation dataset with full sequences")
-    
-    
-    #################################################################################################
 
-    ### HYPERPARAMETER TUNING ###
+    # -----------------------
+    # Hyperparameter tuning
+    # -----------------------
 
     run = HPsearch.Starter(
         "/global/research/students/sapelt/Masters/MasterThesis/datatestSwissProt.csv"
     )
-
     # run = Starter("/global/research/students/sapelt/Masters/MasterThesis/datatest1.csv")
-
     run.tuner()
 
-
-    ##################################################################################################
-
-    ### FINAL TRAINING ###
-
+    # -----------------------
+    # Final training
+    # -----------------------
     Testrun = FinalTrainer.Testrunning(
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1_palma/trial.json",
         "/global/research/students/sapelt/Masters/MasterThesis/logshp/test1_palma/checkpoint.weights.h5",
     )
-
     Testrun.trainer()
 
-    ##################################################################################################
+    # -----------------------
+    # Evaluation on full sequences
+    # -----------------------
 
-    ### EVALUATION ON FULL SEQUENCES ###
+    Predictor.predicting(
+        "./models/my_modelnewlabeling.keras", "./DataEvalSwissProt.csv"
+    )
 
-    Predictor.predicting("./models/my_modelnewlabeling.keras", "./DataEvalSwissProt.csv")
 
+if __name__ == "__main__":
+    main()
