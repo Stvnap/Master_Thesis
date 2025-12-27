@@ -74,6 +74,7 @@ def plotter(df_results):
     # plt.legend()
     # plt.grid(axis='y', alpha=0.75)
     plt.xlim(-1000, 1000)
+    plt.ylim(0,1500)
     # plt.axvline(x=0, color='red', linestyle='--', alpha=0.8)
     plt.tight_layout()
     plt.savefig('/home/sapelt/Documents/Master/FINAL/Histogram of Start Position Differences.png', dpi=600)
@@ -90,6 +91,7 @@ def plotter(df_results):
     plt.xticks(range(-1000, 1001, 50), [str(x) if x % 200 == 0 else '' for x in range(-1000, 1001, 50)])
 
     plt.xlim(-1000, 1000)
+    plt.ylim(0,1500)
     # plt.axvline(x=0, color='red', linestyle='--', alpha=0.8)
     plt.tight_layout()
     plt.savefig('/home/sapelt/Documents/Master/FINAL/Histogram of End Position Differences.png', dpi=600)

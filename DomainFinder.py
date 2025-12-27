@@ -832,6 +832,7 @@ def usage_opener(ESM_Model, input_file):
             csv_path=input_file,
             category_col=CATEGORY_COL,
             sequence_col=SEQUENCE_COL,
+            
         )
         if RANK == 0:
             print("Embeddings generated and saved.")

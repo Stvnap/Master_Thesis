@@ -1890,10 +1890,22 @@ def loader(csv_path):
         - model: trained LitClassifier model loaded from disk for inference.
         - classifier_loader: DataLoader for inference using ClassifierDataset.  
     """
-    # Generate embeddings if not already present
-    if not os.path.exists(
-        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
-    ):
+
+    h5_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
+    
+    # Generate embeddings if not already present OR if they don't exist despite progress file saying complete
+    if not os.path.exists(h5_path):
+        # Check if progress file says complete but file is missing
+        progress_file = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_1001.txt"
+        if os.path.exists(progress_file):
+            with open(progress_file, "r") as f:
+                content = f.read()
+                if "All chunks processed" in content:
+                    # Progress says done but file missing - delete progress and regenerate
+                    if RANK == 0:
+                        print("Progress file indicates completion but HDF5 file missing. Regenerating...")
+                        os.remove(progress_file)
+
         ESMDataset(
             esm_model=ESM_MODEL,                # the ESM model to use
             FSDP_used=False,                    # whether FSDP is used or not (unstable!)

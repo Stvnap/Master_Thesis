@@ -442,11 +442,11 @@ def dataframer(all_predictions, cut_df, output_file):
                         # Create a row for each window and all needed data
                         for window_idx, start_pos in enumerate(window_start_positions):
                             end_pos = start_pos + dimension
-                            window_seq = sequence[start_pos:end_pos]
+                            # window_seq = sequence[start_pos:end_pos]
 
                             # Create a copy of the row for this window
                             row_copy = row.copy()
-                            row_copy["Sequence"] = window_seq                   # Update sequence to windowed sequence
+                            # row_copy["Sequence"] = window_seq                   # Update sequence to windowed sequence
                             row_copy["Sequence_ID"] = (                         # Update Sequence_ID to indicate window for all windows
                                 f"{row_copy['Sequence_ID']}_{window_idx + 1}"
                             )
@@ -510,6 +510,9 @@ def dataframer(all_predictions, cut_df, output_file):
         raise ValueError(
             f"Still have length mismatch: {len(all_predictions)} predictions vs {len(df)} DataFrame rows"
         )
+
+    # Drop the Sequence column early, before any further processing
+    df = df.drop(columns=['Sequence'])
 
     # convert all_predictions to the actual pfam IDs via the selected_pfam_ids.txt file of the used model (gonna be set for final model)
     with open("./temp/selected_pfam_ids_1000.txt", "r") as f:

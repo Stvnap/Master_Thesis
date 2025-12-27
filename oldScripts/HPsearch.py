@@ -37,8 +37,8 @@ STRATEGY = tf.distribute.MirroredStrategy()
 BATCH_SIZE = 64 * STRATEGY.num_replicas_in_sync
 
 DIMENSION_POSITIVE = 148
-CLASS_WEIGHTS = {0: 0.35972796, 1: 8.42605461, 2: 9.85784824}
-BASE_WEIGHTS = [0.35972796, 8.42605461, 9.85784824]
+CLASS_WEIGHTS = {0: 0.35972796, 1: 8.42605461} #2: 9.85784824}
+BASE_WEIGHTS = [0.35972796, 8.42605461] #, 9.85784824]
 
 print(tf.keras.__version__)  # should be 3.6.0
 print(tf.__version__)
@@ -65,7 +65,7 @@ class MyHyperModel(kt.HyperModel):
 
         # Define neuron and hidden layer HPs
         n_neurons = hp.Int("n_neurons", min_value=3100, max_value=3400)
-        n_hidden = hp.Int("n_hidden", min_value=4, max_value=32, step=2)
+        n_hidden = hp.Int("n_hidden", min_value=4, max_value=12)
 
         # Define other HPs
         learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
@@ -126,8 +126,11 @@ class MyHyperModel(kt.HyperModel):
                 Dense(1, activation="sigmoid")
             )  # Binary classification for 1 doamain prediction
             loss_name = hp.Choice(  # Loss function as HP
-                "loss", values=["binary_crossentropy", "binary_focal_crossentropy"]
+                "loss", values=["binary_crossentropy"]#, "binary_focal_crossentropy"]
             )
+
+            loss_name ="binary_crossentropy"
+
             if loss_name == "binary_crossentropy":
                 loss_fn = tf.keras.losses.BinaryCrossentropy()
             elif (
@@ -140,6 +143,14 @@ class MyHyperModel(kt.HyperModel):
                 loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
                     gamma=gammaloss, alpha=alphaloss, apply_class_balancing=False
                 )
+            
+            # Binary classification metrics
+            metrics = [
+                "accuracy",
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+                tf.keras.metrics.AUC(name="auc"),
+            ]
         else:
             model.add(
                 Dense(3, activation="softmax")
@@ -150,31 +161,24 @@ class MyHyperModel(kt.HyperModel):
             )
             if loss_name == "categorical_crossentropy":
                 loss_fn = SparseCategoricalCrossentropy(from_logits=False)
-            # elif (
-            #     loss_name == "Sigmoid_Focal_Crossentropy"
-            # ):  # Focal loss init with HP gammaloss
-            #     gammaloss = hp.Float("gamma_loss", min_value=1, max_value=3, step=1)
-            #     loss_fn = SparseCategoricalFocalLoss(
-            #         from_logits=False,
-            #         gamma=gammaloss,
-            #         class_weight=[0.35972796, 8.42605461, 9.85784824],
-            #     )
 
             loss_fn = SparseCategoricalCrossentropy(from_logits=False)
+            
+            # Multi-class classification metrics
+            metrics = [
+                "accuracy",
+                tf.keras.metrics.Precision(name="prec_1", class_id=1),
+                tf.keras.metrics.Recall(name="rec_1", class_id=1),
+                tf.keras.metrics.Precision(name="prec_2", class_id=2),
+                tf.keras.metrics.Recall(name="rec_2", class_id=2),
+            ]
 
 
         # Compile the model with selected optimizer, loss function and metrics
         model.compile(
             optimizer=optimizer,
             loss=loss_fn,
-            metrics=[
-                "accuracy",
-                tf.keras.metrics.Precision(name="prec_1", class_id=1),
-                tf.keras.metrics.Recall(name="rec_1", class_id=1),
-                tf.keras.metrics.Precision(name="prec_2", class_id=2),
-                tf.keras.metrics.Recall(name="rec_2", class_id=2),
-                # tf.keras.metrics.AUC(name="auc_overall"),
-            ],
+            metrics=metrics,
         )
 
         return model
@@ -224,20 +228,15 @@ class Starter:
         start_time = time.time()
 
         # load set
-        train_dataset = tf.data.Dataset.load("/global/research/students/sapelt/Masters/MasterThesis/Dataframes/1hot/Dataset_2d/trainset")
-        val_dataset = tf.data.Dataset.load("/global/research/students/sapelt/Masters/MasterThesis/Dataframes/1hot/Dataset_2d/valset")
-        test_dataset = tf.data.Dataset.load("/global/research/students/sapelt/Masters/MasterThesis/Dataframes/1hot/Dataset_2d/testset")
+        train_dataset = tf.data.Dataset.load("/global/scratch2/sapelt/Datasets/1hot/PF00210/trainset")
+        val_dataset = tf.data.Dataset.load("/global/scratch2/sapelt/Datasets/1hot/PF00210/valset")
+        test_dataset = tf.data.Dataset.load("/global/scratch2/sapelt/Datasets/1hot/PF00210/testset")
 
         # shuffle, batch and prefetch
         train_dataset = train_dataset.shuffle(
-            buffer_size=train_dataset.cardinality(), seed=42
+            buffer_size=10000
         )
-        val_dataset = val_dataset.shuffle(
-            buffer_size=val_dataset.cardinality(), seed=42
-        )
-        test_dataset = test_dataset.shuffle(
-            buffer_size=test_dataset.cardinality(), seed=42
-        )
+
 
         train_dataset = train_dataset.batch(self.batch_size)
         val_dataset = val_dataset.batch(self.batch_size)
@@ -299,13 +298,17 @@ class Starter:
         # print search space summary
         self.tuner.search_space_summary()
 
-        # Start the HP search
+        search_kwargs = {
+            "epochs": epochs,
+            "validation_data": self.val_dataset,
+            "callbacks": [tensorboard, checkpoint_cb, early_stopping],
+        }
+        
+        search_kwargs["class_weight"] = self.class_weights
+        
         self.tuner.search(
-            self.train_dataset,  # training dataset
-            epochs=epochs,  # number of epochs for each trial
-            validation_data=self.val_dataset,  # validation dataset
-            callbacks=[tensorboard, checkpoint_cb, early_stopping],  # callbacks
-            class_weight=self.class_weights,  # remove when using focal loss
+            self.train_dataset,
+            **search_kwargs
         )
 
         # print results summary and save best 3 models
@@ -337,8 +340,8 @@ def main():
     start the whole HP search
     """
     print(tf.config.list_physical_devices("GPU"), "\n", "\n", "\n", "\n")
-    run = Starter(dimension=2)
-    run.tuner("HPsearch2d_Home", run=run, trials=40, epochs=50)
+    run = Starter(dimension=1)
+    run.tuner("PF00210", run=run, trials=40, epochs=50,)
 
 
 #####################################################################

@@ -591,7 +591,8 @@ class ESMDataset:
                 # set path for progress file based on usage mode
                 if self.usage_mode is True:
                     progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_{num_classes}.txt"
-                if self.testing is True:
+                    expected_chunks = 0  # unknown number of chunks for usage mode
+                elif self.testing is True:
                     progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}_TEST.txt"
                     expected_chunks = int(
                         6 * (10000000 / chunksize))
@@ -600,30 +601,38 @@ class ESMDataset:
 
                 if RANK == 0:
                     print(f"Using progress file at {progress_file_path}")
+
                 # check progress file to resume from last processed chunk if available
-                if os.path.exists(
-                    progress_file_path
-                ):
-                    with open(
-                        progress_file_path,
-                        "r",
-                    ) as status_file:
+                if os.path.exists(progress_file_path):
+                    with open(progress_file_path, "r") as status_file:
                         lines = status_file.readlines()
                         if lines:
                             last_line = lines[-1].strip()
-                            if (
-                                "Completed chunk" in last_line
-                            ):  # Look for completed chunks
-                                start_chunk = (
-                                    int(last_line.split(" ")[2]) + 1
-                                )  # Start from NEXT chunk
-                            else:
-                                start_chunk = int(
-                                    last_line.split(" ")[2]
-                                )  # Start from last incomplete chunk
-                                del_key = True  # del_key to delete last incomplete chunk from h5 file if found in h5 file
+                            
+                            # Check if all chunks are already processed
+                            if "All chunks processed" in last_line:
+                                if RANK == 0:
+                                    print("All chunks already processed. Skipping embedding generation.")
+                                # Set start_chunk to a very high number to skip the embedding loop
+                                start_chunk = float('inf')
+                                exit(0)
+                            
+                            # Look for completed chunks
+                            elif "Completed chunk" in last_line:
+                                start_chunk = int(last_line.split(" ")[2]) + 1
 
-                            if RANK == 0:
+                            elif "Processing chunk" in last_line:
+                                # Start from last incomplete chunk
+                                start_chunk = int(last_line.split(" ")[2])
+                                del_key = True
+                            else:
+                                # Unexpected format, start from beginning
+                                if RANK == 0:
+                                    print(f"Warning: Unexpected progress file format: {last_line}")
+                                    print("Starting from beginning")
+                                start_chunk = 0
+
+                            if RANK == 0 and start_chunk > 0 and start_chunk != float('inf'):
                                 print(f"Resuming from chunk {start_chunk}")
 
                 # Skip processed chunks and if skip failes exit embedding
@@ -723,6 +732,7 @@ class ESMDataset:
 
                     # start time stamp
                     start_time = time.time()
+                    self.cutmode=False
 
                     # Different embedding calls for training and evaluation mode due to different return values.
                     # Evaluation mode needs start and end positions for later boundary detection
@@ -1053,6 +1063,14 @@ class ESMDataset:
             # Domain boundary detection embedding procedure
             if self.domain_boundary_detection is True:
 
+                # Set progress file path for domain boundary detection mode
+                if self.usage_mode is True:
+                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_domain_usage.txt"
+                if self.testing is True:
+                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/progress_domain_TEST.txt"
+                else:
+                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/progress_domain.txt"
+
                 # load data in for basic training mode
                 try:
                     df = pd.read_csv(
@@ -1065,6 +1083,8 @@ class ESMDataset:
                     )
                     # set usage mode to true
                     self.usage_mode = True
+                    # Update progress file path if usage mode was just detected
+                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_domain_usage.txt"
 
                 if RANK == 0:
                     print(f"Data loaded with {len(df)} sequences")
@@ -1126,6 +1146,7 @@ class ESMDataset:
 
                 # start time stamp
                 start_time = time.time()
+                self.cutmode=False
 
                 # Embed sequences with _embed function
                 self._embed(sequences)
@@ -1636,16 +1657,28 @@ class ESMDataset:
             )
 
         # Embedding loop over dataloader with batch_num for progress tracking and actual batch_data
+        # Embedding loop over dataloader with batch_num for progress tracking and actual batch_data
         for batch_num, batch_data in enumerate(dataloader):
-            # Different unpacking based on training or EVAL mode
-            if self.training is True or self.usage_mode is True or self.cutmode is True or self.testing is True:
-                batch_seqs, batch_labels = batch_data
-            else:
+            # Initialize variables that may not be set in all branches
+            batch_start = None
+            batch_end = None
+            
+            # Different unpacking based on mode
+            if self.domain_boundary_detection is True:
+                # Domain boundary detection mode - always uses SeqDatasetForEval (4 values)
+                if self.usage_mode is True:
+                    # Usage mode with dummy starts/ends
+                    batch_seqs, batch_labels, batch_start, batch_end = batch_data
+                else:
+                    # Regular domain boundary with real starts/ends
+                    batch_seqs, batch_labels, batch_start, batch_end = batch_data
+            elif self.training is False and not self.cutmode and not self.testing:
+                # EVAL mode classification with positions (4 values)
                 batch_seqs, batch_labels, batch_start, batch_end = batch_data
+            else:
+                # Training/cutmode/testing - uses SeqDataset (2 values)
+                batch_seqs, batch_labels = batch_data
 
-                # debug prints for first batch
-                # if batch_num == 0 and RANK == 0:
-                #     print(batch_seqs, batch_labels, batch_start, batch_end)
 
             # try multi sample embedding in batches first
             try:

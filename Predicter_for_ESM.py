@@ -53,8 +53,8 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-from ESM_Embedder import DEVICE, RANK
-from ESM_Embeddings_HP_search import ESMDataset, LitClassifier, FFNClassifier
+from ESM_Embedder import DEVICE, RANK, ESMDataset
+from ESM_Embeddings_HP_search import LitClassifier, FFNClassifier
 
 torch.set_float32_matmul_precision("high")
 
@@ -70,8 +70,8 @@ NUM_CLASSES = 3 # including 0 class
 CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/Evalsets/DataEvalSwissProt2d_esm_shuffled.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequences"
-MODEL_PATH = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/t33_ALL_2d.pt"
-CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL.h5"
+MODEL_PATH = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/t33_ALL_24380d.pt"
+CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL_TEST.h5"
 TENSBORBOARD_LOG_DIR = (
     f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{NUM_CLASSES - 1}d_uncut_ALL_cut_loop"
 )
@@ -83,7 +83,7 @@ EMB_BATCH = 64
 NUM_WORKERS = min(16, os.cpu_count())
 NUM_WORKERS_EMB = min(16, os.cpu_count())
 
-THRESHOLD = 5  # Number of consecutive drops to trigger exclusion, relic from old approach
+THRESHOLD = 3  # Number of consecutive drops to trigger exclusion, relic from old approach
 if RANK == 0:
     print("Treshold:", THRESHOLD) 
 
@@ -128,7 +128,7 @@ class EvalDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        with h5py.File(self.h5_file, "r") as f:
+        with h5py.File(self.h_file, "r") as f:
             # chunk and local index calculation
             chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
             local_idx = (
@@ -157,13 +157,73 @@ class EvalDataset(Dataset):
             # return all
             return embeddings, labels, starts, ends
 
+    class EvalTestDataset(Dataset):
+        """
+        Dataset class for loading ESM embeddings and labels from an HDF5 file for evaluation. Suited for Eval mode of ESMDataset.
+        Args:
+            h5_file: Path to the HDF5 file containing embeddings and labels.
+        """
 
+        def __init__(self, h5_file):
+            # h5 file path
+            self.h5_file = h5_file
+
+            # open h5 file to get dataset info
+            with h5py.File(self.h5_file, "r") as f:
+                # Get all embedding keys
+                self.embedding_keys = sorted(
+                    [k for k in f.keys() if k.startswith("embeddings_")]
+                )
+
+                # Debug: Print all keys and their shapes, if no keys found
+                # if len(self.embedding_keys) == 0:
+                #     print("No embedding keys found. Available keys:")
+                #     for key in f.keys():
+                #         print(f"  {key}: shape {f[key].shape}")
+
+                # get sizes of each chunk and cumulative sizes for indexing
+                self.chunk_sizes = [f[key].shape[0] for key in self.embedding_keys]
+                self.cumulative_sizes = np.cumsum(self.chunk_sizes)
+                # total length based on cumulative sizes
+                self.length = (
+                    self.cumulative_sizes[-1] if self.cumulative_sizes.size > 0 else 0
+                )
+
+        def __len__(self):
+            # return precomputed length
+            return self.length
+
+        def __getitem__(self, idx):
+            with h5py.File(self.h5_file, "r") as f:
+                # chunk and local index calculation
+                chunk_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+                local_idx = (
+                    idx - self.cumulative_sizes[chunk_idx - 1] if chunk_idx > 0 else idx
+                )
+
+                # init keys for this chunk
+                embedding_key = self.embedding_keys[chunk_idx]
+                labels_key = embedding_key.replace("embeddings_", "labels_")
+
+                # Get embeddings (2D array -> 1D vector)
+                embeddings = torch.tensor(f[embedding_key][local_idx], dtype=torch.float32)
+
+                # Get labels (1D arrays -> scalars)
+                labels = torch.tensor(f[labels_key][local_idx], dtype=torch.long)
+
+                # Debug print for first few items only
+                # if RANK == 0:
+                #     if idx < 10:
+                #         print(f"Item {idx}: embeddings.shape={embeddings.shape}, labels={labels.item()}")
+
+                # return all
+                return embeddings, labels
 # -------------------------
 # 4. Opener Function
 # -------------------------
 
 
-def opener():
+def opener(df):
     """
     Opens the ESM model, loads the embeddings and labels from cache or computes them if not cached, via ESMDataset class.
     Returns:
@@ -173,44 +233,70 @@ def opener():
     if RANK == 0:
         print("Opening data...")
 
-    # check if cache exists, if not, create embeddings via ESMDataset
-    if os.path.exists(
-        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"
-    ):
-        with open(
-            f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt", "r"
-        ) as status_file:
-            # continue only if not finished
-            if "All chunks processed. Exiting." not in status_file.read():
-                ESMDataset(
-                    esm_model=ESM_MODEL,
-                    FSDP_used=False,
-                    domain_boundary_detection=False,
-                    training=False,
-                    num_classes=NUM_CLASSES,
-                    csv_path=CSV_PATH,
-                    category_col=CATEGORY_COL,
-                    sequence_col=SEQUENCE_COL,
-                )
-                # pass
-    elif not os.path.exists(CACHE_PATH):
-        ESMDataset(
-            esm_model=ESM_MODEL,
-            FSDP_used=False,
-            domain_boundary_detection=False,
-            training=False,
-            num_classes=NUM_CLASSES,
-            csv_path=CSV_PATH,
-            category_col=CATEGORY_COL,
-            sequence_col=SEQUENCE_COL,
-        )
+    # # check if cache exists, if not, create embeddings via ESMDataset
+    # if os.path.exists(
+    #     f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"
+    # ):
+    #     with open(
+    #         f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt", "r"
+    #     ) as status_file:
+    #         # continue only if not finished
+    #         if "All chunks processed. Exiting." not in status_file.read():
+    #             ESMDataset(
+    #                 esm_model=ESM_MODEL,
+    #                 FSDP_used=False,
+    #                 skip_df=df,
+    #                 domain_boundary_detection=False,
+    #                 training=False,
+    #                 num_classes=NUM_CLASSES,
+    #                 csv_path=CSV_PATH,
+    #                 category_col=CATEGORY_COL,
+    #                 sequence_col=SEQUENCE_COL,
+    #             )
+    #             # pass
+    # elif not os.path.exists(CACHE_PATH):
+    #     ESMDataset(
+    #         esm_model=ESM_MODEL,
+    #         FSDP_used=False,
+    #         domain_boundary_detection=False,
+    #         skip_df=df,
+    #         training=False,
+    #         num_classes=NUM_CLASSES,
+    #         csv_path=CSV_PATH,
+    #         category_col=CATEGORY_COL,
+    #         sequence_col=SEQUENCE_COL,
+    #     )
 
     # Load the dataset from the HDF5 file
     evaldataset = EvalDataset(CACHE_PATH)
 
-    # Shuffle the dataset by creating random indices
-    indices = torch.randperm(len(evaldataset))
-    evaldataset = torch.utils.data.Subset(evaldataset, indices.tolist())
+
+    esm_data = ESMDataset(
+        esm_model=ESM_MODEL,
+        skip_df=df,
+        FSDP_used=False,
+        training=False,
+        domain_boundary_detection=False,
+        num_classes=NUM_CLASSES,
+        csv_path=CSV_PATH,
+        category_col=CATEGORY_COL,
+        sequence_col=SEQUENCE_COL,
+    )
+
+    # relic of old approach, when functions did return and not write to h5 file
+    # Each rank has its own portion of embeddings and labels
+    df_embeddings = esm_data.embeddings
+    df_labels = esm_data.labels
+    df = esm_data.df
+
+
+
+    # combine to basic Dataset 
+    evaldataset = TensorDataset(df_embeddings, df_labels)
+
+    # # Shuffle the dataset by creating random indices
+    # indices = torch.randperm(len(evaldataset))
+    # evaldataset = torch.utils.data.Subset(evaldataset, indices.tolist())
 
     # optional subset for testing
     # evaldataset = torch.utils.data.Subset(evaldataset, list(range(100 * 5005)))
@@ -284,9 +370,9 @@ def predict(modelpath, loader, firstrun=False):
     # Prediction loop
     with torch.inference_mode():
         for batch in tqdm.tqdm(loader, desc=f"Predicting batches (Rank {RANK})", disable=(RANK != 0)):
-            if firstrun is True:
+            try:
                 inputs, true_labels, starts, ends = batch
-            else:
+            except:
                 inputs, true_labels = batch
 
 
@@ -345,6 +431,17 @@ def predict(modelpath, loader, firstrun=False):
         # Clean up local tensors
         del local_preds, local_preds_raw, local_labels
 
+        # Broadcast complete predictions from rank 0 to all ranks
+        if RANK == 0:
+            data_to_broadcast = [all_predictions, all_predictions_raw, all_true_labels]
+        else:
+            data_to_broadcast = [None, None, None]
+        
+        dist.broadcast_object_list(data_to_broadcast, src=0)
+        all_predictions, all_predictions_raw, all_true_labels = data_to_broadcast
+        
+        dist.barrier()  # Ensure synchronization
+
     # Calculate metrics ONCE after all batches are processed (only on rank 0)
     if firstrun is True and RANK == 0:
         os.makedirs(TENSBORBOARD_LOG_DIR, exist_ok=True)
@@ -394,13 +491,23 @@ def predict(modelpath, loader, firstrun=False):
         print(f"Overall Weighted Precision: {weighted_precision:.4f}")
         
         total_precision = 0.0
-        for i in range(1, NUM_CLASSES):
-            mean_prec = prec_per_class[i - 1]
-            mean_rec = rec_per_class[i - 1]
-            print(f"Mean precision for class {i}: {mean_prec:.4f}, Mean recall: {mean_rec:.4f}")
-            total_precision += mean_prec
-        print(f"Mean precision over all classes: {total_precision / (NUM_CLASSES - 1):.4f}")
-
+        total_recall = 0.0
+        for i in range(NUM_CLASSES):
+            if i == 0:
+                # For class 0, calculate precision and recall manually
+                class_0_precision = precision_score(all_true_labels, all_predictions, labels=[0], average=None, zero_division=0)[0] if any(p == 0 for p in all_predictions) else 0.0
+                class_0_recall = recall_score(all_true_labels, all_predictions, labels=[0], average=None, zero_division=0)[0] if any(t == 0 for t in all_true_labels) else 0.0
+                print(f"Mean precision for class {i}: {class_0_precision:.4f}, Mean recall: {class_0_recall:.4f}")
+                total_precision += class_0_precision
+                total_recall += class_0_recall
+            else:
+                mean_prec = prec_per_class[i - 1]
+                mean_rec = rec_per_class[i - 1]
+                print(f"Mean precision for class {i}: {mean_prec:.4f}, Mean recall: {mean_rec:.4f}")
+                total_precision += mean_prec
+                total_recall += mean_rec
+        print(f"Mean precision over all classes: {total_precision / NUM_CLASSES:.4f}")
+        print(f"Mean recall over all classes: {total_recall / NUM_CLASSES:.4f}")
         writer.close()
 
     return all_predictions, all_predictions_raw
@@ -631,8 +738,9 @@ def boundary_gatherer(predictions, loader):
 
         # Get true starts, ends, and labels for positive predictions in this batch
         if batch_pos_indices:  # Only process if there are positive predictions
-            batch_pos_true_start = [df_starts[i].item() for i in batch_pos_indices]
-            batch_pos_true_end = [df_ends[i].item() for i in batch_pos_indices]
+            # Wrap each boundary value in a list to support multiple domains per sequence
+            batch_pos_true_start = [[df_starts[i].item()] for i in batch_pos_indices]
+            batch_pos_true_end = [[df_ends[i].item()] for i in batch_pos_indices]
             batch_true_class = [labels[i].item() for i in batch_pos_indices]
 
             # Extend the global lists
@@ -698,6 +806,8 @@ def cutter_loop(
         if max(cut_sizes) < min_len
         else range(5, int(max_len / 3), 5)
     )
+    # cut_sizes = list(range(5,100,5))  # TEMPORARY OVERRIDE FOR TESTING, MAX CUT SIZE 100 step 5
+
     print(f"\nMax cut size: {max(cut_sizes)} residues")
 
     # BUILD UP OF MATRICES AND TRACKING VARIABLES, ADDING THE FIRST COLUMN WITH NO-CUT SCORES
@@ -1083,14 +1193,32 @@ def main():
     Main function to orchestrate the loading, predicting, cutting, gathering, and plotting of domain boundary predictions using ESM embeddings.
     Uses all helper functions defined above.
     """
+    df = pd.read_csv(CSV_PATH)
 
     # Open File and get DataLoader for Evaluation
-    eval_loader = opener()
+    eval_loader = opener(df)
     if RANK == 0:
         print("\nStarting first prediction run...")
 
     # Initial Prediction on uncut sequences to gather predictions for classes and raw scores
     predictions, raw_scores_nocut = predict(MODEL_PATH, eval_loader, firstrun=True)
+
+
+    # broadcast predictions and raw scores to all ranks to get same data everywhere
+    if dist.is_initialized():
+        # Prepare data to broadcast
+        if RANK == 0:
+            data_to_broadcast = [predictions, raw_scores_nocut]
+        else:
+            data_to_broadcast = [None, None]
+        
+        # Broadcast from rank 0 to all other ranks
+        dist.broadcast_object_list(data_to_broadcast, src=0)
+        
+        # All ranks unpack the broadcasted data
+        predictions, raw_scores_nocut = data_to_broadcast
+        
+        dist.barrier()  # Ensure all ranks are synchronized after broadcasting
 
     # new exit because unused relic cut loop below
     # dist.barrier()  # Ensure all processes reach this point before quitting
@@ -1104,14 +1232,13 @@ def main():
     # ------------------------------------
     
     # set df to none for first cut loop
-    df = pd.read_csv(CSV_PATH)
     
     # Gather boundaries and true classes from initial predictions
     pos_indices, pos_true_start, pos_true_end, true_class = boundary_gatherer(
         predictions, eval_loader
     )
 
-    if "./pickle/checkpoint_cutloop.pkl" in os.listdir("./pickle/"):
+    if os.path.exists("./pickle/checkpoint_cutloop.pkl"):
         if RANK == 0:
             print("Loading checkpoint data from pickle...")
             with open("./pickle/checkpoint_cutloop.pkl", "rb") as f:
@@ -1123,17 +1250,25 @@ def main():
             errors_start = checkpoint_data["errors_start"]
             errors_end = checkpoint_data["errors_end"]
             true_class = checkpoint_data["true_class"]
-        # Broadcast loaded data to all ranks
-        data_to_broadcast = [
-            predictions,
-            pos_indices,
-            all_residues_start,
-            all_residues_end,
-            errors_start,
-            errors_end,
-            true_class,
-        ]
+            
+            # Prepare data to broadcast
+            data_to_broadcast = [
+                predictions,
+                pos_indices,
+                all_residues_start,
+                all_residues_end,
+                errors_start,
+                errors_end,
+                true_class,
+            ]
+        else:
+            # Other ranks need to prepare None values for broadcast
+            data_to_broadcast = [None, None, None, None, None, None, None]
+        
+        # Broadcast from rank 0 to all other ranks
         dist.broadcast_object_list(data_to_broadcast, src=0)
+        
+        # All ranks unpack the broadcasted data
         (
             predictions,
             pos_indices,
@@ -1143,6 +1278,7 @@ def main():
             errors_end,
             true_class,
         ) = data_to_broadcast
+        
         dist.barrier()  # Ensure all ranks are synchronized after loading
 
     else:
@@ -1190,12 +1326,16 @@ def main():
     )
     list_concatenater(endlist)
 
-    # Plotting of errors in hists and boxplots
-    plotter(errors_start, Name="Start", bin_width=5)
-    plotter(errors_end, Name="End", bin_width=5)
-    boxplotter(errors_start, true_class, Name="Start")
-    boxplotter(errors_end, true_class, Name="End")
+    errors_start_filtered = [e for e, c in zip(errors_start, true_class) if c != 0]
+    errors_end_filtered = [e for e, c in zip(errors_end, true_class) if c != 0]
+    true_class_filtered = [c for c in true_class if c != 0]
 
+
+    # Plotting of errors in hists and boxplots
+    plotter(errors_start_filtered, Name="Start", bin_width=5)
+    plotter(errors_end_filtered, Name="End", bin_width=5)
+    boxplotter(errors_start_filtered, true_class_filtered, Name="Start")
+    boxplotter(errors_end_filtered, true_class_filtered, Name="End")
 
 ###############################################################################################################
 if __name__ == "__main__":
