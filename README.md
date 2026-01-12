@@ -53,7 +53,7 @@ uv sync
 Download the models:
 ```bash
 pip install -U huggingface_hub
-huggingface-cli download username/model-name --local-dir ./model
+huggingface-cli download Stvnap/DOPAMINE --local-dir ./model
 ```
 
 To verify installation run:
