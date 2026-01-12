@@ -104,9 +104,9 @@ def Inputter(filepath):
     This function will convert fasta files to csv format.
     """
     # Ensure the directory exists
-    os.makedirs("tempTest", exist_ok=True)
+    os.makedirs("tempUsage", exist_ok=True)
     # execute the fasta_to_csv function from the sideScripts.fasta_to_csv module
-    fasta_to_csv.fasta_to_csv(fasta_path=filepath, csv_path="./tempTest/seqs.csv")
+    fasta_to_csv.fasta_to_csv(fasta_path=filepath, csv_path="./tempUsage/seqs.csv")
 
 
 # -------------------------
@@ -131,10 +131,10 @@ def Transformer(input_file, ESM_Model, gpus):
     print("\nStarting the Transformer script...")
 
     # fast exit if predicted_domain_regions.pkl already exists
-    if os.path.exists("./tempTest/predicted_domain_regions.pkl"):
+    if os.path.exists("./tempUsage/predicted_domain_regions.pkl"):
         print("Found existing predicted_domain_regions.pkl, loading it directly.")
         # Load the predicted domain regions from pickle file
-        with open("./tempTest/predicted_domain_regions.pkl", "rb") as f:
+        with open("./tempUsage/predicted_domain_regions.pkl", "rb") as f:
             all_regions = pickle.load(f)
         return all_regions
 
@@ -148,7 +148,7 @@ def Transformer(input_file, ESM_Model, gpus):
         "--input",
         input_file,
         "--output",
-        "./tempTest/regions.csv",
+        "./tempUsage/regions.csv",
         "--model",
         ESM_Model,
     ]
@@ -179,7 +179,7 @@ def Transformer(input_file, ESM_Model, gpus):
     print("DomainBoundaryFinder completed successfully")
 
     # Load the predicted domain regions from pickle file
-    with open("./tempTest/predicted_domain_regions.pkl", "rb") as f:
+    with open("./tempUsage/predicted_domain_regions.pkl", "rb") as f:
         all_regions = pickle.load(f)
 
     print("Transformer script completed. Regions found:", len(all_regions), "\n")
@@ -245,7 +245,7 @@ def Regions_Sorter(all_regions, input_file):
     cut_out_df = pd.DataFrame(cut_out_regions)
 
     # Save to CSV for the next step and as a checkpoint
-    cut_out_df.to_csv("./tempTest/cut_out_regions.csv", index=False)
+    cut_out_df.to_csv("./tempUsage/cut_out_regions.csv", index=False)
 
     print(
         f"Extracted {len(cut_out_regions)} domains from initally {len(df)} sequences."
@@ -280,7 +280,7 @@ def classifier(gpus):
         "--rdzv-endpoint=localhost:0",
         "ESM_Embeddings_HP_search.py",
         "--csv_path",
-        "./tempTest/cut_out_regions.csv",
+        "./tempUsage/cut_out_regions.csv",
     ]
 
     # Print the command being run
@@ -307,7 +307,7 @@ def classifier(gpus):
         sys.exit(1)
 
     # Load the predictions from the output file generated in ESM_Embeddings_HP_search
-    predictions_df = pd.read_csv("./tempTest/predictions.csv")
+    predictions_df = pd.read_csv("./tempUsage/predictions.csv")
 
     # extract predictions and raw scores as lists
     all_predictions = predictions_df["prediction"].tolist()
@@ -528,7 +528,7 @@ def dataframer(all_predictions, cut_df, output_file):
     # Mark sequences with no domain overlap as "No Domain"
     for idx, row_copy in df.iterrows():
         if row_copy["Domain_Start"] == -1 and row_copy["Domain_End"] == -1:
-            df.at[idx, "Prediction"] = "No Domain"
+            df = df.drop(idx)
 
     # Reorder columns to put Window_Start_Pos and Window_End_Pos after Sequence_Length
     if "Window_Start_Pos" in df.columns and "Window_End_Pos" in df.columns:
@@ -582,7 +582,7 @@ def main(input_file, output_file, ESM_Model, gpus):
     if input_file.endswith(".fa") or input_file.endswith(".fasta"):
         Inputter(input_file)
         # set new input file to the converted csv
-        input_file = "./tempTest/seqs.csv"
+        input_file = "./tempUsage/seqs.csv"
     # if not fasta or fasta format, exit with error stating unsupported format
     else:
         print(
@@ -616,8 +616,8 @@ def main(input_file, output_file, ESM_Model, gpus):
     print(
         f"\n\nPipeline completed with {len(final_df)} predictions.\nResults saved to {output_file}.\nRemoving temp files...\n\n"
     )
-    tempfolder = "./tempTest"
-    embedding_dir_scratch = "/global/scratch2/sapelt/tempTest/embeddings"
+    tempfolder = "./tempUsage"
+    embedding_dir_scratch = "./tempUsage/embeddings"
     if os.path.exists(tempfolder):
         shutil.rmtree(tempfolder)
         shutil.rmtree(embedding_dir_scratch)

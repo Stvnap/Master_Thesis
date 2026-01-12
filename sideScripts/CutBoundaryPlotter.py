@@ -86,7 +86,7 @@ def CutBoundaryPlotter():
     for x, y in [(x1, y1), (x2, y2)]:
         plt.figure(figsize=(10, 6   ))
         plt.plot(x, y, marker="o", color=COLORS[0] if x == x1 else COLORS[1])
-        plt.ylabel("Absolute Error in Residues")
+        plt.ylabel("Logit Score")
         if x == x1:
             plt.legend(["HMM Boundary Start at 24"])
             plt.title("Change of Logits When Cutting N-terminal Boundary")

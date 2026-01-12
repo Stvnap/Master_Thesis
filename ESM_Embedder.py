@@ -341,7 +341,7 @@ class ESMDataset:
                 chunksize = 100000
 
                 # path to selected IDs file, based on num_classes set
-                selected_ids_file = f"/global/research/students/sapelt/Masters/MasterThesis/temp/selected_pfam_ids_{num_classes - 1}.txt"
+                selected_ids_file = f"./temp/selected_pfam_ids_{num_classes - 1}.txt"
 
                 if num_classes < 24381:
                     if self.training is True and not os.path.exists(selected_ids_file):
@@ -548,7 +548,7 @@ class ESMDataset:
                             selected_ids = [line.strip() for line in f.readlines()]
                 else:  # For 24381 classes, use all Pfam IDs stored in a made file
                     with open(
-                        "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/all_pfamIDs.txt",
+                        "./Dataframes/v3/all_pfamIDs.txt",
                         "r",
                     ) as f:
                         selected_ids = [line.strip() for line in f.readlines()]
@@ -590,14 +590,14 @@ class ESMDataset:
 
                 # set path for progress file based on usage mode
                 if self.usage_mode is True:
-                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_{num_classes}.txt"
+                    progress_file_path = f"./tempUsage/progress_usage_{num_classes}.txt"
                     expected_chunks = 0  # unknown number of chunks for usage mode
                 elif self.testing is True:
-                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}_TEST.txt"
+                    progress_file_path = f"./temp/progress_{num_classes}_TEST.txt"
                     expected_chunks = int(
                         6 * (10000000 / chunksize))
                 else:
-                    progress_file_path = f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{num_classes}.txt"
+                    progress_file_path = f"./temp/progress_{num_classes}.txt"
 
                 if RANK == 0:
                     print(f"Using progress file at {progress_file_path}")
@@ -859,7 +859,7 @@ class ESMDataset:
 
                         # Save datasets to h5 file, each rank writes its own part singlely to prevent conflicts due to locking flagged with chunk_num and rank
                         os.makedirs(
-                            "/global/research/students/sapelt/Masters/MasterThesis/temp",
+                            "./temp",
                             exist_ok=True,
                         )
                         if RANK == 0:
@@ -868,7 +868,7 @@ class ESMDataset:
                             if RANK == rank_id:
                                 # filename based on num_classes
                                 with h5py.File(
-                                    f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{self.num_classes - 1}d.h5",
+                                    f"./temp/embeddings_classification_{self.num_classes - 1}d.h5",
                                     "a",
                                 ) as f:
                                     # if del_key got turned true due to interrupted chunk, delete existing datasets for this chunk and rank to prevent duplicates
@@ -933,9 +933,9 @@ class ESMDataset:
                     # idx_multiplied to track which original sequences were slided into windows
                     elif self.usage_mode is True:
                         # fix save_path for usage mode, no need to make it variable
-                        save_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
-                        # create tempTest/embeddings directory if not exists to load in embeddings
-                        os.makedirs("/global/scratch2/sapelt/tempTest/embeddings", exist_ok=True)
+                        save_path = "./tempUsage/embeddings/embeddings_domain_classifier.h5"
+                        # create tempUsage/embeddings directory if not exists to load in embeddings
+                        os.makedirs("./tempUsage/embeddings", exist_ok=True)
 
                         # save loop for each rank singlely to prevent conflicts
                         for rank_id in range(dist.get_world_size()):
@@ -993,7 +993,7 @@ class ESMDataset:
                     else:
                         # create temp directory if not exists
                         os.makedirs(
-                            "/global/research/students/sapelt/Masters/MasterThesis/temp",
+                            "./temp",
                             exist_ok=True,
                         )
 
@@ -1012,7 +1012,7 @@ class ESMDataset:
                             if RANK == rank_id:
                                 # filename based on num_classes with _EVAL.h5 suffix
                                 with h5py.File(
-                                    f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{self.num_classes - 1}d_EVAL.h5",
+                                    f"./temp/embeddings_classification_{self.num_classes - 1}d_EVAL.h5",
                                     "a",
                                 ) as f:
                                     f.create_dataset(
@@ -1065,11 +1065,11 @@ class ESMDataset:
 
                 # Set progress file path for domain boundary detection mode
                 if self.usage_mode is True:
-                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_domain_usage.txt"
+                    progress_file_path = "./tempUsage/progress_domain_usage.txt"
                 if self.testing is True:
-                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/progress_domain_TEST.txt"
+                    progress_file_path = "./temp/progress_domain_TEST.txt"
                 else:
-                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/progress_domain.txt"
+                    progress_file_path = "./temp/progress_domain.txt"
 
                 # load data in for basic training mode
                 try:
@@ -1084,7 +1084,7 @@ class ESMDataset:
                     # set usage mode to true
                     self.usage_mode = True
                     # Update progress file path if usage mode was just detected
-                    progress_file_path = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_domain_usage.txt"
+                    progress_file_path = "./tempUsage/progress_domain_usage.txt"
 
                 if RANK == 0:
                     print(f"Data loaded with {len(df)} sequences")
@@ -1903,9 +1903,9 @@ class ESMDataset:
 
                     # save path handling, different for usage mode and normal mode
                     if self.usage_mode is True:
-                        save_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
+                        save_path = "./tempUsage/embeddings/embeddings_domain.h5"
                     else:
-                        save_path = "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
+                        save_path = "./temp/embeddings_domain.h5"
 
                     # Save embeddings and labels to h5py file with rank identifier to avoid write conflicts
                     if RANK == 0:

@@ -70,10 +70,10 @@ NUM_CLASSES = 3 # including 0 class
 CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/Evalsets/DataEvalSwissProt2d_esm_shuffled.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequences"
-MODEL_PATH = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/t33_ALL_24380d.pt"
-CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL_TEST.h5"
+MODEL_PATH = "./models/FINAL/t33_ALL_24380d.pt"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES - 1}d_EVAL_TEST.h5"
 TENSBORBOARD_LOG_DIR = (
-    f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{NUM_CLASSES - 1}d_uncut_ALL_cut_loop"
+    f"./models/FINAL/{NUM_CLASSES - 1}d_uncut_ALL_cut_loop"
 )
 
 ESM_MODEL = "esm2_t33_650M_UR50D"
@@ -233,39 +233,39 @@ def opener(df):
     if RANK == 0:
         print("Opening data...")
 
-    # # check if cache exists, if not, create embeddings via ESMDataset
-    # if os.path.exists(
-    #     f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"
-    # ):
-    #     with open(
-    #         f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt", "r"
-    #     ) as status_file:
-    #         # continue only if not finished
-    #         if "All chunks processed. Exiting." not in status_file.read():
-    #             ESMDataset(
-    #                 esm_model=ESM_MODEL,
-    #                 FSDP_used=False,
-    #                 skip_df=df,
-    #                 domain_boundary_detection=False,
-    #                 training=False,
-    #                 num_classes=NUM_CLASSES,
-    #                 csv_path=CSV_PATH,
-    #                 category_col=CATEGORY_COL,
-    #                 sequence_col=SEQUENCE_COL,
-    #             )
-    #             # pass
-    # elif not os.path.exists(CACHE_PATH):
-    #     ESMDataset(
-    #         esm_model=ESM_MODEL,
-    #         FSDP_used=False,
-    #         domain_boundary_detection=False,
-    #         skip_df=df,
-    #         training=False,
-    #         num_classes=NUM_CLASSES,
-    #         csv_path=CSV_PATH,
-    #         category_col=CATEGORY_COL,
-    #         sequence_col=SEQUENCE_COL,
-    #     )
+    # check if cache exists, if not, create embeddings via ESMDataset
+    if os.path.exists(
+        f"./temp/progress_{NUM_CLASSES}.txt"
+    ):
+        with open(
+            f"./temp/progress_{NUM_CLASSES}.txt", "r"
+        ) as status_file:
+            # continue only if not finished
+            if "All chunks processed. Exiting." not in status_file.read():
+                ESMDataset(
+                    esm_model=ESM_MODEL,
+                    FSDP_used=False,
+                    skip_df=df,
+                    domain_boundary_detection=False,
+                    training=False,
+                    num_classes=NUM_CLASSES,
+                    csv_path=CSV_PATH,
+                    category_col=CATEGORY_COL,
+                    sequence_col=SEQUENCE_COL,
+                )
+                # pass
+    elif not os.path.exists(CACHE_PATH):
+        ESMDataset(
+            esm_model=ESM_MODEL,
+            FSDP_used=False,
+            domain_boundary_detection=False,
+            skip_df=df,
+            training=False,
+            num_classes=NUM_CLASSES,
+            csv_path=CSV_PATH,
+            category_col=CATEGORY_COL,
+            sequence_col=SEQUENCE_COL,
+        )
 
     # Load the dataset from the HDF5 file
     evaldataset = EvalDataset(CACHE_PATH)
@@ -1094,7 +1094,7 @@ def list_concatenater(endlist):
     # Convert to DataFrame and save as CSV
     concatenated_df = pd.DataFrame(concatenated_list)
     concatenated_df.to_csv(
-        "/global/research/students/sapelt/Masters/MasterThesis/Results/Predicter_from_ESM_final_result.csv",
+        "./Results/Predicter_from_ESM_final_result.csv",
         index=False,
     )
     print("Saved results to predicted_boundaries_after.csv")

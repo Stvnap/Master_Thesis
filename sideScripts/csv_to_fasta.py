@@ -13,9 +13,9 @@ Table of Contents:
 # -------------------------
 import pandas as pd
 
-DF_INPUT = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/random_AA_sequences_used.csv"
-FASTA_OUTPUT = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/random_AA_sequences_used.fasta"
-ID_COL = "ID"
+DF_INPUT = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/SampledEntriesCompleteProteins_MAX.csv"
+FASTA_OUTPUT = "/global/students/research/sapelt/Masters/MasterThesis/Dataframes/v3/SampledEntriesCompleteProteins_MAX.fasta"
+ID_COL = "id"
 SEQ_COL = "Sequence"
 
 

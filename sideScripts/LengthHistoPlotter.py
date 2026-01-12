@@ -145,7 +145,7 @@ class DomainProcessing:
         plt.figure(figsize=(8, 5))
         sns.histplot(seqlen, bins=100, color=colors[0], stat='probability',edgecolor='black')
         plt.xlabel("Sequence Length in residues")
-        plt.ylabel("Count")
+        plt.ylabel("Fraction")
         # plt.ylim(0, 0.31)
         plt.title(f"Distribution of Sequence Lengths for Target Domain {domain_name}")
         plt.tight_layout()

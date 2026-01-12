@@ -83,7 +83,7 @@ RANK = dist.get_rank()  # rank of the current process
 CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/FoundEntriesSwissProteins.csv"  # path to the csv file with sequences
 CATEGORY_COL = "Pfam_id"  # category column in the csv file
 SEQUENCE_COL = "Sequence"  # sequence column in the csv file
-CACHE_PATH = "/global/research/students/sapelt/Masters/MasterThesis/pickle/FoundEntriesSwissProteins_domains.pkl"  # path to cache pickle file
+CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"  # path to cache pickle file
 PROJECT_NAME = (
     "Optuna_uncut_t33_domains_boundary"  # project name for logging and model saving
 )
@@ -427,7 +427,7 @@ def opener():
 
     # Check if embeddings H5 file exists, if not create it from scratch
     if not os.path.exists(
-        "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
+        "./temp/embeddings_domain.h5"
     ):
         if RANK == 0:
             print("Creating DomainBoundaryDataset from embeddings in H5 file...")
@@ -444,7 +444,7 @@ def opener():
     if RANK == 0:
         print("Using preembedded ESM data from scratch")
     domain_boundary_dataset = DomainBoundaryDataset(
-        "/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_domain.h5"
+        "./temp/embeddings_domain.h5"
     )
 
     # Split indices for train and validation sets
@@ -653,7 +653,7 @@ def final_trainer(lit_model, train_loader, val_loader):
             checkpoint_callback,
         ],  # callbacks for early stopping and checkpointing
         logger=TensorBoardLogger(
-            save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/{PROJECT_NAME}",
+            save_dir=f"./logs/{PROJECT_NAME}",
             name=PROJECT_NAME,
         ),  # tensorboard logger to save logs
     )
@@ -793,7 +793,7 @@ def main_trainer(Final_training=False):
     if Final_training is True:
         lit_model = final_trainer(lit_model, train_loader, val_loader)
     # save the final model with dynamic file name
-    final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/{PROJECT_NAME}.pt"
+    final_model_path = f"./models/{PROJECT_NAME}.pt"
     torch.save(lit_model, final_model_path)
 
     # evaluate the final model
@@ -816,11 +816,11 @@ def usage_opener(ESM_Model, input_file):
         domain_boudnary_set_loader (DataLoader): DataLoader for the domain boundary detection dataset.
     """
     # Create necessary directories
-    os.makedirs("tempTest/embeddings", exist_ok=True)
-    os.makedirs("/global/scratch2/sapelt/tempTest/embeddings", exist_ok=True)
+    os.makedirs("tempUsage/embeddings", exist_ok=True)
+    os.makedirs("/global/scratch2/sapelt/tempUsage/embeddings", exist_ok=True)
     # Check if embeddings H5 file exists, if not create it from scratch
     if not os.path.exists(
-        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
+        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain.h5"
     ):
         if RANK == 0:
             print("Generating embeddings with ESM model...")
@@ -842,7 +842,7 @@ def usage_opener(ESM_Model, input_file):
 
     # Create the dataset and dataloader
     domain_boundary_dataset = DomainBoundaryDataset(
-        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain.h5"
+        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain.h5"
     )
 
     # Load the original CSV to get actual sequence lengths neeeded for usage dataset
@@ -880,7 +880,7 @@ def usage_opener(ESM_Model, input_file):
 
     # Load the trained model for prediction, move to device and set to eval mode
     model = torch.load(
-        "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Optuna_uncut_t33_domains_boundary.pt",
+        "./models/FINAL/Optuna_uncut_t33_domains_boundary.pt",
         map_location=DEVICE,
         weights_only=False,
     )
@@ -1082,7 +1082,7 @@ def main(input_file):
     all_regions = regions_search(all_preds)
 
     # Save all_regions to cache file for interrupted use cases
-    output_file = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl"
+    output_file = "./tempUsage/predicted_domain_regions.pkl"
     with open(output_file, "wb") as f:
         pickle.dump(all_regions, f)
 
@@ -1109,7 +1109,7 @@ def parse_arguments():
     parser.add_argument(
         "--output",
         type=str,
-        default="/global/research/students/sapelt/Masters/MasterThesis/tempTest/predicted_domain_regions.pkl",
+        default="./tempUsage/predicted_domain_regions.pkl",
         help="Output file path",
     )
     # Embedding model argument, not tested

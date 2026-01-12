@@ -881,96 +881,93 @@ def plotter():
 
     # trainings plot vs Evaluation plot 
 
-    log_dir = "/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/t33_ALL_24380d/tensorboard/t33_ALL_24380d_final/version_17"
-    reader = SummaryReader(log_dir,extra_columns={"dir_name"})
-    df = reader.scalars
-    tags = df["tag"].unique()
-    print(df)
-    print("Tags found:",tags)
+    # log_dir = "/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/t33_ALL_24380d/tensorboard/t33_ALL_24380d_final/version_17"
+    # reader = SummaryReader(log_dir,extra_columns={"dir_name"})
+    # df = reader.scalars
+    # tags = df["tag"].unique()
+    # print(df)
+    # print("Tags found:",tags)
 
-    # train values
-    prec_vals_train = []
-    for class_tag in tags:
-        if class_tag.startswith("val_prec"):  
-            values = df[df["tag"] == class_tag]["value"].values
-            if len(values) > 0:
-                prec_vals_train.append(np.max(values))
+    # # train values
+    # prec_vals_train = []
+    # for class_tag in tags:
+    #     if class_tag.startswith("val_prec"):  
+    #         values = df[df["tag"] == class_tag]["value"].values
+    #         if len(values) > 0:
+    #             prec_vals_train.append(np.max(values))
  
-    rec_vals_train = []
-    for class_tag in tags:
-        if class_tag.startswith("val_rec"):  
-            values = df[df["tag"] == class_tag]["value"].values
-            if len(values) > 0:
-                rec_vals_train.append(np.max(values))
+    # rec_vals_train = []
+    # for class_tag in tags:
+    #     if class_tag.startswith("val_rec"):  
+    #         values = df[df["tag"] == class_tag]["value"].values
+    #         if len(values) > 0:
+    #             rec_vals_train.append(np.max(values))
 
-    # remove last entry has it is the average over all classes
-    prec_vals_train = prec_vals_train[:-1]
-    rec_vals_train = rec_vals_train[:-1]
+    # # remove last entry has it is the average over all classes
+    # prec_vals_train = prec_vals_train[:-1]
+    # rec_vals_train = rec_vals_train[:-1]
 
 
-    # # Eval values
+    # # # Eval values
 
-    # log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/24380d_uncut_ALL/"
+    # log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/24380d_uncut_ALL_EVAL/"
     # reader = SummaryReader(log_dir)
     # df = reader.scalars
     # tags = df["tag"].unique()
     # print(df)
     # print("Tags found:",tags)
 
-    # prec_vals_eval = []
-    # for class_tag in tags:
-    #     if class_tag.startswith("Precision/"):  
-    #         values = df[df["tag"] == class_tag]["value"].values
-    #         # print("Max Precision for", class_tag, ":", values)
-    #         # Extract single value or take mean if multiple values
-    #         if len(values) > 0:
-    #             prec_vals_eval.append(values[0] if len(values) == 1 else np.mean(values))
+    # all_prec_eval = []
+    # for tag in tags:
+    #     if tag.startswith("Precision/"):
+    #         values = df[df["tag"] == tag]["value"].values
+    #         all_prec_eval.extend(values)
+    #         # print(f"Processing tag: {tag}")
+    
 
-    # rec_vals_eval = []
-    # for class_tag in tags:
-    #     if class_tag.startswith("Recall/"):  
-    #         values = df[df["tag"] == class_tag]["value"].values
-    #         # print("Max Recall for", class_tag, ":", values)
-    #         # Extract single value or take mean if multiple values
-    #         if len(values) > 0:
-    #             rec_vals_eval.append(values[0] if len(values) == 1 else np.mean(values))
+    # all_rec_eval = []
+    # for tag in tags:
+    #     if tag.startswith("Recall/"):
+    #         values = df[df["tag"] == tag]["value"].values
+    #         all_rec_eval.extend(values)  # Changed from all_prec to all_rec
+    #         # print(f"Processing tag: {tag}")
 
 
-    # Plot for Training values (Precision and Recall)
-    fig5, ax5 = plt.subplots(figsize=(8, 5))
-    training_data = [prec_vals_train, rec_vals_train]
-    training_labels = ['Precision', 'Recall']
+    # # Plot for Training values (Precision and Recall)
+    # fig5, ax5 = plt.subplots(figsize=(8, 5))
+    # training_data = [prec_vals_train, rec_vals_train]
+    # training_labels = ['Precision', 'Recall']
     
-    violin5 = ax5.violinplot(training_data, positions=range(len(training_labels)), showmeans=True, showmedians=True)
+    # violin5 = ax5.violinplot(training_data, positions=range(len(training_labels)), showmeans=True, showmedians=True)
     
-    for i, pc in enumerate(violin5['bodies']):
-        pc.set_facecolor(colors[i])
-        pc.set_alpha(0.7)
+    # for i, pc in enumerate(violin5['bodies']):
+    #     pc.set_facecolor(colors[i])
+    #     pc.set_alpha(0.7)
     
-    for part in ['cmaxes', 'cmins', 'cbars', 'cmeans', 'cmedians']:
-        if part in violin5:
-            violin5[part].set_color('dimgray')
+    # for part in ['cmaxes', 'cmins', 'cbars', 'cmeans', 'cmedians']:
+    #     if part in violin5:
+    #         violin5[part].set_color('dimgray')
     
-    for i, data in enumerate(training_data):
-        mean_val = np.mean(data)
-        ax5.text(i, 0.5, f'{mean_val:.3f}', ha='center', va='bottom', 
-                fontweight='bold', fontsize=10, bbox=dict(boxstyle='round,pad=0.3', 
-                facecolor='white', edgecolor='black', alpha=0.8))
+    # for i, data in enumerate(training_data):
+    #     mean_val = np.mean(data)
+    #     ax5.text(i, 0.5, f'{mean_val:.3f}', ha='center', va='bottom', 
+    #             fontweight='bold', fontsize=10, bbox=dict(boxstyle='round,pad=0.3', 
+    #             facecolor='white', edgecolor='black', alpha=0.8))
     
-    ax5.set_xlabel('Metrics')
-    ax5.set_ylabel('Score')
-    ax5.set_title('Full Model (D 24380) - Training Results')
-    ax5.set_xticks(range(len(training_labels)))
-    ax5.set_xticklabels(training_labels)
-    ax5.set_ylim(-0.01, 1.01)
+    # ax5.set_xlabel('Metrics')
+    # ax5.set_ylabel('Score')
+    # ax5.set_title('Full Model (D 24380) - Training Results')
+    # ax5.set_xticks(range(len(training_labels)))
+    # ax5.set_xticklabels(training_labels)
+    # ax5.set_ylim(-0.01, 1.01)
     
-    plt.tight_layout()
-    plt.savefig('/home/sapelt/Documents/Master/FINAL/Full_Model_D24380_Training_Results.png', dpi=600)
-    fig5.show()
+    # plt.tight_layout()
+    # plt.savefig('/home/sapelt/Documents/Master/FINAL/Full_Model_D24380_Training_Results.png', dpi=600)
+    # fig5.show()
     
-    # # Plot for Evaluation values (Precision and Recall)
+    # Plot for Evaluation values (Precision and Recall)
     # fig6, ax6 = plt.subplots(figsize=(8, 5))
-    # eval_data = [prec_vals_eval, rec_vals_eval]
+    # eval_data = [all_prec_eval, all_rec_eval]
     # eval_labels = ['Precision', 'Recall']
     
     # violin6 = ax6.violinplot(eval_data, positions=range(len(eval_labels)), showmeans=True, showmedians=True)
@@ -999,6 +996,130 @@ def plotter():
     # plt.tight_layout()
     # plt.savefig('/home/sapelt/Documents/Master/FINAL/Full_Model_D24380_Evaluation_Results.png', dpi=600)
     # plt.show()
+
+
+    ############################
+    # TEST PLOTS
+    ##########################
+
+
+    # # cut out
+
+    # log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/24380d_uncut_ALL_TEST/"
+    # reader = SummaryReader(log_dir)
+    # df = reader.scalars
+    # tags = df["tag"].unique()
+    # print(df)
+    # print("Tags found:",tags)
+
+    # all_prec = []
+    # for tag in tags:
+    #     if tag.startswith("Precision/"):
+    #         values = df[df["tag"] == tag]["value"].values
+    #         all_prec.extend(values)
+    #         # print(f"Processing tag: {tag}")
+    
+
+    # all_rec = []
+    # for tag in tags:
+    #     if tag.startswith("Recall/"):
+    #         values = df[df["tag"] == tag]["value"].values
+    #         all_rec.extend(values) 
+    #         # print(f"Processing tag: {tag}")
+
+    # eval test
+
+    log_dir = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/24380d_uncut_ALL_TEST_EVAL/events.out.tfevents.1766626652.r10n03.424110.0"
+    reader = SummaryReader(log_dir)
+    df = reader.scalars
+    tags = df["tag"].unique()
+    print(df)
+    
+    print("Tags found:",tags)
+
+    
+    all_prec_eval = []
+    for tag in tags:
+        if tag.startswith("Precision/"):
+            values = df[df["tag"] == tag]["value"].values
+            all_prec_eval.extend(values)
+            # print(f"Processing tag: {tag}")
+    
+
+    all_rec_eval = []
+    for tag in tags:
+        if tag.startswith("Recall/"):
+            values = df[df["tag"] == tag]["value"].values
+            all_rec_eval.extend(values) 
+            # print(f"Processing tag: {tag}")
+
+
+    ###############################
+
+
+    # # Plot for test cutout
+    # fig7, ax7 = plt.subplots(figsize=(8, 5))
+    # training_data = [all_prec, all_rec]
+    # training_labels = ['Precision', 'Recall']
+    
+    # violin7 = ax7.violinplot(training_data, positions=range(len(training_labels)), showmeans=True, showmedians=True)
+    
+    # for i, pc in enumerate(violin7['bodies']):
+    #     pc.set_facecolor(colors[i])
+    #     pc.set_alpha(0.7)
+    
+    # for part in ['cmaxes', 'cmins', 'cbars', 'cmeans', 'cmedians']:
+    #     if part in violin7:
+    #         violin7[part].set_color('dimgray')
+    
+    # for i, data in enumerate(training_data):
+    #     mean_val = np.mean(data)
+    #     ax7.text(i, 0.5, f'{mean_val:.3f}', ha='center', va='bottom', 
+    #             fontweight='bold', fontsize=10, bbox=dict(boxstyle='round,pad=0.3', 
+    #             facecolor='white', edgecolor='black', alpha=0.8))
+    
+    # ax7.set_xlabel('Metrics')
+    # ax7.set_ylabel('Score')
+    # ax7.set_title('Full Model (D 24380) - Training Results')
+    # ax7.set_xticks(range(len(training_labels)))
+    # ax7.set_xticklabels(training_labels)
+    # ax7.set_ylim(-0.01, 1.01)
+    
+    # plt.tight_layout()
+    # plt.savefig('/home/sapelt/Documents/Master/FINAL/Full_Model_D24380_TEST_CUTOUT.png', dpi=600)
+    # fig7.show()
+    
+    # Plot for test eval 
+    fig8, ax8 = plt.subplots(figsize=(8, 5))
+    eval_data = [all_prec_eval, all_rec_eval]
+    eval_labels = ['Precision', 'Recall']
+    
+    violin8 = ax8.violinplot(eval_data, positions=range(len(eval_labels)), showmeans=True, showmedians=True)
+    
+    for i, pc in enumerate(violin8['bodies']):
+        pc.set_facecolor(colors[i])
+        pc.set_alpha(0.7)
+    
+    for part in ['cmaxes', 'cmins', 'cbars', 'cmeans', 'cmedians']:
+        if part in violin8:
+            violin8[part].set_color('dimgray')
+    
+    for i, data in enumerate(eval_data):
+        mean_val = np.mean(data)
+        ax8.text(i, 0.5, f'{mean_val:.3f}', ha='center', va='bottom', 
+                fontweight='bold', fontsize=10, bbox=dict(boxstyle='round,pad=0.3', 
+                facecolor='white', edgecolor='black', alpha=0.8))
+    
+    ax8.set_xlabel('Metrics')
+    ax8.set_ylabel('Score')
+    ax8.set_title('Full Model (D 24380) - Evaluation Results')
+    ax8.set_xticks(range(len(eval_labels)))
+    ax8.set_xticklabels(eval_labels)
+    ax8.set_ylim(-0.01, 1.01)
+    
+    plt.tight_layout()
+    # plt.savefig('/home/sapelt/Documents/Master/FINAL/Full_Model_D24380_TEST_EVAL.png', dpi=600)
+    plt.show()
 
 
 

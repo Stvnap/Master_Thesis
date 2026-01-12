@@ -72,7 +72,7 @@ pd.set_option("display.max_rows", None)
 # 2. GLOBALS
 # --------------------------------------------------------------------------------------------
 
-NUM_CLASSES = 1001  # classes + 1 for "other" class or FULL for full pfam classification
+NUM_CLASSES = 24381  # classes + 1 for "other" class or FULL for full pfam classification
 if RANK == 0:
     print("USING n CLASSES:", NUM_CLASSES)
 
@@ -80,7 +80,7 @@ if RANK == 0:
 CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv"
 CATEGORY_COL = "Pfam_id"
 SEQUENCE_COL = "Sequence"
-CACHE_PATH = f"/global/research/students/sapelt/Masters/MasterThesis/temp/embeddings_classification_{NUM_CLASSES - 1}d.h5"
+CACHE_PATH = f"./temp/embeddings_classification_{NUM_CLASSES - 1}d.h5"
 PROJECT_NAME = f"t33_ALL_{NUM_CLASSES - 1}d"
 
 # ESM MODEL SELECTION
@@ -1195,7 +1195,7 @@ def objective(
         enable_progress_bar=True,  # enable progress bar
         callbacks=[early_stop, checkpoint_callback],  # add callbacks
         logger=TensorBoardLogger(
-            save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/tensorboard",
+            save_dir=f"./logs/FINAL/{PROJECT_NAME}/tensorboard",
             name=f"optuna_trial_{trial.number}",
         ),  # TensorBoard logger
         # limit_train_batches=250, # used for debug
@@ -1352,7 +1352,7 @@ def run_optuna_study(train_dataset, train_loader, val_loader, weights):
                 "minimize",
                 "maximize",
             ],  # multi-objective: minimize val_loss, maximize val_precision
-            storage=f"sqlite:////global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",  # SQLite storage path
+            storage=f"sqlite:///./logs/FINAL/{PROJECT_NAME}/optuna_study.db",  # SQLite storage path
             load_if_exists=True,  # load existing study if it exists
             study_name=PROJECT_NAME,  # name of the study
             # overwrite=True,               # overwrite existing study (to quickly wipe HP progress)
@@ -1368,7 +1368,7 @@ def run_optuna_study(train_dataset, train_loader, val_loader, weights):
                 "minimize",
                 "maximize",
             ],  # multi-objective: minimize val_loss, maximize val_precision
-            storage=f"sqlite:////global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/optuna_study.db",  # SQLite storage path
+            storage=f"sqlite:///./logs/FINAL/{PROJECT_NAME}/optuna_study.db",  # SQLite storage path
             load_if_exists=True,  # load existing study if it exists
             study_name=PROJECT_NAME,  # name of the study
             # overwrite=True,               # overwrite existing study (to quickly wipe HP progress)
@@ -1763,7 +1763,7 @@ def final_training(lit_model, train_loader, val_loader):
         enable_progress_bar=True,  # enable progress bar
         callbacks=[early_stop, checkpoint_callback],  # add callbacks
         logger=TensorBoardLogger(  # TensorBoard logger for final training
-            save_dir=f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}/tensorboard",
+            save_dir=f"./logs/FINAL/{PROJECT_NAME}/tensorboard",
             name=f"{PROJECT_NAME}_final",
         ),
         # limit_train_batches=250,  # used for debug
@@ -1778,7 +1778,7 @@ def final_training(lit_model, train_loader, val_loader):
     trainer.fit(lit_model, train_loader, val_loader, ckpt_path=resume_from_checkpoint)
 
     # Define path for saving the final model
-    final_model_path = f"/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/{PROJECT_NAME}.pt"
+    final_model_path = f"./models/FINAL/{PROJECT_NAME}.pt"
 
     if RANK == 0:
         print(
@@ -1792,7 +1792,7 @@ def final_training(lit_model, train_loader, val_loader):
         and "Transformer" in lit_model.model.__class__.__name__
     ):
 
-        final_model_path = "/global/research/students/sapelt/Masters/MasterThesis/models/FINAL/Domain_boundary_transformer.pt"
+        final_model_path = "./models/FINAL/Domain_boundary_transformer.pt"
         os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
         # Load the best checkpoint before saving
         if checkpoint_callback.best_model_path:
@@ -1891,12 +1891,12 @@ def loader(csv_path):
         - classifier_loader: DataLoader for inference using ClassifierDataset.  
     """
 
-    h5_path = "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
+    h5_path = "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain_classifier.h5"
     
     # Generate embeddings if not already present OR if they don't exist despite progress file saying complete
     if not os.path.exists(h5_path):
         # Check if progress file says complete but file is missing
-        progress_file = "/global/research/students/sapelt/Masters/MasterThesis/tempTest/progress_usage_1001.txt"
+        progress_file = "./tempUsage/progress_usage_1001.txt"
         if os.path.exists(progress_file):
             with open(progress_file, "r") as f:
                 content = f.read()
@@ -1919,7 +1919,7 @@ def loader(csv_path):
 
     # Create inference dataset
     classifier_dataset = ClassifierDataset(
-        "/global/scratch2/sapelt/tempTest/embeddings/embeddings_domain_classifier.h5"
+        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain_classifier.h5"
     )
 
     # Create DataLoader for inference
@@ -1935,7 +1935,7 @@ def loader(csv_path):
 
     # Load the best model with trained weights
     model = torch.load(
-        "/global/research/students/sapelt/Masters/MasterThesis/models/Optuna_1000d_uncut_t33.pt",
+        "./models/Optuna_1000d_uncut_t33.pt",
         weights_only=False,
     )
     # set model to eval mode and move to device
@@ -2008,7 +2008,7 @@ def parse_args():
     parser.add_argument(
         "--csv_path",
         type=str,
-        default="/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/RemainingEntriesCompleteProteins.csv",
+        default="./Dataframes/v3/RemainingEntriesCompleteProteins.csv",
         help="Path to input CSV file",
     )
     parser.add_argument(
@@ -2033,17 +2033,17 @@ def main_HP(Final_training=False):
 
     # Create necessary directories if they don't exist
     os.makedirs(
-        "/global/research/students/sapelt/Masters/MasterThesis/pickle", exist_ok=True
+        "./pickle", exist_ok=True
     )
     os.makedirs(
-        f"/global/research/students/sapelt/Masters/MasterThesis/logs/FINAL/{PROJECT_NAME}",
+        f"./logs/FINAL/{PROJECT_NAME}",
         exist_ok=True,
     )
     os.makedirs(
-        "/global/research/students/sapelt/Masters/MasterThesis/models", exist_ok=True
+        "./models", exist_ok=True
     )
     if os.path.exists(
-        f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt"
+        f"./temp/progress_{NUM_CLASSES}.txt"
     ):
         
     # -------------------------
@@ -2053,7 +2053,7 @@ def main_HP(Final_training=False):
         # Generation of Embeddings
         # first check status file to see if all chunks were processed
         with open(
-            f"/global/research/students/sapelt/Masters/MasterThesis/temp/progress_{NUM_CLASSES}.txt",
+            f"./temp/progress_{NUM_CLASSES}.txt",
             "r",
         ) as status_file:
             # If not find final tag "All chunks processed. Exiting.", start embedding generation again
@@ -2186,7 +2186,7 @@ def main_usage(csv_path, output_dir=None):
     
     Args:
         csv_path: Path to CSV file containing sequences to be used for inference
-        output_dir: Directory to save prediction results. If None, uses default tempTest directory
+        output_dir: Directory to save prediction results. If None, uses default tempUsage directory
         
     Returns:
         predictions_df: DataFrame containing predictions and raw scores
@@ -2205,7 +2205,7 @@ def main_usage(csv_path, output_dir=None):
 
     # Determine output directory
     if output_dir is None:
-        output_dir = "/global/research/students/sapelt/Masters/MasterThesis/tempTest"
+        output_dir = "./tempUsage"
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)

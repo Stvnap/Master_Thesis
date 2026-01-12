@@ -1,6 +1,6 @@
-# PFAM Domain Prediction Program v0.1
+# DOPAMINE: DOmain Prediction and Annotation using Machine learning Inference with Neural network-based Evaluation (v.1.0)
 
-This package uses AI to predict Pfam Domain IDs and their locations within protein sequences using state-of-the-art machine learning approaches.
+DOPAMINE uses state-of-the-art AI and DL methods to predict Pfam domain IDs and their locations within protein sequences.
 
 ---
 
@@ -56,19 +56,19 @@ This package uses **UV** for dependency management. Install UV following the [of
 
 **Basic usage:**
 ```bash
-uv run main.py --input=./Users.fasta --output=./Output.csv
+uv run DOPAMINE.py --input=./Users.fasta --output=./Output.csv
 ```
 
 **Multi-GPU usage:**
 ```bash
-uv run main.py --input=./Users.fasta --output=./Output.csv --gpus=2
+uv run DOPAMINE.py --input=./Users.fasta --output=./Output.csv --gpus=2
 ```
 
 ### System Requirements
 
 #### Memory & Storage
 - **RAM**: Allocate **≥50GB per GPU** for optimal performance. Even though processing occurs on GPU, embeddings are offloaded to CPU RAM.
-- **Disk Space**: Reserve sufficient space based on input size (multiple genomes can require hundreds of GB quickly)
+- **Disk Space**: Reserve sufficient space based on input size (one proteom with ~40 000 seqs requires at least 500 GB)
 
 #### Checkpoint System
 
@@ -84,11 +84,8 @@ The program implements automatic checkpointing after each major step:
 - Domain boundary embedding recovery
 
 **Checkpoint Storage:**
-- Temporary files stored in `temp/` directory
+- Temporary files stored in `tempUsage/` directory
 - Automatically cleared after completion
-
-
-> ⚠️ Note: Fixed paths on `/global/scratch2/sapelt/` for embeddings due to development.
 
 ### Output Format
 
@@ -114,9 +111,9 @@ The pipeline operates in two distinct modes:
 - **Usage Mode**: For end users performing predictions
 - **Training Mode**: For developers training and evaluating models
 
-### Current Workflow (Usage Mode)
+### Current Architecture of DOPAMINE
 
-![Current Workflow](https://i.imgur.com/gIoRQe7.png)
+![Current Architecture of DOPAMINE](https://i.imgur.com/AJuqoNC.png)
 
 ---
 
@@ -124,7 +121,7 @@ The pipeline operates in two distinct modes:
 
 ### Running Scripts with Multi-GPU Support
 
-All scripts except [`main.py`](main.py) require `torchrun` for multi-GPU execution. Therefore each script must be ran with its needed flags at the end accordingly:
+All scripts except [`DOPAMINE.py`](DOPAMINE.py) require `torchrun` for multi-GPU execution. Therefore each script must be ran with its needed flags at the end accordingly:
 
 ```bash
 torchrun --nproc-per-node=<NUM_GPUS> \
@@ -152,7 +149,7 @@ torchrun --nproc-per-node=4 \
 
 ### Script Descriptions
 
-#### [`main.py`](main.py)
+#### [`DOPAMINE.py`](DOPAMINE.py)
 
 **Purpose:** Main entry point for the prediction pipeline (usage mode)
 
@@ -162,7 +159,7 @@ torchrun --nproc-per-node=4 \
 
 **Usage:**
 ```bash
-uv run main.py --input=<FASTA> --output=<CSV> [--gpus=<N>]
+uv run DOPAMINE.py --input=<FASTA> --output=<CSV> [--gpus=<N>]
 ```
 
 ---
@@ -310,7 +307,7 @@ torchrun --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 \
 **Purpose:** Utility scripts for development and data conversion. All are started via **UV**.
 
 **Contains:**
-- FASTA to CSV converter (used in [`main.py`](main.py))
+- FASTA to CSV converter (used in [`DOPAMINE.py`](DOPAMINE.py))
 - Development and helper scripts
 - Other format converters
 
@@ -377,7 +374,7 @@ The Optuna package was used for HP Search.
 
 ```
 .
-├── main.py                          # Main entry point (usage mode)
+├── DOPAMINE.py                      # Main entry point (usage mode)
 ├── Dataset_preprocess_v3.py         # Pfam data preprocessing
 ├── TestsetCreater.py                # Train/test split generation
 ├── ESM_Embedder.py                  # Embedding generation engine
