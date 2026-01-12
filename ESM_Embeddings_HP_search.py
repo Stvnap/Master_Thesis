@@ -1935,7 +1935,7 @@ def loader(csv_path):
 
     # Load the best model with trained weights
     model = torch.load(
-        "./models/Optuna_1000d_uncut_t33.pt",
+        "./models/t33_ALL_24380d.pt",
         weights_only=False,
     )
     # set model to eval mode and move to device

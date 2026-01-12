@@ -84,6 +84,7 @@ CSV_PATH = "/global/research/students/sapelt/Masters/MasterThesis/Dataframes/v3/
 CATEGORY_COL = "Pfam_id"  # category column in the csv file
 SEQUENCE_COL = "Sequence"  # sequence column in the csv file
 CACHE_PATH = "./pickle/FoundEntriesSwissProteins_domains.pkl"  # path to cache pickle file
+MODEL_NAME = "Optuna_uncut_t33_domains_boundary"  # model name for saving
 PROJECT_NAME = (
     "Optuna_uncut_t33_domains_boundary"  # project name for logging and model saving
 )
@@ -793,7 +794,7 @@ def main_trainer(Final_training=False):
     if Final_training is True:
         lit_model = final_trainer(lit_model, train_loader, val_loader)
     # save the final model with dynamic file name
-    final_model_path = f"./models/{PROJECT_NAME}.pt"
+    final_model_path = f"./models/{MODEL_NAME}.pt"
     torch.save(lit_model, final_model_path)
 
     # evaluate the final model

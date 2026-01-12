@@ -31,7 +31,7 @@ DOPAMINE uses state-of-the-art AI and DL methods to predict Pfam domain IDs and 
 | **University** | University of Münster |
 | **Supervisors** | Erich Bornberg-Bauer, Elias Dohmen, Carsten Kemena-Rinke |
 | **Project Timeline** | March 2025 - January 2026 |
-| **GitHub** | [Link](https://github.com/Stvnap/Master_Thesis) |
+| **GitHub** | [Link](https://github.com/Stvnap/DOPAMINE) |
 
 ---
 
@@ -40,6 +40,27 @@ DOPAMINE uses state-of-the-art AI and DL methods to predict Pfam domain IDs and 
 ### Installation
 
 This package uses **UV** for dependency management. Install UV following the [official guide](https://docs.astral.sh/uv/getting-started/installation/).
+
+Start by cloning this Repo:
+```bash
+git clone https://github.com/Stvnap/DOPAMINE.git
+cd DOPAMINE
+```
+Then install dependencies:
+```bash
+uv sync
+```
+Download the models:
+```bash
+pip install -U huggingface_hub
+huggingface-cli download username/model-name --local-dir ./model
+```
+
+To verify installation run:
+```bash
+uv run DOPAMINE.py --input=./Testfile.fasta --output=./Testoutput.csv
+```
+
 
 ### Command-Line Flags
 
@@ -63,12 +84,13 @@ uv run DOPAMINE.py --input=./Users.fasta --output=./Output.csv
 ```bash
 uv run DOPAMINE.py --input=./Users.fasta --output=./Output.csv --gpus=2
 ```
+> **⚠️ Note:** multi GPU usage is still experimentally and under development
 
 ### System Requirements
 
 #### Memory & Storage
 - **RAM**: Allocate **≥50GB per GPU** for optimal performance. Even though processing occurs on GPU, embeddings are offloaded to CPU RAM.
-- **Disk Space**: Reserve sufficient space based on input size (one proteom with ~40 000 seqs requires at least 500 GB)
+- **Disk Space**: Reserve sufficient space based on input size (one proteom with ~40 000 seqs requires at least **50GB**)
 
 #### Checkpoint System
 
