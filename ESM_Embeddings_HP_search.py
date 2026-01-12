@@ -1891,7 +1891,7 @@ def loader(csv_path):
         - classifier_loader: DataLoader for inference using ClassifierDataset.  
     """
 
-    h5_path = "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain_classifier.h5"
+    h5_path = "./tempUsage/embeddings/embeddings_domain_classifier.h5"
     
     # Generate embeddings if not already present OR if they don't exist despite progress file saying complete
     if not os.path.exists(h5_path):
@@ -1919,7 +1919,7 @@ def loader(csv_path):
 
     # Create inference dataset
     classifier_dataset = ClassifierDataset(
-        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain_classifier.h5"
+        "./tempUsage/embeddings/embeddings_domain_classifier.h5"
     )
 
     # Create DataLoader for inference

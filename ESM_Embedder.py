@@ -548,7 +548,7 @@ class ESMDataset:
                             selected_ids = [line.strip() for line in f.readlines()]
                 else:  # For 24381 classes, use all Pfam IDs stored in a made file
                     with open(
-                        "./Dataframes/v3/all_pfamIDs.txt",
+                        "./models/all_pfamIDs.txt",
                         "r",
                     ) as f:
                         selected_ids = [line.strip() for line in f.readlines()]

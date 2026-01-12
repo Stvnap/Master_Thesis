@@ -1,4 +1,4 @@
-# DOPAMINE: DOmain Prediction and Annotation using Machine learning Inference with Neural network-based Evaluation (v.1.0)
+# DOPAMINE: DOmain Prediction and Annotation using Machine learning Inference with Neural network-based Evaluation (v.1.1)
 
 DOPAMINE uses state-of-the-art AI and DL methods to predict Pfam domain IDs and their locations within protein sequences.
 
@@ -53,7 +53,7 @@ uv sync
 Download the models:
 ```bash
 pip install -U huggingface_hub
-huggingface-cli download Stvnap/DOPAMINE --local-dir ./model
+huggingface-cli download Stvnap/DOPAMINE --local-dir ./models
 ```
 
 To verify installation run:

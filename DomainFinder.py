@@ -881,7 +881,7 @@ def usage_opener(ESM_Model, input_file):
 
     # Load the trained model for prediction, move to device and set to eval mode
     model = torch.load(
-        "./models/FINAL/Optuna_uncut_t33_domains_boundary.pt",
+        "./models/Optuna_uncut_t33_domains_boundary.pt",
         map_location=DEVICE,
         weights_only=False,
     )

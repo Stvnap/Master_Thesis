@@ -515,7 +515,7 @@ def dataframer(all_predictions, cut_df, output_file):
     df = df.drop(columns=['Sequence'])
 
     # convert all_predictions to the actual pfam IDs via the selected_pfam_ids.txt file of the used model (gonna be set for final model)
-    with open("./temp/selected_pfam_ids_1000.txt", "r") as f:
+    with open("./models/all_pfamIDs.txt", "r") as f:
         pfam_ids = [line.strip() for line in f.readlines()]
         all_predictions = [
             pfam_ids[pred - 1] if pred > 0 and pred < len(pfam_ids) else "Unknown"
@@ -617,10 +617,8 @@ def main(input_file, output_file, ESM_Model, gpus):
         f"\n\nPipeline completed with {len(final_df)} predictions.\nResults saved to {output_file}.\nRemoving temp files...\n\n"
     )
     tempfolder = "./tempUsage"
-    embedding_dir_scratch = "./tempUsage/embeddings"
     if os.path.exists(tempfolder):
         shutil.rmtree(tempfolder)
-        shutil.rmtree(embedding_dir_scratch)
 
 ####################################################################
 # Entry point, parse args and call main
