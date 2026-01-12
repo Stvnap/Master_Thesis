@@ -818,10 +818,10 @@ def usage_opener(ESM_Model, input_file):
     """
     # Create necessary directories
     os.makedirs("tempUsage/embeddings", exist_ok=True)
-    os.makedirs("/global/scratch2/sapelt/tempUsage/embeddings", exist_ok=True)
+    os.makedirs("./tempUsage/embeddings", exist_ok=True)
     # Check if embeddings H5 file exists, if not create it from scratch
     if not os.path.exists(
-        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain.h5"
+        "./tempUsage/embeddings/embeddings_domain.h5"
     ):
         if RANK == 0:
             print("Generating embeddings with ESM model...")
@@ -843,7 +843,7 @@ def usage_opener(ESM_Model, input_file):
 
     # Create the dataset and dataloader
     domain_boundary_dataset = DomainBoundaryDataset(
-        "/global/scratch2/sapelt/tempUsage/embeddings/embeddings_domain.h5"
+        "./tempUsage/embeddings/embeddings_domain.h5"
     )
 
     # Load the original CSV to get actual sequence lengths neeeded for usage dataset
